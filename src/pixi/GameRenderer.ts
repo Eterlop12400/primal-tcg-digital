@@ -311,8 +311,8 @@ export class GameRenderer {
 
     let kingdomY: number, handY: number;
     if (isTop) {
-      kingdomY = areaY + pad;
-      handY = areaY + kingdomH + pad;
+      handY = areaY;
+      kingdomY = areaY + handH + pad;
     } else {
       handY = areaY + areaH - handH;
       kingdomY = areaY;
