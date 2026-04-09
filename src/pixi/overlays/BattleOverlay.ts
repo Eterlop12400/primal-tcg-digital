@@ -60,9 +60,7 @@ export class BattleOverlay extends Container {
   ) {
     super();
 
-    const humanPlayer = ui.humanPlayer;
     const phase = state.phase;
-    const cardSize = CARD_SIZES.md;
 
     // Backdrop
     const backdrop = new Graphics();
@@ -71,47 +69,12 @@ export class BattleOverlay extends Container {
     backdrop.eventMode = 'static';
     this.addChild(backdrop);
 
-    // Phase accent colors
-    const phaseColor =
-      phase === 'battle-attack' ? 0xef4444 :
-      phase === 'battle-block' ? 0x3b82f6 :
-      phase === 'battle-showdown' ? 0xf59e0b :
-      0x8b5cf6;
-
-    // Header
-    const phaseText = PHASE_LABELS[phase] ?? phase;
-    const header = new Text({
-      text: phaseText.toUpperCase(),
-      style: new TextStyle({
-        fontSize: 16,
-        fill: phaseColor,
-        fontFamily: 'Arial, sans-serif',
-        fontWeight: 'bold',
-        letterSpacing: 4,
-      }),
-    });
-    header.anchor.set(0.5, 0);
-    header.x = layout.width / 2;
-    header.y = 20;
-    this.addChild(header);
-
-    // Header lines
-    for (const offsetX of [-1, 1]) {
-      const line = new Graphics();
-      const lx = layout.width / 2 + offsetX * (header.width / 2 + 16);
-      line.moveTo(lx, 28);
-      line.lineTo(lx + offsetX * 60, 28);
-      line.stroke({ color: phaseColor, width: 1, alpha: 0.3 });
-      this.addChild(line);
-    }
-
     // Rebuild closure for local state changes
     const rebuild = () => {
-      // Remove everything after backdrop + header + 2 lines = 4 children
-      while (this.children.length > 4) {
-        this.removeChildAt(4);
+      while (this.children.length > 1) {
+        this.removeChildAt(1);
       }
-      this.renderContent(state, ui, layout, cardSize, dispatch, rebuild);
+      this.renderContent(state, ui, layout, dispatch, rebuild);
     };
 
     rebuild();
@@ -121,7 +84,6 @@ export class BattleOverlay extends Container {
     state: GameState,
     ui: UIState,
     layout: BoardLayout,
-    cardSize: CardSize,
     dispatch: (action: UIAction) => void,
     rebuild: () => void,
   ): void {
@@ -130,6 +92,7 @@ export class BattleOverlay extends Container {
     const actingPlayer = getActingPlayer(state);
     const isMyTurn = actingPlayer === humanPlayer;
     const legalActions = getLegalActions(state, humanPlayer);
+    const cardSize = CARD_SIZES.md;
 
     const allTeams = Object.values(state.teams);
     const attackingTeams = allTeams.filter((t) => t.isAttacking);
@@ -159,7 +122,6 @@ export class BattleOverlay extends Container {
     const isShowdown = phase === 'battle-showdown';
     const isDefender = isBlock && isMyTurn && legalActions.includes('select-blockers');
 
-    // Available blocker teams (player's teams not attacking/blocking)
     const availableBlockerTeams = allTeams.filter(
       (t) => t.owner === humanPlayer && !t.isAttacking && !t.isBlocking,
     );
@@ -170,7 +132,46 @@ export class BattleOverlay extends Container {
       .map((m) => m.attackingTeamId);
     const needsOrdering = canChooseOrder && myAttackingTeamIds.length > 1;
 
-    // ---- Hint text ----
+    // Phase accent color
+    const phaseColor =
+      phase === 'battle-attack' ? 0xef4444 :
+      phase === 'battle-block' ? 0x3b82f6 :
+      phase === 'battle-showdown' ? 0xf59e0b :
+      0x8b5cf6;
+
+    // --- Content container (centered vertically) ---
+    const content = new Container();
+    let cy = 0;
+
+    // Header
+    const phaseText = PHASE_LABELS[phase] ?? phase;
+    const header = new Text({
+      text: phaseText.toUpperCase(),
+      style: new TextStyle({
+        fontSize: 22,
+        fill: phaseColor,
+        fontFamily: 'Arial, sans-serif',
+        fontWeight: 'bold',
+        letterSpacing: 6,
+      }),
+    });
+    header.anchor.set(0.5, 0);
+    header.x = layout.width / 2;
+    header.y = cy;
+    content.addChild(header);
+
+    // Header accent lines
+    for (const offsetX of [-1, 1]) {
+      const line = new Graphics();
+      const lx = layout.width / 2 + offsetX * (header.width / 2 + 20);
+      line.moveTo(lx, 12);
+      line.lineTo(lx + offsetX * 80, 12);
+      line.stroke({ color: phaseColor, width: 2, alpha: 0.4 });
+      content.addChild(line);
+    }
+    cy += 32;
+
+    // Hint text
     let hintText = '';
     if (needsOrdering) {
       hintText = `Tap matchups to choose resolution order (${this.showdownOrder.length}/${myAttackingTeamIds.length})`;
@@ -187,26 +188,36 @@ export class BattleOverlay extends Container {
     if (hintText) {
       const hint = new Text({
         text: hintText,
-        style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif' }),
+        style: new TextStyle({ fontSize: 12, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif' }),
       });
       hint.anchor.set(0.5, 0);
       hint.x = layout.width / 2;
-      hint.y = 48;
-      this.addChild(hint);
+      hint.y = cy;
+      content.addChild(hint);
+      cy += 22;
     }
 
-    // ---- Matchups ----
-    const matchupY = 70;
+    cy += 8;
+
+    // ---- Matchup Panels ----
     const matchupGap = 20;
-    const matchupW = Math.min(400, (layout.width - 80 - matchupGap * (matchups.length - 1)) / Math.max(matchups.length, 1));
+    const maxMatchupW = 420;
+    const matchupW = Math.min(
+      maxMatchupW,
+      (layout.width - 80 - matchupGap * (matchups.length - 1)) / Math.max(matchups.length, 1),
+    );
     const totalMatchupW = matchups.length * matchupW + (matchups.length - 1) * matchupGap;
-    let matchupStartX = (layout.width - totalMatchupW) / 2;
+    const matchupStartX = (layout.width - totalMatchupW) / 2;
+    const matchupY = cy;
+
+    // Calculate panel height based on actual content
+    // Top label(18) + top cards(cardSize.height) + VS bar(40) + bottom label(18) + bottom cards(cardSize.height) + padding(28)
+    const panelH = 18 + cardSize.height + 40 + 18 + cardSize.height + 28 + (isShowdown ? 22 : 0);
 
     for (let mi = 0; mi < matchups.length; mi++) {
       const matchup = matchups[mi];
       const mx = matchupStartX + mi * (matchupW + matchupGap);
 
-      // Build display matchup (with blocker assignment preview)
       const assignedBlockerId = isDefender
         ? Object.entries(this.blockerAssignments).find(([, atkId]) => atkId === matchup.attackingTeamId)?.[0] ?? null
         : matchup.blockingTeamId;
@@ -219,15 +230,14 @@ export class BattleOverlay extends Container {
       const orderIndex = this.showdownOrder.indexOf(matchup.attackingTeamId);
       const isOrdered = orderIndex !== -1;
 
-      // Matchup panel — compact height
+      // Panel background
       const panel = new Graphics();
-      const panelH = Math.min(360, layout.height - 260);
-      panel.roundRect(mx, matchupY, matchupW, panelH, 8);
+      panel.roundRect(mx, matchupY, matchupW, panelH, 10);
       const panelBorderColor = isOrdered ? 0xf59e0b : 0x1e293b;
-      panel.fill({ color: 0x0f1729, alpha: 0.8 });
-      panel.stroke({ color: panelBorderColor, width: isOrdered ? 2 : 1, alpha: 0.5 });
+      panel.fill({ color: 0x0f1729, alpha: 0.9 });
+      panel.stroke({ color: panelBorderColor, width: isOrdered ? 2 : 1, alpha: 0.6 });
 
-      // Clickable for showdown ordering or blocker assignment
+      // Click handlers
       if (needsOrdering && isPlayerAttacker) {
         panel.eventMode = 'static';
         panel.cursor = 'pointer';
@@ -247,15 +257,14 @@ export class BattleOverlay extends Container {
           this.assignBlockerToAttacker(matchup.attackingTeamId, rebuild);
         });
       }
-      this.addChild(panel);
+      content.addChild(panel);
 
       // Order badge
       if (needsOrdering && isPlayerAttacker && isOrdered) {
         const badge = new Graphics();
         badge.circle(mx + 14, matchupY + 14, 12);
         badge.fill({ color: 0xf59e0b });
-        this.addChild(badge);
-
+        content.addChild(badge);
         const badgeTxt = new Text({
           text: `${orderIndex + 1}`,
           style: new TextStyle({ fontSize: 12, fill: 0x000000, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
@@ -263,14 +272,14 @@ export class BattleOverlay extends Container {
         badgeTxt.anchor.set(0.5, 0.5);
         badgeTxt.x = mx + 14;
         badgeTxt.y = matchupY + 14;
-        this.addChild(badgeTxt);
+        content.addChild(badgeTxt);
       }
 
-      const contentX = mx + 10;
-      const contentW = matchupW - 20;
-      let cy = matchupY + 16;
+      const contentX = mx + 14;
+      const contentW = matchupW - 28;
+      let pcy = matchupY + 14;
 
-      // Top team (opponent's perspective)
+      // --- Opponent side (top half of panel) ---
       const opponentTeamId = isPlayerAttacker ? assignedBlockerId : matchup.attackingTeamId;
       const opponentLabel = isPlayerAttacker
         ? (assignedBlockerId ? 'OPPONENT BLOCK' : null)
@@ -280,87 +289,99 @@ export class BattleOverlay extends Container {
         if (opponentLabel) {
           const lbl = new Text({
             text: opponentLabel,
-            style: new TextStyle({ fontSize: 8, fill: isPlayerAttacker ? 0x60a5fa : 0xf87171, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 2 }),
+            style: new TextStyle({ fontSize: 10, fill: isPlayerAttacker ? 0x60a5fa : 0xf87171, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 2 }),
           });
           lbl.anchor.set(0.5, 0);
           lbl.x = mx + matchupW / 2;
-          lbl.y = cy;
-          this.addChild(lbl);
-          cy += 14;
+          lbl.y = pcy;
+          content.addChild(lbl);
+          pcy += 18;
         }
-        cy = this.renderTeamCards(state, state.teams[opponentTeamId], contentX, cy, contentW, cardSize);
+        pcy = this.renderTeamCards(content, state, state.teams[opponentTeamId], contentX, pcy, contentW, cardSize);
       } else if (isPlayerAttacker) {
-        // Unblocked label
+        // Unblocked placeholder
+        const placeholderBg = new Graphics();
+        placeholderBg.roundRect(contentX, pcy, contentW, cardSize.height, 6);
+        placeholderBg.fill({ color: 0x111827, alpha: 0.5 });
+        placeholderBg.stroke({ color: 0x1e293b, width: 1, alpha: 0.3 });
+        content.addChild(placeholderBg);
+
         const unblockedTxt = new Text({
-          text: isDefender ? 'TAP TO ASSIGN' : 'UNBLOCKED',
-          style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontStyle: 'italic' }),
+          text: isDefender ? 'TAP TO ASSIGN BLOCKER' : 'UNBLOCKED',
+          style: new TextStyle({ fontSize: 12, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontStyle: 'italic' }),
         });
         unblockedTxt.anchor.set(0.5, 0.5);
         unblockedTxt.x = mx + matchupW / 2;
-        unblockedTxt.y = cy + 30;
-        this.addChild(unblockedTxt);
-        cy += 60;
+        unblockedTxt.y = pcy + cardSize.height / 2;
+        content.addChild(unblockedTxt);
+        pcy += cardSize.height + 4;
       }
 
-      // VS power comparison
-      cy += 8;
-      const vsY = cy;
+      // --- VS power comparison bar ---
+      pcy += 4;
+      const vsY = pcy;
+
+      // VS divider line
+      const vsDivider = new Graphics();
+      vsDivider.moveTo(mx + 16, vsY + 16);
+      vsDivider.lineTo(mx + matchupW - 16, vsY + 16);
+      vsDivider.stroke({ color: phaseColor, width: 1, alpha: 0.15 });
+      content.addChild(vsDivider);
 
       const atkPowerTxt = new Text({
         text: `${matchup.attackingPower}`,
-        style: new TextStyle({ fontSize: 18, fill: 0xf87171, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+        style: new TextStyle({ fontSize: 22, fill: 0xf87171, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
       });
       atkPowerTxt.anchor.set(1, 0.5);
-      atkPowerTxt.x = mx + matchupW / 2 - 24;
-      atkPowerTxt.y = vsY + 12;
-      this.addChild(atkPowerTxt);
+      atkPowerTxt.x = mx + matchupW / 2 - 26;
+      atkPowerTxt.y = vsY + 16;
+      content.addChild(atkPowerTxt);
 
       const atkLabel = new Text({
         text: 'ATK',
-        style: new TextStyle({ fontSize: 7, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+        style: new TextStyle({ fontSize: 8, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
       });
       atkLabel.anchor.set(1, 0.5);
       atkLabel.x = atkPowerTxt.x - atkPowerTxt.width - 4;
-      atkLabel.y = vsY + 12;
-      this.addChild(atkLabel);
+      atkLabel.y = vsY + 16;
+      content.addChild(atkLabel);
 
-      // VS circle
       const vsCircle = new Graphics();
-      vsCircle.circle(mx + matchupW / 2, vsY + 12, 14);
-      vsCircle.fill({ color: 0xffffff, alpha: 0.05 });
-      vsCircle.stroke({ color: 0xffffff, width: 1, alpha: 0.15 });
-      this.addChild(vsCircle);
+      vsCircle.circle(mx + matchupW / 2, vsY + 16, 16);
+      vsCircle.fill({ color: phaseColor, alpha: 0.08 });
+      vsCircle.stroke({ color: phaseColor, width: 1, alpha: 0.25 });
+      content.addChild(vsCircle);
 
       const vsTxt = new Text({
         text: 'VS',
-        style: new TextStyle({ fontSize: 8, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+        style: new TextStyle({ fontSize: 10, fill: COLORS.text, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
       });
       vsTxt.anchor.set(0.5, 0.5);
       vsTxt.x = mx + matchupW / 2;
-      vsTxt.y = vsY + 12;
-      this.addChild(vsTxt);
+      vsTxt.y = vsY + 16;
+      content.addChild(vsTxt);
 
       const blkPowerTxt = new Text({
         text: assignedBlockerId ? `${assignedBlockerPower}` : '—',
-        style: new TextStyle({ fontSize: 18, fill: 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+        style: new TextStyle({ fontSize: 22, fill: 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
       });
       blkPowerTxt.anchor.set(0, 0.5);
-      blkPowerTxt.x = mx + matchupW / 2 + 24;
-      blkPowerTxt.y = vsY + 12;
-      this.addChild(blkPowerTxt);
+      blkPowerTxt.x = mx + matchupW / 2 + 26;
+      blkPowerTxt.y = vsY + 16;
+      content.addChild(blkPowerTxt);
 
       const blkLabel = new Text({
-        text: 'BLK',
-        style: new TextStyle({ fontSize: 7, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+        text: 'DEF',
+        style: new TextStyle({ fontSize: 8, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
       });
       blkLabel.anchor.set(0, 0.5);
       blkLabel.x = blkPowerTxt.x + blkPowerTxt.width + 4;
-      blkLabel.y = vsY + 12;
-      this.addChild(blkLabel);
+      blkLabel.y = vsY + 16;
+      content.addChild(blkLabel);
 
-      cy = vsY + 32;
+      pcy = vsY + 36;
 
-      // Bottom team (your perspective)
+      // --- Player side (bottom half of panel) ---
       const playerTeamId = isPlayerAttacker ? matchup.attackingTeamId : assignedBlockerId;
       const playerLabel = isPlayerAttacker ? 'YOUR ATTACK' : (assignedBlockerId ? 'YOUR BLOCK' : null);
 
@@ -368,15 +389,15 @@ export class BattleOverlay extends Container {
         if (playerLabel) {
           const lbl = new Text({
             text: playerLabel,
-            style: new TextStyle({ fontSize: 8, fill: isPlayerAttacker ? 0xf87171 : 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 2 }),
+            style: new TextStyle({ fontSize: 10, fill: isPlayerAttacker ? 0xf87171 : 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 2 }),
           });
           lbl.anchor.set(0.5, 0);
           lbl.x = mx + matchupW / 2;
-          lbl.y = cy;
-          this.addChild(lbl);
-          cy += 14;
+          lbl.y = pcy;
+          content.addChild(lbl);
+          pcy += 18;
         }
-        this.renderTeamCards(state, state.teams[playerTeamId], contentX, cy, contentW, cardSize);
+        this.renderTeamCards(content, state, state.teams[playerTeamId], contentX, pcy, contentW, cardSize);
       }
 
       // Showdown result prediction
@@ -390,40 +411,44 @@ export class BattleOverlay extends Container {
 
         const resultTxt = new Text({
           text: resultLabel.toUpperCase(),
-          style: new TextStyle({ fontSize: 9, fill: resultColor, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 1 }),
+          style: new TextStyle({ fontSize: 11, fill: resultColor, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 1 }),
         });
         resultTxt.anchor.set(0.5, 1);
         resultTxt.x = mx + matchupW / 2;
-        resultTxt.y = matchupY + panelH - 10;
-        this.addChild(resultTxt);
+        resultTxt.y = matchupY + panelH - 8;
+        content.addChild(resultTxt);
       }
     }
+
+    cy = matchupY + panelH + 16;
 
     // ---- Available Blockers Section (block phase, defender only) ----
     const assignedBlockerIds = new Set(Object.keys(this.blockerAssignments));
     const unassignedBlockerTeams = availableBlockerTeams.filter((t) => !assignedBlockerIds.has(t.id));
 
     if (isDefender && unassignedBlockerTeams.length > 0) {
-      const blockerSectionY = layout.height - 170;
-
       const divider = new Graphics();
-      divider.moveTo(layout.width * 0.15, blockerSectionY - 10);
-      divider.lineTo(layout.width * 0.85, blockerSectionY - 10);
-      divider.stroke({ color: 0x1e293b, width: 1 });
-      this.addChild(divider);
+      divider.moveTo(layout.width * 0.15, cy);
+      divider.lineTo(layout.width * 0.85, cy);
+      divider.stroke({ color: phaseColor, width: 1, alpha: 0.2 });
+      content.addChild(divider);
+      cy += 12;
 
       const blockerLabel = new Text({
         text: 'YOUR AVAILABLE TEAMS',
-        style: new TextStyle({ fontSize: 9, fill: 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 2 }),
+        style: new TextStyle({ fontSize: 11, fill: 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 3 }),
       });
       blockerLabel.anchor.set(0.5, 0);
       blockerLabel.x = layout.width / 2;
-      blockerLabel.y = blockerSectionY;
-      this.addChild(blockerLabel);
+      blockerLabel.y = cy;
+      content.addChild(blockerLabel);
+      cy += 20;
 
-      const teamCardSize = CARD_SIZES.xs;
-      const teamGap = 16;
-      const teamsW = unassignedBlockerTeams.length * 120 + (unassignedBlockerTeams.length - 1) * teamGap;
+      const teamCardSize = CARD_SIZES.sm;
+      const teamGap = 14;
+      const teamPanelW = 140;
+      const teamPanelH = teamCardSize.height + 30;
+      const teamsW = unassignedBlockerTeams.length * teamPanelW + (unassignedBlockerTeams.length - 1) * teamGap;
       let teamStartX = (layout.width - teamsW) / 2;
 
       for (const team of unassignedBlockerTeams) {
@@ -431,7 +456,7 @@ export class BattleOverlay extends Container {
         const teamPower = estimateTeamPower(state, team);
 
         const teamPanel = new Graphics();
-        teamPanel.roundRect(teamStartX, blockerSectionY + 18, 120, 65, 6);
+        teamPanel.roundRect(teamStartX, cy, teamPanelW, teamPanelH, 8);
         teamPanel.fill({ color: isSelected ? 0x1e3a5f : 0x111827, alpha: 0.9 });
         teamPanel.stroke({ color: isSelected ? 0x3b82f6 : 0x1e293b, width: isSelected ? 2 : 1, alpha: isSelected ? 1 : 0.5 });
         teamPanel.eventMode = 'static';
@@ -439,13 +464,13 @@ export class BattleOverlay extends Container {
         teamPanel.on('pointerdown', () => {
           this.handleSelectBlockerTeam(team.id, attackingTeams, rebuild);
         });
-        this.addChild(teamPanel);
+        content.addChild(teamPanel);
 
         // Render team characters
         const chars = team.characterIds;
         const charGap = 4;
         const charsW = chars.length * teamCardSize.width + (chars.length - 1) * charGap;
-        let charX = teamStartX + (120 - charsW) / 2;
+        let charX = teamStartX + (teamPanelW - charsW) / 2;
 
         for (const cid of chars) {
           const inst = state.cards[cid];
@@ -456,42 +481,47 @@ export class BattleOverlay extends Container {
 
           const card = new CardSprite({ defId: inst.defId, size: teamCardSize, cardDef: def, instance: inst, effectiveStats: stats });
           card.x = charX;
-          card.y = blockerSectionY + 22;
-          this.addChild(card);
+          card.y = cy + 6;
+          content.addChild(card);
           charX += teamCardSize.width + charGap;
         }
 
         // Power label
         const pwrTxt = new Text({
           text: `PWR ${teamPower}`,
-          style: new TextStyle({ fontSize: 8, fill: 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+          style: new TextStyle({ fontSize: 10, fill: 0x60a5fa, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
         });
         pwrTxt.anchor.set(0.5, 0);
-        pwrTxt.x = teamStartX + 60;
-        pwrTxt.y = blockerSectionY + 70;
-        this.addChild(pwrTxt);
+        pwrTxt.x = teamStartX + teamPanelW / 2;
+        pwrTxt.y = cy + teamPanelH - 18;
+        content.addChild(pwrTxt);
 
-        teamStartX += 120 + teamGap;
+        teamStartX += teamPanelW + teamGap;
       }
+
+      cy += teamPanelH + 6;
 
       // Assigned count
       if (Object.keys(this.blockerAssignments).length > 0) {
         const countTxt = new Text({
-          text: `${Object.keys(this.blockerAssignments).length} blocker(s) assigned — tap to remove`,
-          style: new TextStyle({ fontSize: 9, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif' }),
+          text: `${Object.keys(this.blockerAssignments).length} blocker(s) assigned`,
+          style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif' }),
         });
         countTxt.anchor.set(0.5, 0);
         countTxt.x = layout.width / 2;
-        countTxt.y = blockerSectionY + 88;
-        this.addChild(countTxt);
+        countTxt.y = cy;
+        content.addChild(countTxt);
+        cy += 18;
       }
     }
 
+    cy += 12;
+
     // ---- Action Buttons ----
-    const btnY = layout.height - 55;
-    const btnW = 130;
-    const btnH = 34;
-    const btnGap = 12;
+    const btnW = 150;
+    const btnH = 40;
+    const btnGap = 16;
+    const btnY = cy;
 
     if (isDefender) {
       const assignmentCount = Object.keys(this.blockerAssignments).length;
@@ -499,8 +529,8 @@ export class BattleOverlay extends Container {
         ? `CONFIRM ${assignmentCount} BLOCKER${assignmentCount !== 1 ? 'S' : ''}`
         : 'CONFIRM (NONE)';
 
-      const confirmBtn = this.makeButton(confirmLabel, btnW + 20, btnH, COLORS.buttonPrimary);
-      confirmBtn.x = layout.width / 2 - (btnW + 20) - btnGap / 2;
+      const confirmBtn = this.makeButton(confirmLabel, btnW + 30, btnH, COLORS.buttonPrimary);
+      confirmBtn.x = layout.width / 2 - (btnW + 30) - btnGap / 2;
       confirmBtn.y = btnY;
       confirmBtn.on('pointerdown', () => {
         const assignments = Object.entries(this.blockerAssignments).map(([blockingTeamId, attackingTeamId]) => ({
@@ -513,7 +543,7 @@ export class BattleOverlay extends Container {
           action: { type: 'select-blockers', assignments },
         });
       });
-      this.addChild(confirmBtn);
+      content.addChild(confirmBtn);
 
       const noBlockBtn = this.makeButton('NO BLOCKERS', btnW, btnH, 0x374151);
       noBlockBtn.x = layout.width / 2 + btnGap / 2;
@@ -525,7 +555,8 @@ export class BattleOverlay extends Container {
           action: { type: 'select-blockers', assignments: [] },
         });
       });
-      this.addChild(noBlockBtn);
+      content.addChild(noBlockBtn);
+      cy += btnH;
     }
 
     if (canChooseOrder) {
@@ -534,8 +565,8 @@ export class BattleOverlay extends Container {
         ? `SELECT ORDER (${this.showdownOrder.length}/${myAttackingTeamIds.length})`
         : 'RESOLVE SHOWDOWN';
 
-      const resolveBtn = this.makeButton(label, btnW + 30, btnH, allOrdered ? COLORS.buttonPrimary : 0x374151);
-      resolveBtn.x = layout.width / 2 - (btnW + 30) / 2;
+      const resolveBtn = this.makeButton(label, btnW + 40, btnH, allOrdered ? COLORS.buttonPrimary : 0x374151);
+      resolveBtn.x = layout.width / 2 - (btnW + 40) / 2;
       resolveBtn.y = btnY;
       resolveBtn.alpha = allOrdered ? 1 : 0.5;
       if (allOrdered) {
@@ -548,7 +579,8 @@ export class BattleOverlay extends Container {
           });
         });
       }
-      this.addChild(resolveBtn);
+      content.addChild(resolveBtn);
+      cy += btnH;
     }
 
     if (isEOA && isMyTurn) {
@@ -570,12 +602,20 @@ export class BattleOverlay extends Container {
           action: { type: 'pass-priority' },
         });
       });
-      this.addChild(passBtn);
+      content.addChild(passBtn);
+      cy += btnH;
     }
+
+    // --- Center content vertically ---
+    const totalHeight = cy;
+    const topOffset = Math.max(20, (layout.height - totalHeight) / 2);
+    content.y = topOffset;
+    this.addChild(content);
   }
 
   // ---- Render team characters in a row ----
   private renderTeamCards(
+    parent: Container,
     state: GameState,
     team: Team,
     x: number,
@@ -584,7 +624,7 @@ export class BattleOverlay extends Container {
     cardSize: CardSize,
   ): number {
     const chars = team.characterIds;
-    const gap = 4;
+    const gap = 6;
     const totalW = chars.length * cardSize.width + (chars.length - 1) * gap;
     const startX = x + (w - totalW) / 2;
 
@@ -606,7 +646,7 @@ export class BattleOverlay extends Container {
       });
       card.x = startX + i * (cardSize.width + gap);
       card.y = y;
-      this.addChild(card);
+      parent.addChild(card);
     }
 
     return y + cardSize.height + 4;
@@ -618,7 +658,6 @@ export class BattleOverlay extends Container {
     attackingTeams: Team[],
     rebuild: () => void,
   ): void {
-    // If clicking an already-assigned blocker, unassign it
     if (this.blockerAssignments[teamId]) {
       delete this.blockerAssignments[teamId];
       this.selectedBlockerTeamId = null;
@@ -626,10 +665,8 @@ export class BattleOverlay extends Container {
       return;
     }
 
-    // If only one attacking team, auto-assign
     if (attackingTeams.length === 1) {
       const attackingTeamId = attackingTeams[0].id;
-      // Remove any existing blocker for this attacker
       const newAssignments: Record<string, string> = {};
       for (const [bId, aId] of Object.entries(this.blockerAssignments)) {
         if (aId !== attackingTeamId) newAssignments[bId] = aId;
@@ -641,7 +678,6 @@ export class BattleOverlay extends Container {
       return;
     }
 
-    // Toggle selection for multi-attacker case
     this.selectedBlockerTeamId = this.selectedBlockerTeamId === teamId ? null : teamId;
     rebuild();
   }
@@ -649,7 +685,6 @@ export class BattleOverlay extends Container {
   private assignBlockerToAttacker(attackingTeamId: string, rebuild: () => void): void {
     if (!this.selectedBlockerTeamId) return;
 
-    // Remove any existing blocker for this attacker
     const existingBlocker = Object.entries(this.blockerAssignments).find(
       ([, atkId]) => atkId === attackingTeamId,
     );
@@ -668,13 +703,13 @@ export class BattleOverlay extends Container {
     c.eventMode = 'static';
     c.cursor = 'pointer';
     const bg = new Graphics();
-    bg.roundRect(0, 0, w, h, 6);
-    bg.fill({ color, alpha: 0.9 });
-    bg.stroke({ color: 0xffffff, width: 1, alpha: 0.1 });
+    bg.roundRect(0, 0, w, h, 8);
+    bg.fill({ color, alpha: 0.95 });
+    bg.stroke({ color: 0xffffff, width: 1, alpha: 0.15 });
     c.addChild(bg);
     const txt = new Text({
       text: label,
-      style: new TextStyle({ fontSize: 10, fill: COLORS.textBright, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 1 }),
+      style: new TextStyle({ fontSize: 12, fill: COLORS.textBright, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 1 }),
     });
     txt.anchor.set(0.5, 0.5);
     txt.x = w / 2;

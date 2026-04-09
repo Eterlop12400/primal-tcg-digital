@@ -782,6 +782,8 @@ export class GameRenderer {
           color: 0x374151,
           onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'select-attackers', teamIds: [] } }),
         });
+      } else if (state.phase === 'battle-eoa') {
+        buttons.push({ label: 'PASS PRIORITY', color: 0x374151, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'pass-priority' } }) });
       } else if (state.phase === 'end') {
         buttons.push({ label: 'PASS', color: 0x374151, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'pass-priority' } }) });
       }
@@ -968,7 +970,8 @@ export class GameRenderer {
 
   private shouldShowBattle(state: GameState): boolean {
     const phase = state.phase;
-    const isBattlePhase = phase === 'battle-attack' || phase === 'battle-block' || phase === 'battle-eoa' || phase === 'battle-showdown';
+    // Don't show overlay during EOA — player needs hand/essence access for ability cards
+    const isBattlePhase = phase === 'battle-attack' || phase === 'battle-block' || phase === 'battle-showdown';
     if (!isBattlePhase) return false;
     const attackingTeams = Object.values(state.teams).filter((t) => t.isAttacking);
     return attackingTeams.length > 0;
