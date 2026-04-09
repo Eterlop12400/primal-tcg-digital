@@ -101,16 +101,18 @@ export function moveCard(
   const fromPlayer = card.owner;
   const targetPlayer = toPlayer ?? card.owner;
 
+  const fromZone = card.zone;
+
   // Remove from current zone
-  removeFromZone(state, instanceId, fromPlayer, card.zone);
+  removeFromZone(state, instanceId, fromPlayer, fromZone);
 
   // Handle new instance rule: moving zones = new instance
   // (except Kingdom <-> Battlefield)
   const isKingdomBattlefieldMove =
-    (card.zone === 'kingdom' && toZone === 'battlefield') ||
-    (card.zone === 'battlefield' && toZone === 'kingdom');
+    (fromZone === 'kingdom' && toZone === 'battlefield') ||
+    (fromZone === 'battlefield' && toZone === 'kingdom');
 
-  if (!isKingdomBattlefieldMove && card.zone !== toZone) {
+  if (!isKingdomBattlefieldMove && fromZone !== toZone) {
     // Reset temporary state for new instance
     card.statModifiers = [];
     card.isNegated = false;
@@ -130,7 +132,7 @@ export function moveCard(
 
   // Handle attached cards when leaving play
   const inPlayZones: Zone[] = ['kingdom', 'battlefield', 'field-area'];
-  if (inPlayZones.includes(card.zone) && !inPlayZones.includes(toZone)) {
+  if (inPlayZones.includes(fromZone) && !inPlayZones.includes(toZone)) {
     // Detach all attached cards -> discard
     for (const attachedId of [...card.attachedCards]) {
       const attached = getCard(state, attachedId);
@@ -141,6 +143,35 @@ export function moveCard(
 
     // Remove counters
     card.counters = [];
+  }
+
+  // Check field card discard triggers (in-play card moved to discard)
+  if (toZone === 'discard' && inPlayZones.includes(fromZone)) {
+    for (const p of ['player1', 'player2'] as PlayerId[]) {
+      const fieldId = state.players[p].fieldCard;
+      if (!fieldId) continue;
+      const fieldDef = getCardDefForInstance(state, fieldId);
+      for (const effect of fieldDef.effects) {
+        if (
+          effect.type === 'trigger' &&
+          effect.triggerCondition === 'in-play-card-discarded' &&
+          effect.oncePerTurn
+        ) {
+          const fCard = getCard(state, fieldId);
+          if (fCard.usedEffects.includes(effect.id)) continue;
+          if (state.phase !== 'main' && !state.phase.startsWith('battle')) continue;
+          state.pendingTriggers.push({
+            id: `trigger_${fieldId}_${effect.id}`,
+            type: 'trigger-effect',
+            sourceCardInstanceId: fieldId,
+            effectId: effect.id,
+            resolved: false,
+            negated: false,
+            owner: p,
+          });
+        }
+      }
+    }
   }
 }
 
@@ -426,7 +457,8 @@ export function addLog(
   state: GameState,
   player: PlayerId,
   action: string,
-  details?: string
+  details?: string,
+  cardInstanceId?: string
 ): void {
   state.log.push({
     timestamp: Date.now(),
@@ -435,6 +467,7 @@ export function addLog(
     player,
     action,
     details,
+    cardInstanceId,
   });
 }
 

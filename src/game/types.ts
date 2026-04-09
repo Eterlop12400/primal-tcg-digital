@@ -125,6 +125,7 @@ export interface CardEffectDef {
   turnTiming?: TurnTiming;
   triggerCondition?: string; // human-readable for now, will be enum/function later
   costDescription?: string;
+  targetDescription?: string;
   effectDescription: string;
   oncePerTurn: boolean;
   // The actual effect logic will be implemented as functions keyed by card+effect ID
@@ -282,6 +283,7 @@ export interface GameLogEntry {
   player: PlayerId;
   action: string;
   details?: string;
+  cardInstanceId?: string;
 }
 
 // --- Player Action (input from human or AI) ---

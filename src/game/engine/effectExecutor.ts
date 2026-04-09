@@ -11,7 +11,6 @@ import {
 } from '../types';
 import {
   getCard,
-  getCardDef,
   getCardDefForInstance,
   moveCard,
   moveCardToBottomOfDeck,
@@ -36,13 +35,21 @@ export function executeEffect(state: GameState, entry: ChainEntry): void {
   const handler = effectHandlers[def.id] ?? effectHandlers[effectKey];
 
   if (handler) {
+    addLog(
+      state,
+      entry.owner,
+      'effect-resolve',
+      `${def.name} effect activates`,
+      entry.sourceCardInstanceId
+    );
     handler(state, entry);
   } else {
     addLog(
       state,
       entry.owner,
       'effect-unimplemented',
-      `Effect for ${def.name} (${def.id}) not yet implemented`
+      `Effect for ${def.name} (${def.id}) not yet implemented`,
+      entry.sourceCardInstanceId
     );
   }
 }

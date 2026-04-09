@@ -22,7 +22,7 @@ export {
   getLegalActions,
 } from './gameLoop';
 
-export { resolveChain } from './chainResolver';
+export { resolveChain, flushPendingTriggers } from './chainResolver';
 export { executeEffect } from './effectExecutor';
 export { processAction } from './actionProcessor';
 

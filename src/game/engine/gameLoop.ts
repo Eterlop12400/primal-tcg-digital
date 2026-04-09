@@ -24,6 +24,7 @@ import {
   generateId,
   getCardsInZone,
 } from './utils';
+import { resolveChain, flushPendingTriggers } from './chainResolver';
 
 // ============================================================
 // Phase Transitions
@@ -102,19 +103,23 @@ export function advanceToMainPhase(state: GameState): void {
 
 export function advanceToOrganizationPhase(state: GameState): void {
   state.phase = 'organization';
+  state.priorityPlayer = state.currentTurn;
+  state.consecutivePasses = 0;
   const player = state.currentTurn;
 
   addLog(state, player, 'phase-organization', 'Organization Phase');
 
   // TODO: Check for start-of-organization triggers
 
-  // Separate all characters into individual teams first
-  // (Player will then reorganize via action)
+  // Clear existing teams then auto-create solo teams for each kingdom character
   clearTeams(state, player);
+  autoCreateSoloTeams(state, player);
 }
 
 export function advanceToBattlePhase(state: GameState): void {
   state.phase = 'battle-attack';
+  state.priorityPlayer = state.currentTurn;
+  state.consecutivePasses = 0;
 
   addLog(state, state.currentTurn, 'phase-battle', 'Battle Phase — Attack Step');
 
@@ -133,6 +138,8 @@ export function advanceToEOA(state: GameState): void {
 
 export function advanceToShowdown(state: GameState): void {
   state.phase = 'battle-showdown';
+  state.priorityPlayer = state.currentTurn;
+  state.consecutivePasses = 0;
 
   addLog(state, state.currentTurn, 'phase-showdown', 'Showdown Step');
 
@@ -147,18 +154,19 @@ export function advanceToEndPhase(state: GameState): void {
   addLog(state, player, 'phase-end', 'End Phase');
 
   // 1. Check Battle Rewards win condition
+  // BR zone fills on the LOSING side — if your BR has 10+, your opponent wins
   if (state.players[player].battleRewards.length >= 10) {
     state.gameOver = true;
-    state.winner = player;
+    state.winner = opponent;
     state.winReason = 'battle-rewards';
-    addLog(state, player, 'win', `${player} wins with 10+ Battle Rewards!`);
+    addLog(state, opponent, 'win', `${opponent} wins — ${player} has 10+ Battle Rewards!`);
     return;
   }
   if (state.players[opponent].battleRewards.length >= 10) {
     state.gameOver = true;
-    state.winner = opponent;
+    state.winner = player;
     state.winReason = 'battle-rewards';
-    addLog(state, opponent, 'win', `${opponent} wins with 10+ Battle Rewards!`);
+    addLog(state, player, 'win', `${player} wins — ${opponent} has 10+ Battle Rewards!`);
     return;
   }
 
@@ -243,6 +251,27 @@ function clearTeams(state: GameState, player: PlayerId): void {
   }
 }
 
+function autoCreateSoloTeams(state: GameState, player: PlayerId): void {
+  const kingdom = state.players[player].kingdom;
+  for (const cardId of kingdom) {
+    const card = state.cards[cardId];
+    if (!card || card.state === undefined) continue; // Only characters have state
+
+    const teamId = generateId('team');
+    const team: Team = {
+      id: teamId,
+      owner: player,
+      characterIds: [cardId],
+      hasLead: true,
+      isAttacking: false,
+      isBlocking: false,
+    };
+    state.teams[teamId] = team;
+    card.teamId = teamId;
+    card.battleRole = 'team-lead';
+  }
+}
+
 export function organizeTeams(
   state: GameState,
   player: PlayerId,
@@ -317,8 +346,10 @@ export function sendAttackers(
     `Sent ${teamIds.length} team(s) to attack`
   );
 
-  // Move to Block Step
+  // Move to Block Step — defending player gets priority
   state.phase = 'battle-block';
+  state.priorityPlayer = getOpponent(state.currentTurn);
+  state.consecutivePasses = 0;
 }
 
 export function assignBlockers(
@@ -417,6 +448,7 @@ export function resolveShowdown(
     // Stalemate — 1 damage to both team leads
     applyShowdownDamage(state, attackingTeam, 'stalemate');
     applyShowdownDamage(state, blockingTeam, 'stalemate');
+    flushPendingTriggers(state);
     addLog(
       state,
       attackingTeam.owner,
@@ -434,6 +466,7 @@ export function resolveShowdown(
   if (difference >= 5) {
     // Outstanding Victory
     applyShowdownDamage(state, losingTeam, 'outstanding-victory');
+    flushPendingTriggers(state);
     addLog(
       state,
       winningTeam.owner,
@@ -444,6 +477,7 @@ export function resolveShowdown(
   } else {
     // Victory
     applyShowdownDamage(state, losingTeam, 'victory');
+    flushPendingTriggers(state);
     addLog(
       state,
       winningTeam.owner,
@@ -507,18 +541,21 @@ function applyShowdownDamage(
 
 function awardBattleRewards(
   state: GameState,
-  player: PlayerId,
+  winningPlayer: PlayerId,
   count: number
 ): void {
-  const opponent = getOpponent(player);
-  const opponentDeck = state.players[opponent].deck;
+  // In Primal TCG, battle rewards are cards from the LOSER's deck
+  // placed face-down in the LOSER's Battle Reward zone.
+  // When a player's BR zone reaches 10, their opponent wins.
+  const losingPlayer = getOpponent(winningPlayer);
+  const loserDeck = state.players[losingPlayer].deck;
 
   for (let i = 0; i < count; i++) {
-    if (opponentDeck.length === 0) break;
-    const cardId = opponentDeck.shift()!;
+    if (loserDeck.length === 0) break;
+    const cardId = loserDeck.shift()!;
     const card = state.cards[cardId];
     card.zone = 'battle-rewards';
-    state.players[player].battleRewards.push(cardId);
+    state.players[losingPlayer].battleRewards.push(cardId);
   }
 }
 
@@ -552,8 +589,7 @@ export function handlePassPriority(state: GameState): void {
     state.consecutivePasses = 0;
 
     if (state.chain.length > 0 && !state.isChainResolving) {
-      // Resolve the chain
-      // TODO: Chain resolution logic
+      resolveChain(state);
     } else {
       // No chain — advance to next phase
       advancePhase(state);
@@ -670,6 +706,7 @@ export function getLegalActions(state: GameState, player: PlayerId): PlayerActio
     case 'battle-block': {
       if (!isTurnPlayer) {
         actions.push('select-blockers');
+        actions.push('organize-teams');
       }
       break;
     }

@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0d1117;
+  --foreground: #e6e6e6;
 }
 
 @theme inline {
@@ -10,17 +10,78 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --color-zone-bg: rgba(255, 255, 255, 0.05);
+  --color-zone-border: rgba(255, 255, 255, 0.1);
+  --color-highlight: #f59e0b;
+  --color-selected: #06b6d4;
+  --color-necro: #8b5cf6;
+  --color-plasma: #f472b6;
+  --color-water: #3b82f6;
+  --color-fire: #ef4444;
+  --color-terra: #84cc16;
+  --color-air: #38bdf8;
+  --color-healthy: #22c55e;
+  --color-injured: #ef4444;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+@keyframes slide-in-down {
+  from {
+    opacity: 0;
+    transform: translateY(-16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in-down 0.3s ease-out;
+}
+
+/* Turn banner animations (Master Duel style) */
+@keyframes bannerIn {
+  0% {
+    opacity: 0;
+    transform: scaleX(0.3);
+  }
+  60% {
+    opacity: 1;
+    transform: scaleX(1.02);
+  }
+  100% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+}
+
+@keyframes bannerOut {
+  0% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scaleX(0.3);
+  }
+}
+
+@keyframes sweepLine {
+  0% {
+    transform: scaleX(0);
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    transform: scaleX(1);
+    opacity: 1;
+  }
 }

@@ -13,7 +13,6 @@ import {
 } from '../types';
 import {
   getCard,
-  getCardDef,
   getCardDefForInstance,
   moveCard,
   moveCardToBottomOfDeck,
@@ -214,7 +213,7 @@ function handleSummon(
   state.priorityPlayer = getOpponent(player);
   state.consecutivePasses = 0;
 
-  addLog(state, player, 'summon', `Summoning ${def.name}`);
+  addLog(state, player, 'summon', `Summoning ${def.name}`, action.cardInstanceId);
 
   return { success: true };
 }
@@ -299,7 +298,7 @@ function handlePlayStrategy(
   state.priorityPlayer = getOpponent(player);
   state.consecutivePasses = 0;
 
-  addLog(state, player, 'play-strategy', `Playing ${def.name}`);
+  addLog(state, player, 'play-strategy', `Playing ${def.name}`, action.cardInstanceId);
 
   return { success: true };
 }
@@ -369,7 +368,7 @@ function handlePlayAbility(
   state.priorityPlayer = getOpponent(player);
   state.consecutivePasses = 0;
 
-  addLog(state, player, 'play-ability', `Playing ${def.name}`);
+  addLog(state, player, 'play-ability', `Playing ${def.name}`, action.cardInstanceId);
 
   return { success: true };
 }
@@ -442,7 +441,7 @@ function handleActivateEffect(
   state.priorityPlayer = getOpponent(player);
   state.consecutivePasses = 0;
 
-  addLog(state, player, 'activate', `Activated ${def.name}'s effect`);
+  addLog(state, player, 'activate', `Activated ${def.name}'s effect`, action.cardInstanceId);
 
   return { success: true };
 }
@@ -486,11 +485,17 @@ function handleOrganizeTeams(
   player: PlayerId,
   action: Extract<PlayerAction, { type: 'organize-teams' }>
 ): { success: boolean; error?: string } {
-  if (state.phase !== 'organization') {
-    return { success: false, error: 'Not in Organization Phase' };
-  }
-  if (state.currentTurn !== player) {
-    return { success: false, error: 'Not your turn' };
+  // Allowed during organization (turn player) and battle-block (defender)
+  if (state.phase === 'organization') {
+    if (state.currentTurn !== player) {
+      return { success: false, error: 'Not your turn' };
+    }
+  } else if (state.phase === 'battle-block') {
+    if (state.currentTurn === player) {
+      return { success: false, error: 'Only the defender can reorganize during block' };
+    }
+  } else {
+    return { success: false, error: 'Cannot organize teams in this phase' };
   }
 
   // Validate team sizes (max 3 per team)

@@ -68,10 +68,36 @@ export function resolveChain(state: GameState): void {
   state.consecutivePasses = 0;
 }
 
+/**
+ * Flush any pending triggers into the chain and resolve them.
+ * Call this after non-chain events that can create triggers
+ * (e.g. showdown damage discarding characters).
+ */
+export function flushPendingTriggers(state: GameState): void {
+  if (state.pendingTriggers.length === 0) return;
+
+  const turnPlayerTriggers = state.pendingTriggers.filter(
+    (t) => t.owner === state.currentTurn
+  );
+  const nonTurnPlayerTriggers = state.pendingTriggers.filter(
+    (t) => t.owner !== state.currentTurn
+  );
+
+  state.pendingTriggers = [];
+
+  for (const trigger of [...turnPlayerTriggers, ...nonTurnPlayerTriggers]) {
+    state.chain.push(trigger);
+  }
+
+  if (state.chain.length > 0) {
+    resolveChain(state);
+  }
+}
+
 function resolveChainEntry(state: GameState, entry: ChainEntry): void {
   // Check if negated
   if (entry.negated) {
-    addLog(state, entry.owner, 'effect-negated', 'Effect was negated');
+    addLog(state, entry.owner, 'effect-negated', 'Effect was negated', entry.sourceCardInstanceId);
     handlePostResolution(state, entry);
     return;
   }
@@ -105,7 +131,8 @@ function resolveSummon(state: GameState, entry: ChainEntry): void {
     state,
     entry.owner,
     'summon-resolve',
-    `${def.name} enters the Kingdom`
+    `${def.name} enters the Kingdom`,
+    entry.sourceCardInstanceId
   );
 
   // Check for "put in play" triggers on the summoned character
@@ -135,7 +162,8 @@ function resolveStrategy(state: GameState, entry: ChainEntry): void {
       state,
       entry.owner,
       'strategy-permanent',
-      `${def.name} enters the Kingdom as a Permanent${def.permanentCount ? `(${def.permanentCount})` : ''}`
+      `${def.name} enters the Kingdom as a Permanent${def.permanentCount ? `(${def.permanentCount})` : ''}`,
+      entry.sourceCardInstanceId
     );
   } else {
     // Move to essence area
@@ -144,7 +172,8 @@ function resolveStrategy(state: GameState, entry: ChainEntry): void {
       state,
       entry.owner,
       'strategy-resolve',
-      `${def.name} resolved → Essence Area`
+      `${def.name} resolved → Essence Area`,
+      entry.sourceCardInstanceId
     );
   }
 }
@@ -160,7 +189,8 @@ function resolveAbility(state: GameState, entry: ChainEntry): void {
         state,
         entry.owner,
         'ability-fizzle',
-        `${def.name} fizzles — user no longer on battlefield`
+        `${def.name} fizzles — user no longer on battlefield`,
+        entry.sourceCardInstanceId
       );
       moveCard(state, entry.sourceCardInstanceId, 'essence');
       return;
@@ -187,7 +217,8 @@ function resolveAbility(state: GameState, entry: ChainEntry): void {
         state,
         entry.owner,
         'ability-fizzle',
-        `${def.name} fizzles — no valid targets`
+        `${def.name} fizzles — no valid targets`,
+        entry.sourceCardInstanceId
       );
       moveCard(state, entry.sourceCardInstanceId, 'essence');
       return;
@@ -203,7 +234,8 @@ function resolveAbility(state: GameState, entry: ChainEntry): void {
     state,
     entry.owner,
     'ability-resolve',
-    `${def.name} resolved → Essence Area`
+    `${def.name} resolved → Essence Area`,
+    entry.sourceCardInstanceId
   );
 }
 
