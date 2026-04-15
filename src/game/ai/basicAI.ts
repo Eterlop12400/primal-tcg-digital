@@ -17,6 +17,7 @@ import {
   CharacterCardDef,
   StrategyCardDef,
   AbilityCardDef,
+  FieldCardDef,
   Team,
 } from '../types';
 import {
@@ -294,6 +295,57 @@ function chooseActivateEffect(
           effectId: effect.id,
           costCardIds: [dp[0], dp[1]],
         };
+      }
+    }
+  }
+
+  // Check player's field card for activate effects
+  const fieldCardId = state.players[player].fieldCard;
+  if (fieldCardId) {
+    const fieldInst = state.cards[fieldCardId];
+    if (fieldInst && fieldInst.zone === 'field-area') {
+      const fDef = getCardDefForInstance(state, fieldCardId);
+      if (fDef.cardType === 'field') {
+        const fieldDef = fDef as FieldCardDef;
+        for (const effect of fieldDef.effects) {
+          if (effect.type !== 'activate') continue;
+          if (effect.timing !== 'main' && effect.timing !== 'both') continue;
+          if (effect.turnTiming === 'opponent-turn') continue;
+          if (effect.oncePerTurn && fieldInst.usedEffects.includes(effect.id)) continue;
+
+          if (fDef.id === 'F0006') {
+            // Micromon Beach — count Terra/Water characters
+            const allInPlay = [
+              ...getCardsInZone(state, player, 'kingdom'),
+              ...getCardsInZone(state, player, 'battlefield'),
+            ];
+            const terraWaterCount = allInPlay.filter((c) => {
+              const d = getCardDefForInstance(state, c.instanceId);
+              if (d.cardType !== 'character') return false;
+              return d.symbols.includes('terra') || d.symbols.includes('water');
+            }).length;
+
+            if (terraWaterCount < 2) continue;
+
+            // AI heuristic: prefer highest threshold available
+            // 6+ > 4+ draw > 2+ buff > 4+ essence swap
+            let choice: number;
+            if (terraWaterCount >= 6) {
+              choice = 3; // Block abilities
+            } else if (terraWaterCount >= 4) {
+              choice = 1; // Draw 1
+            } else {
+              choice = 0; // +1/+1 buff
+            }
+
+            return {
+              type: 'activate-effect',
+              cardInstanceId: fieldCardId,
+              effectId: effect.id,
+              effectSubChoice: choice,
+            };
+          }
+        }
       }
     }
   }

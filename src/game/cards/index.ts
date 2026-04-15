@@ -1,11 +1,17 @@
 // Card registry — all card definitions accessible by ID
 import { CardDef } from '../types';
 import { STARTER_DECK_1_CARDS } from './starter-deck-1';
+import { STARTER_DECK_2_CARDS } from './starter-deck-2';
 
 const cardRegistry: Record<string, CardDef> = {};
 
 // Register all starter deck 1 cards
 for (const card of STARTER_DECK_1_CARDS) {
+  cardRegistry[card.id] = card;
+}
+
+// Register all starter deck 2 cards
+for (const card of STARTER_DECK_2_CARDS) {
   cardRegistry[card.id] = card;
 }
 

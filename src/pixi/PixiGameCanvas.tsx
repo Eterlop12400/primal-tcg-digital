@@ -16,7 +16,7 @@ import { PlayerId, PlayerAction } from '@/game/types';
 import { getAIAction } from '@/game/ai';
 import { getCardDefForInstance, getLegalActions } from '@/game/engine';
 import { getActingPlayer, isHumanTurn } from '@/lib/gameHelpers';
-import { AUTO_PASS_DELAY_MS } from '@/lib/constants';
+import { AUTO_PASS_DELAY_MS, SPEED_PRESETS } from '@/lib/constants';
 import { GameRenderer } from './GameRenderer';
 
 interface PixiGameCanvasProps {
@@ -137,6 +137,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
     humanPlayer: uiState.humanPlayer,
     isPaused: uiState.isPaused,
     aiSpeed: uiState.aiSpeed,
+    speedPreset: uiState.speedPreset,
     isAIThinking: uiState.isAIThinking,
     gameStarted: uiState.gameStarted,
     mulliganDone: uiState.mulliganDone,
@@ -162,6 +163,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
     // Don't auto-pass when there's a pending interactive choice
     if (gameState.pendingSearch || gameState.pendingTargetChoice || gameState.pendingOptionalEffect) return;
 
+    const autoPassDelay = SPEED_PRESETS[uiState.speedPreset].autoPassDelay;
     const humanPlayer = uiState.humanPlayer;
     const isTurnPlayer = gameState.currentTurn === humanPlayer;
     const phase = gameState.phase;
@@ -223,7 +225,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
             action: { type: 'select-blockers', assignments: [] },
           });
           autoPassRef.current = null;
-        }, AUTO_PASS_DELAY_MS);
+        }, autoPassDelay);
         return () => {
           if (autoPassRef.current) {
             clearTimeout(autoPassRef.current);
@@ -253,7 +255,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
               },
             });
             autoPassRef.current = null;
-          }, AUTO_PASS_DELAY_MS);
+          }, autoPassDelay);
           return () => {
             if (autoPassRef.current) {
               clearTimeout(autoPassRef.current);
@@ -281,7 +283,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
         autoPassRef.current = null;
       }
     };
-  }, [gameState, isMyTurn, legalActions, uiState.mode, uiState.humanPlayer, uiState.gameStarted, dispatch]);
+  }, [gameState, isMyTurn, legalActions, uiState.mode, uiState.humanPlayer, uiState.gameStarted, uiState.speedPreset, dispatch]);
 
   // ============================================================
   // Render

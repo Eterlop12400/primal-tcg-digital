@@ -5,7 +5,8 @@ import { GameState, PlayerId, PlayerAction } from '@/game/types';
 import { getAIAction } from '@/game/ai';
 import { GameMode } from './useGameEngine';
 import { getActingPlayer } from '@/lib/gameHelpers';
-import { AI_MOVE_DELAY_MS } from '@/lib/constants';
+import { AI_MOVE_DELAY_MS, SPEED_PRESETS } from '@/lib/constants';
+import type { SpeedPreset } from '@/lib/constants';
 
 // ============================================================
 // Types
@@ -17,6 +18,7 @@ interface UseAILoopOptions {
   humanPlayer: PlayerId;
   isPaused: boolean;
   aiSpeed: number;
+  speedPreset: SpeedPreset;
   isAIThinking: boolean;
   gameStarted: boolean;
   mulliganDone: Record<PlayerId, boolean>;
@@ -36,6 +38,7 @@ export function useAILoop(options: UseAILoopOptions): void {
     humanPlayer,
     isPaused,
     aiSpeed,
+    speedPreset,
     isAIThinking,
     gameStarted,
     mulliganDone,
@@ -43,6 +46,8 @@ export function useAILoop(options: UseAILoopOptions): void {
     onAIThinkingChange,
     onAIMulligan,
   } = options;
+
+  const aiDelay = SPEED_PRESETS[speedPreset].aiMoveDelay;
 
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -79,7 +84,7 @@ export function useAILoop(options: UseAILoopOptions): void {
             onAIMulliganRef.current(aiPlayer);
             onAIThinkingChangeRef.current(false);
             timeoutRef.current = null;
-          }, AI_MOVE_DELAY_MS);
+          }, aiDelay);
         }
       } else if (mode === 'aivai') {
         // Both players are AI — mulligan for whichever hasn't gone yet
@@ -95,7 +100,7 @@ export function useAILoop(options: UseAILoopOptions): void {
             onAIMulliganRef.current(nextToMulligan);
             onAIThinkingChangeRef.current(false);
             timeoutRef.current = null;
-          }, Math.min(aiSpeed, AI_MOVE_DELAY_MS));
+          }, aiDelay);
         }
       }
       return;
@@ -181,7 +186,7 @@ export function useAILoop(options: UseAILoopOptions): void {
         }
         onAIThinkingChangeRef.current(false);
         timeoutRef.current = null;
-      }, AI_MOVE_DELAY_MS);
+      }, aiDelay);
     } else if (mode === 'aivai') {
       // Both players are AI — always schedule the next action
       const actingPlayer = getActingPlayer(gameState);
@@ -196,7 +201,7 @@ export function useAILoop(options: UseAILoopOptions): void {
         }
         onAIThinkingChangeRef.current(false);
         timeoutRef.current = null;
-      }, aiSpeed);
+      }, aiDelay);
     }
 
     // Cleanup on unmount or when dependencies change
@@ -206,5 +211,5 @@ export function useAILoop(options: UseAILoopOptions): void {
         timeoutRef.current = null;
       }
     };
-  }, [gameState, mode, humanPlayer, isPaused, aiSpeed, gameStarted, mulliganDone]);
+  }, [gameState, mode, humanPlayer, isPaused, aiSpeed, speedPreset, gameStarted, mulliganDone]);
 }

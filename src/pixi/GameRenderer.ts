@@ -28,6 +28,7 @@ import { CardPreviewOverlay } from './overlays/CardPreviewOverlay';
 import { PileViewerOverlay } from './overlays/PileViewerOverlay';
 import { DeckSearchOverlay } from './overlays/DeckSearchOverlay';
 import { EssencePickerOverlay } from './overlays/EssencePickerOverlay';
+import { FieldActivateOverlay } from './overlays/FieldActivateOverlay';
 import { showCardCloseUp } from './effects/CardCloseUp';
 import { showEffectCallout } from './effects/Animations';
 import gsap from 'gsap';
@@ -53,6 +54,7 @@ import type {
   CharacterCardDef,
   StrategyCardDef,
   AbilityCardDef,
+  FieldCardDef,
 } from '@/game/types';
 import type { AnimationEvent } from '@/game/engine/animationEvents';
 import { AnimationQueue } from './animation/AnimationQueue';
@@ -70,7 +72,10 @@ import {
   canPlayStrategyCard,
   getValidHandCostCards,
 } from '@/lib/gameHelpers';
-import { PHASE_LABELS } from '@/lib/constants';
+import { PHASE_LABELS, SPEED_PRESETS } from '@/lib/constants';
+import type { SpeedPreset } from '@/lib/constants';
+import { NarrationTracker } from './narration/NarrationTracker';
+import { NarrationOverlay } from './narration/NarrationOverlay';
 
 export class GameRenderer {
   app: Application;
@@ -104,6 +109,11 @@ export class GameRenderer {
   // Animation system
   private animationQueue: AnimationQueue;
   private animationRouter: AnimationRouter | null = null;
+
+  // Narration system
+  private narrationTracker = new NarrationTracker();
+  private narrationOverlay: NarrationOverlay | null = null;
+  private narrationContainer = new Container(); // persistent, not cleared each frame
 
   constructor() {
     this.app = new Application();
@@ -140,6 +150,14 @@ export class GameRenderer {
     this.layout = computeLayout(screenW, screenH);
     this.animationRouter = new AnimationRouter(this.effectsLayer, this.boardLayer, this.layout);
     this.animationQueue.setPlayer((event) => this.animationRouter!.play(event));
+
+    // Narration overlay persists across frame rebuilds (not cleared with uiLayer.removeChildren)
+    this.narrationOverlay = new NarrationOverlay();
+    this.narrationOverlay.updateLayout(screenW, screenH, 44);
+    this.narrationContainer.addChild(this.narrationOverlay);
+    // narrationContainer is added to stage directly so it's above uiLayer and not cleared
+    this.app.stage.addChild(this.narrationContainer);
+
     this.initialized = true;
   }
 
@@ -167,6 +185,9 @@ export class GameRenderer {
         if (this.animationRouter) {
           this.animationRouter.updateLayout(this.layout);
         }
+        if (this.narrationOverlay) {
+          this.narrationOverlay.updateLayout(w, h, 44);
+        }
         if (this.currentGameState && this.currentUIState) {
           this.update(this.currentGameState, this.currentUIState);
         }
@@ -178,6 +199,11 @@ export class GameRenderer {
     const prevState = this.currentGameState;
     this.currentGameState = gameState;
     this.currentUIState = uiState;
+
+    // Reset narration tracker on new game
+    if (!prevState || (prevState.turnNumber > 0 && gameState.turnNumber === 0)) {
+      this.narrationTracker.reset();
+    }
 
     // Update animation router layout
     if (this.animationRouter) {
@@ -193,9 +219,31 @@ export class GameRenderer {
       this.animationRouter.setCardPositions(this.cardPositions);
     }
 
+    // Sync animation queue speed with current speed preset
+    const speedConfig = SPEED_PRESETS[uiState.speedPreset];
+    this.animationQueue.setSpeed(speedConfig.animationSpeed);
+
     // Enqueue animation events if provided
     if (hasCollectorEvents) {
       this.animationQueue.enqueue(events);
+    }
+
+    // Process narration for new events
+    if (hasCollectorEvents && uiState.narrationEnabled && this.narrationOverlay) {
+      const narrationItems = this.narrationTracker.processEvents(events, uiState.humanPlayer, uiState.mode);
+      if (narrationItems.length > 0) {
+        this.narrationOverlay.enqueue(narrationItems);
+      }
+    }
+
+    // Update narration overlay layout
+    if (this.narrationOverlay) {
+      this.narrationOverlay.updateLayout(this.app.screen.width, this.app.screen.height, 44);
+      this.narrationOverlay.setVoiceEnabled(uiState.narrationEnabled);
+      this.narrationOverlay.visible = uiState.narrationEnabled;
+      if (!uiState.narrationEnabled) {
+        this.narrationOverlay.clear();
+      }
     }
 
     this.boardLayer.removeChildren();
@@ -251,6 +299,11 @@ export class GameRenderer {
       this.renderOptionalEffectOverlay(gameState, uiState);
     }
 
+    // Field activate picker overlay (e.g., Micromon Beach)
+    if (uiState.selectionMode.type === 'field-activate-pick' && this.dispatch) {
+      this.renderFieldActivateOverlay(gameState, uiState);
+    }
+
     // Coin flip overlay (fires once, self-destroys via GSAP)
     this.checkCoinFlip(gameState, uiState);
   }
@@ -279,6 +332,14 @@ export class GameRenderer {
 
     // Phase change banner + subtle board scale pulse
     if (state.phase !== this.prevPhase && state.currentTurn === this.prevCurrentTurn) {
+      // Phase narration
+      if (ui.narrationEnabled && this.narrationOverlay && this.prevPhase) {
+        const phaseNarration = this.narrationTracker.processPhaseChange(this.prevPhase, state.phase);
+        if (phaseNarration) {
+          this.narrationOverlay.enqueue([phaseNarration]);
+        }
+      }
+
       const phaseText = PHASE_LABELS[state.phase] ?? state.phase;
       if (state.phase !== 'start' && state.phase !== 'setup') {
         showPhaseBanner(this.effectsLayer, phaseText, L.width, L.height);
@@ -856,7 +917,21 @@ export class GameRenderer {
             def = getCardDefForInstance(state, pile.instanceId);
             if (def.cardType === 'character') stats = getEffectiveStats(state, pile.instanceId);
           } catch { /* skip */ }
-          const card = new CardSprite({ defId: inst.defId, size: pileSize, cardDef: def, instance: inst, effectiveStats: stats, showName: pileSize.width >= 56 });
+
+          // Determine if field card is clickable for activate effect
+          const isFieldActivatable = !!(def?.cardType === 'field' && pile.zone === 'field'
+            && this.dispatch && this.currentUIState
+            && this.isFieldCardActivatable(state, this.currentUIState, pile.instanceId!, def as FieldCardDef));
+          const card = new CardSprite({
+            defId: inst.defId,
+            size: pileSize,
+            cardDef: def,
+            instance: inst,
+            effectiveStats: stats,
+            showName: pileSize.width >= 56,
+            highlighted: isFieldActivatable,
+            highlightColor: isFieldActivatable ? COLORS.accentCyan : undefined,
+          });
           card.x = centerX;
           card.y = cardY;
 
@@ -867,6 +942,11 @@ export class GameRenderer {
               if (e.button === 2) {
                 e.preventDefault?.();
                 this.showCardPreview(inst.defId, inst, stats);
+                return;
+              }
+              // Left-click: field card activate
+              if (isFieldActivatable && this.dispatch && this.currentUIState) {
+                this.handleFieldCardClick(state, this.currentUIState, pile.instanceId!, def as FieldCardDef, this.dispatch);
               }
             });
           }
@@ -1061,7 +1141,34 @@ export class GameRenderer {
           (smType === 'ability-target-select' || smType === 'activate-target-select'));
         const isUserSelectMode = !!(this.currentUIState && smType === 'ability-user-select');
         const isKingdomSelected = this.currentUIState?.selectedCardIds.includes(cid) ?? false;
-        const isKingdomHighlighted = (isTargetMode || isUserSelectMode) && (inst.zone === 'battlefield' || inst.zone === 'kingdom');
+
+        // Determine if this card should be highlighted as a valid target
+        let isKingdomHighlighted = false;
+        if ((isTargetMode || isUserSelectMode) && (inst.zone === 'battlefield' || inst.zone === 'kingdom')) {
+          if (isTargetMode && smType === 'ability-target-select') {
+            // Check if ability requires opposing targets — only highlight valid opposing chars
+            const sm2 = this.currentUIState!.selectionMode as { type: 'ability-target-select'; abilityCardId: string; userId: string; needed: number };
+            try {
+              const abDef3 = getCardDefForInstance(state, sm2.abilityCardId) as AbilityCardDef;
+              if (abDef3.targetDescription && abDef3.targetDescription.toLowerCase().includes('opposing')) {
+                const userTeam2 = Object.values(state.teams).find((t) => t.characterIds.includes(sm2.userId));
+                const targetTeam2 = Object.values(state.teams).find((t) => t.characterIds.includes(cid));
+                if (userTeam2 && targetTeam2) {
+                  isKingdomHighlighted = (userTeam2.isAttacking && targetTeam2.blockingTeamId === userTeam2.id) ||
+                    (userTeam2.isBlocking && userTeam2.blockingTeamId === targetTeam2.id) ||
+                    (userTeam2.isAttacking && userTeam2.blockedByTeamId === targetTeam2.id) ||
+                    (targetTeam2.isAttacking && targetTeam2.blockedByTeamId === userTeam2.id);
+                }
+              } else {
+                isKingdomHighlighted = true; // Non-opposing target — highlight all
+              }
+            } catch {
+              isKingdomHighlighted = true; // Fallback — highlight all
+            }
+          } else {
+            isKingdomHighlighted = true; // User select or activate target — highlight all
+          }
+        }
         const card = new CardSprite({ defId: inst.defId, size: actualSize, cardDef: def, instance: inst, effectiveStats: stats, injured: isInjured, highlighted: isKingdomHighlighted, selected: isKingdomSelected, interactive: isKingdomHighlighted });
 
         if (group.isTeam) {
@@ -1649,6 +1756,97 @@ export class GameRenderer {
   }
 
   // ============================================================
+  // Field Card Activate Logic
+  // ============================================================
+
+  /** Count Terra/Water characters a player controls (kingdom + battlefield) */
+  private countTerraWaterChars(state: GameState, player: PlayerId): number {
+    const kingdom = state.players[player].kingdom;
+    const battlefield = state.players[player].battlefield;
+    let count = 0;
+    for (const id of [...kingdom, ...battlefield]) {
+      try {
+        const def = getCardDefForInstance(state, id);
+        if (def.cardType !== 'character') continue;
+        if (def.symbols.includes('terra') || def.symbols.includes('water')) count++;
+      } catch { /* skip */ }
+    }
+    return count;
+  }
+
+  /** Check if a field card's activate effect can be used right now */
+  private isFieldCardActivatable(state: GameState, ui: UIState, instanceId: string, def: FieldCardDef): boolean {
+    const hp = ui.humanPlayer;
+    if (state.phase !== 'main') return false;
+    if (state.currentTurn !== hp) return false;
+    if (ui.selectionMode.type !== 'none') return false;
+
+    const inst = state.cards[instanceId];
+    if (!inst || inst.zone !== 'field-area') return false;
+
+    const effect = def.effects.find((e) => e.type === 'activate');
+    if (!effect) return false;
+    if (effect.oncePerTurn && inst.usedEffects.includes(effect.id)) return false;
+
+    // Check that at least one sub-effect is available
+    const count = this.countTerraWaterChars(state, hp);
+    return count >= 2;
+  }
+
+  /** Handle left-click on a field card to open the activate picker */
+  private handleFieldCardClick(state: GameState, ui: UIState, instanceId: string, def: FieldCardDef, dispatch: (action: UIAction) => void): void {
+    const hp = ui.humanPlayer;
+    const effect = def.effects.find((e) => e.type === 'activate');
+    if (!effect) return;
+
+    const count = this.countTerraWaterChars(state, hp);
+
+    const effects = [
+      { index: 0, threshold: '2+', desc: 'Select 1 Character — it gets +1/+1 this turn', available: count >= 2 },
+      { index: 1, threshold: '4+', desc: 'Draw 1 card', available: count >= 4 },
+      { index: 2, threshold: '4+', desc: "Discard 1 from opponent's Essence, move 1 from your DP to Essence", available: count >= 4 },
+      { index: 3, threshold: '6+', desc: 'Ability cards cannot be played during this turn', available: count >= 6 },
+    ];
+
+    dispatch({
+      type: 'SET_SELECTION_MODE',
+      mode: {
+        type: 'field-activate-pick',
+        cardId: instanceId,
+        effectId: effect.id,
+        effects,
+      },
+    });
+  }
+
+  /** Render the field activate picker overlay */
+  private renderFieldActivateOverlay(state: GameState, ui: UIState): void {
+    const sm = ui.selectionMode;
+    if (sm.type !== 'field-activate-pick' || !this.dispatch) return;
+
+    const count = this.countTerraWaterChars(state, ui.humanPlayer);
+
+    // Get card name
+    let cardName = 'FIELD CARD';
+    try {
+      const def = getCardDefForInstance(state, sm.cardId);
+      cardName = def.name;
+    } catch { /* skip */ }
+
+    const overlay = new FieldActivateOverlay(
+      this.layout,
+      cardName,
+      count,
+      sm.effectId,
+      sm.cardId,
+      sm.effects,
+      this.dispatch,
+      ui.humanPlayer,
+    );
+    this.overlayLayer.addChild(overlay);
+  }
+
+  // ============================================================
   // Kingdom/Battlefield Card Click Logic (for ability/activate flows)
   // ============================================================
 
@@ -2055,7 +2253,8 @@ export class GameRenderer {
       sm.type === 'ability-select' || sm.type === 'ability-user-select' ||
       sm.type === 'ability-target-select' || sm.type === 'ability-essence-cost' ||
       sm.type === 'activate-effect-select' || sm.type === 'activate-pick-effect' ||
-      sm.type === 'activate-target-select' || sm.type === 'activate-cost-select'
+      sm.type === 'activate-target-select' || sm.type === 'activate-cost-select' ||
+      sm.type === 'field-activate-pick'
     ) {
       buttons.push({ label: 'CANCEL', color: 0x374151, onClick: () => d({ type: 'CLEAR_SELECTION' }) });
     } else if (sm.type === 'select-attackers') {
@@ -2418,6 +2617,102 @@ export class GameRenderer {
       errTxt.y = centerY - 12;
       this.uiLayer.addChild(errTxt);
     }
+
+    // Speed + narration controls
+    this.renderSettingsControls(state, ui);
+  }
+
+  // ============================================================
+  // Settings Controls (Speed + Narration)
+  // ============================================================
+
+  private renderSettingsControls(_state: GameState, ui: UIState): void {
+    if (!this.dispatch) return;
+    const L = this.layout;
+    const d = this.dispatch;
+
+    const btnW = 36;
+    const btnH = 20;
+    const gap = 4;
+    const centerY = L.uiBarY + L.uiBarH / 2;
+
+    // Position: right side, to the left of BR text
+    const startX = L.width - 200;
+
+    const presets: { label: string; key: SpeedPreset }[] = [
+      { label: 'SLW', key: 'slow' },
+      { label: 'NRM', key: 'normal' },
+      { label: 'FST', key: 'fast' },
+    ];
+
+    presets.forEach((preset, i) => {
+      const x = startX + i * (btnW + gap);
+      const isActive = ui.speedPreset === preset.key;
+
+      const btn = new Graphics();
+      btn.roundRect(x, centerY - btnH / 2, btnW, btnH, 3);
+      if (isActive) {
+        btn.fill({ color: COLORS.accentCyan, alpha: 0.8 });
+      } else {
+        btn.fill({ color: 0x1a2535, alpha: 0.6 });
+      }
+      btn.eventMode = 'static';
+      btn.cursor = 'pointer';
+      btn.on('pointerdown', () => {
+        d({ type: 'SET_SPEED_PRESET', preset: preset.key });
+      });
+      this.uiLayer.addChild(btn);
+
+      const lbl = new Text({
+        text: preset.label,
+        style: new TextStyle({
+          fontSize: 9,
+          fill: isActive ? 0x000000 : COLORS.textMuted,
+          fontFamily: FONT,
+          fontWeight: 'bold',
+          letterSpacing: 0.5,
+        }),
+      });
+      lbl.anchor.set(0.5, 0.5);
+      lbl.x = x + btnW / 2;
+      lbl.y = centerY;
+      lbl.eventMode = 'none';
+      this.uiLayer.addChild(lbl);
+    });
+
+    // Narration toggle
+    const narX = startX + presets.length * (btnW + gap) + gap;
+    const isNarActive = ui.narrationEnabled;
+
+    const narBtn = new Graphics();
+    narBtn.roundRect(narX, centerY - btnH / 2, btnW, btnH, 3);
+    if (isNarActive) {
+      narBtn.fill({ color: COLORS.accentCyan, alpha: 0.8 });
+    } else {
+      narBtn.fill({ color: 0x1a2535, alpha: 0.6 });
+    }
+    narBtn.eventMode = 'static';
+    narBtn.cursor = 'pointer';
+    narBtn.on('pointerdown', () => {
+      d({ type: 'SET_NARRATION_ENABLED', enabled: !ui.narrationEnabled });
+    });
+    this.uiLayer.addChild(narBtn);
+
+    const narLbl = new Text({
+      text: 'NAR',
+      style: new TextStyle({
+        fontSize: 9,
+        fill: isNarActive ? 0x000000 : COLORS.textMuted,
+        fontFamily: FONT,
+        fontWeight: 'bold',
+        letterSpacing: 0.5,
+      }),
+    });
+    narLbl.anchor.set(0.5, 0.5);
+    narLbl.x = narX + btnW / 2;
+    narLbl.y = centerY;
+    narLbl.eventMode = 'none';
+    this.uiLayer.addChild(narLbl);
   }
 
   // ============================================================
@@ -2899,6 +3194,9 @@ export class GameRenderer {
   }
 
   destroy(): void {
+    if (this.narrationOverlay) {
+      this.narrationOverlay.clear();
+    }
     if (this.initialized) {
       this.app.destroy(true);
     }

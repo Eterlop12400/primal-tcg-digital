@@ -10,6 +10,7 @@ import {
   CharacterCardDef,
   StrategyCardDef,
   AbilityCardDef,
+  FieldCardDef,
 } from '../types';
 import {
   getCard,
@@ -351,6 +352,12 @@ function handlePlayAbility(
     return { success: false, error: 'Can only play abilities during Exchange of Ability' };
   }
 
+  // Check Micromon Beach 6+ restriction
+  const noAbilitiesEffect = state.lingeringEffects.find((e) => e.id.startsWith('micromon_beach_no_abilities'));
+  if (noAbilitiesEffect) {
+    return { success: false, error: 'Ability cards cannot be played this turn (Micromon Beach)' };
+  }
+
   const card = getCard(state, action.cardInstanceId);
   const def = getCardDefForInstance(state, action.cardInstanceId) as AbilityCardDef;
 
@@ -454,19 +461,22 @@ function handleActivateEffect(
   const card = getCard(state, action.cardInstanceId);
   const def = getCardDefForInstance(state, action.cardInstanceId);
 
-  if (def.cardType !== 'character') {
-    return { success: false, error: 'Only character cards have activate effects in this deck' };
+  if (def.cardType !== 'character' && def.cardType !== 'field') {
+    return { success: false, error: 'Only character and field cards have activate effects' };
   }
 
-  const charDef = def as CharacterCardDef;
-  const effect = charDef.effects.find((e) => e.id === action.effectId);
+  // Find the effect on the card
+  const effectList = def.cardType === 'character'
+    ? (def as CharacterCardDef).effects
+    : (def as FieldCardDef).effects;
+  const effect = effectList.find((e) => e.id === action.effectId);
 
   if (!effect || effect.type !== 'activate') {
     return { success: false, error: 'Effect not found or not an activate effect' };
   }
 
-  // Check injured
-  if (card.state === 'injured' && !effect.isValid) {
+  // Check injured (characters only)
+  if (def.cardType === 'character' && card.state === 'injured' && !effect.isValid) {
     return { success: false, error: 'Character is injured and effect is not Valid' };
   }
 
@@ -507,6 +517,7 @@ function handleActivateEffect(
     type: 'activate-effect',
     sourceCardInstanceId: action.cardInstanceId,
     effectId: action.effectId,
+    effectSubChoice: action.effectSubChoice,
     targetIds: action.targetIds,
     resolved: false,
     negated: false,
@@ -814,26 +825,59 @@ function handleSearchSelect(
     return { success: false, error: 'Invalid search selection' };
   }
 
-  // Move chosen card from deck to hand
-  state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
-  const card = getCard(state, chosen);
-  card.zone = 'hand';
-  state.players[player].hand.push(chosen);
+  const effectId = state.pendingSearch.effectId;
 
-  const def = getCardDefForInstance(state, chosen);
-  addLog(state, player, 'search', `Selected ${def.name}`);
+  if (effectId === 'C0087-E1') {
+    // Rococo — put selected card into kingdom with +1/+1 counter
+    state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
+    const card = getCard(state, chosen);
+    card.zone = 'kingdom';
+    card.state = 'healthy';
+    state.players[player].kingdom.push(chosen);
 
-  if (discardRest && displayCardIds) {
-    // Discard the remaining displayed cards (e.g., Vanessa — discard the other top cards)
-    const toDiscard = displayCardIds.filter((id) => id !== chosen);
-    for (const id of toDiscard) {
-      state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
-      moveCard(state, id, 'discard');
-    }
-  } else {
-    // Standard search: shuffle deck after
+    // Add +1/+1 counter
+    card.counters.push({ type: 'plus-one' });
+
+    // Create a solo team
+    const teamId = generateId('team');
+    state.teams[teamId] = {
+      id: teamId,
+      owner: player,
+      characterIds: [chosen],
+      hasLead: true,
+      isAttacking: false,
+      isBlocking: false,
+    };
+    card.teamId = teamId;
+    card.battleRole = 'team-lead';
+
+    const def = getCardDefForInstance(state, chosen);
+    addLog(state, player, 'effect', `Rococo — ${def.name} enters kingdom with +1/+1 Counter`);
+
     const { shuffleDeck } = require('./utils');
     shuffleDeck(state, player);
+  } else {
+    // Default: move chosen card from deck to hand
+    state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
+    const card = getCard(state, chosen);
+    card.zone = 'hand';
+    state.players[player].hand.push(chosen);
+
+    const def = getCardDefForInstance(state, chosen);
+    addLog(state, player, 'search', `Selected ${def.name}`);
+
+    if (discardRest && displayCardIds) {
+      // Discard the remaining displayed cards (e.g., Vanessa — discard the other top cards)
+      const toDiscard = displayCardIds.filter((id) => id !== chosen);
+      for (const id of toDiscard) {
+        state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
+        moveCard(state, id, 'discard');
+      }
+    } else {
+      // Standard search: shuffle deck after
+      const { shuffleDeck } = require('./utils');
+      shuffleDeck(state, player);
+    }
   }
 
   state.pendingSearch = undefined;
@@ -981,6 +1025,33 @@ function handleResolveTargetChoice(
         });
         addLog(state, player, 'effect', 'Samanosuke — Gained +2/+0 this turn');
       }
+      break;
+    }
+    case 'C0093-E1': {
+      // Linda The Puffer — move chosen hand card to bottom of deck
+      moveCardToBottomOfDeck(state, chosen);
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Linda The Puffer — Put ${def.name} at bottom of deck`);
+      break;
+    }
+    case 'F0006-E1-buff': {
+      // Micromon Beach 2+ — apply +1/+1 to chosen character this turn
+      const target = getCard(state, chosen);
+      target.statModifiers.push({
+        lead: 1,
+        support: 1,
+        source: 'F0006-MicromonBeach',
+        duration: 'turn',
+      });
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Micromon Beach — ${def.name} gets +1/+1 this turn`);
+      break;
+    }
+    case 'F0006-E1-dp-to-essence': {
+      // Micromon Beach 4+ — move chosen DP card to essence
+      moveCard(state, chosen, 'essence');
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Micromon Beach — Moved ${def.name} from DP to Essence`);
       break;
     }
     default:

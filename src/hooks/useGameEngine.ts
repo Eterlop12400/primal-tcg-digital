@@ -13,6 +13,8 @@ import {
 } from '@/game/engine';
 import type { AnimationEvent } from '@/game/engine/animationEvents';
 import { getActingPlayer, isHumanTurn } from '@/lib/gameHelpers';
+import { SPEED_PRESETS } from '@/lib/constants';
+import type { SpeedPreset } from '@/lib/constants';
 
 // ============================================================
 // Types
@@ -40,7 +42,9 @@ export type SelectionMode =
   | { type: 'activate-effect-select' }
   | { type: 'activate-pick-effect'; cardId: string; effects: { id: string; desc: string }[] }
   | { type: 'activate-target-select'; cardId: string; effectId: string; needed: number }
-  | { type: 'activate-cost-select'; cardId: string; effectId: string; targetIds: string[]; needed: number; costSource: 'hand' | 'discard' | 'essence'; costDescription?: string };
+  | { type: 'activate-cost-select'; cardId: string; effectId: string; targetIds: string[]; needed: number; costSource: 'hand' | 'discard' | 'essence'; costDescription?: string }
+  // Field card activate effect picker (e.g., Micromon Beach)
+  | { type: 'field-activate-pick'; cardId: string; effectId: string; effects: { index: number; threshold: string; desc: string; available: boolean }[] };
 
 export interface UIState {
   gameState: GameState | null;
@@ -53,6 +57,8 @@ export interface UIState {
   isAIThinking: boolean;
   isPaused: boolean;
   aiSpeed: number;
+  speedPreset: SpeedPreset;
+  narrationEnabled: boolean;
   lastError: string | null;
   gameStarted: boolean;
   pendingEvents: AnimationEvent[];
@@ -73,6 +79,8 @@ export type UIAction =
   | { type: 'SET_AI_THINKING'; value: boolean }
   | { type: 'SET_PAUSED'; value: boolean }
   | { type: 'SET_AI_SPEED'; speed: number }
+  | { type: 'SET_SPEED_PRESET'; preset: SpeedPreset }
+  | { type: 'SET_NARRATION_ENABLED'; enabled: boolean }
   | { type: 'SET_ERROR'; error: string | null };
 
 // ============================================================
@@ -90,6 +98,8 @@ const initialUIState: UIState = {
   isAIThinking: false,
   isPaused: false,
   aiSpeed: 800,
+  speedPreset: 'normal' as SpeedPreset,
+  narrationEnabled: false,
   lastError: null,
   gameStarted: false,
   pendingEvents: [],
@@ -103,6 +113,8 @@ function uiReducer(state: UIState, action: UIAction): UIState {
   switch (action.type) {
     case 'INIT_GAME': {
       const gameState = createNewGame();
+      const defaultPreset: SpeedPreset = action.mode === 'aivai' ? 'slow' : 'normal';
+      const defaultNarration = action.mode === 'aivai';
       return {
         ...initialUIState,
         gameState,
@@ -111,6 +123,9 @@ function uiReducer(state: UIState, action: UIAction): UIState {
         selectionMode: { type: 'mulligan' },
         mulliganDone: { player1: false, player2: false },
         gameStarted: false,
+        speedPreset: defaultPreset,
+        narrationEnabled: defaultNarration,
+        aiSpeed: SPEED_PRESETS[defaultPreset].aiMoveDelay,
       };
     }
 
@@ -237,6 +252,15 @@ function uiReducer(state: UIState, action: UIAction): UIState {
 
     case 'SET_AI_SPEED': {
       return { ...state, aiSpeed: action.speed };
+    }
+
+    case 'SET_SPEED_PRESET': {
+      const config = SPEED_PRESETS[action.preset];
+      return { ...state, speedPreset: action.preset, aiSpeed: config.aiMoveDelay };
+    }
+
+    case 'SET_NARRATION_ENABLED': {
+      return { ...state, narrationEnabled: action.enabled };
     }
 
     case 'SET_ERROR': {

@@ -733,6 +733,35 @@ function applyShowdownDamage(
       }
     }
   }
+
+  // Check showdown-discard triggers on the discarded characters themselves
+  if (discardedIds.length > 0) {
+    for (const discardedId of discardedIds) {
+      const discardedCard = state.cards[discardedId];
+      if (!discardedCard) continue;
+      const def = getCardDefForInstance(state, discardedId);
+      if (def.cardType !== 'character') continue;
+      const charDef = def as CharacterCardDef;
+
+      for (const effect of charDef.effects) {
+        if (
+          effect.type === 'trigger' &&
+          effect.triggerCondition === 'showdown-discard' &&
+          effect.isValid
+        ) {
+          state.pendingTriggers.push({
+            id: `trigger_${discardedId}_${effect.id}`,
+            type: 'trigger-effect',
+            sourceCardInstanceId: discardedId,
+            effectId: effect.id,
+            resolved: false,
+            negated: false,
+            owner: discardedCard.owner,
+          });
+        }
+      }
+    }
+  }
 }
 
 function awardBattleRewards(

@@ -204,6 +204,7 @@ export interface ChainEntry {
   userId?: string;        // for ability cards (the character using it)
   targetIds?: string[];   // instanceIds of targets
   xValue?: number;        // for X cost effects
+  effectSubChoice?: number; // for multi-choice effects (e.g., Micromon Beach)
   resolved: boolean;
   negated: boolean;
   owner: PlayerId;
@@ -325,7 +326,7 @@ export type PlayerAction =
   | { type: 'summon'; cardInstanceId: string; handCostCardIds?: string[] }
   | { type: 'play-strategy'; cardInstanceId: string; handCostCardIds?: string[]; targetIds?: string[] }
   | { type: 'play-ability'; cardInstanceId: string; userId: string; targetIds?: string[]; essenceCostCardIds: string[]; xValue?: number }
-  | { type: 'activate-effect'; cardInstanceId: string; effectId: string; targetIds?: string[]; costCardIds?: string[] }
+  | { type: 'activate-effect'; cardInstanceId: string; effectId: string; targetIds?: string[]; costCardIds?: string[]; effectSubChoice?: number }
   | { type: 'charge-essence'; cardInstanceIds: string[] }
   | { type: 'pass-priority' }
   | { type: 'organize-teams'; teams: { leadId: string; supportIds: string[] }[] }

@@ -454,14 +454,17 @@ const effectHandlers: Record<string, EffectHandler> = {
   // --------------------------------------------------------
   // S0039 — Reaped Fear (Permanent 3, Unique)
   // TRIGGER: Once/turn, Slayer team discards opponent via showdown → win 1 BR
-  // (This is checked during showdown resolution, not here)
+  // Only fires from showdown trigger (effectId 'S0039-E1'), not on initial play
   // --------------------------------------------------------
   'S0039': (state, entry) => {
+    // No effect on play — this is a permanent with a trigger-only effect.
+    // The trigger fires from showdown resolution in gameLoop.ts.
+    if (entry.effectId !== 'S0039-E1') return;
+
     const player = entry.owner;
     const opponent = getOpponent(player);
 
-    // Award 1 additional Battle Reward — cards go from opponent's deck to opponent's BR zone
-    // (when opponent's BR reaches 10, the current player wins)
+    // Award 1 additional Battle Reward
     const opponentDeck = state.players[opponent].deck;
     if (opponentDeck.length > 0) {
       const cardId = opponentDeck.shift()!;
@@ -684,6 +687,128 @@ const effectHandlers: Record<string, EffectHandler> = {
   },
 
   // --------------------------------------------------------
+  // S0043 — Heavy Storm
+  // Discard 2 cards from opponent's Essence area, then draw 1 card
+  // --------------------------------------------------------
+  'S0043': (state, entry, collector) => {
+    const player = entry.owner;
+    const opponent = getOpponent(player);
+
+    // Discard up to 2 from opponent's essence
+    const opponentEssence = [...state.players[opponent].essence];
+    const toDiscard = opponentEssence.slice(0, Math.min(2, opponentEssence.length));
+    for (const id of toDiscard) {
+      moveCard(state, id, 'discard');
+    }
+
+    if (toDiscard.length > 0) {
+      addLog(state, player, 'effect', `Heavy Storm — Discarded ${toDiscard.length} card(s) from opponent's Essence`);
+    } else {
+      addLog(state, player, 'effect', 'Heavy Storm — Opponent has no Essence cards to discard');
+    }
+
+    // Draw 1 card
+    drawCards(state, player, 1);
+    addLog(state, player, 'effect', 'Heavy Storm — Drew 1 card');
+  },
+
+  // --------------------------------------------------------
+  // C0087 — Rococo
+  // TRIGGER [Valid|showdown-discard]: If Field is "Micromon Beach",
+  //   you may search deck for another "Rococo", put in play with +1/+1 counter
+  // --------------------------------------------------------
+  'C0087': (state, entry) => {
+    const player = entry.owner;
+
+    // Check field name
+    if (!fieldHasName(state, player, 'Micromon Beach')) {
+      addLog(state, player, 'effect', 'Rococo — Field is not Micromon Beach');
+      return;
+    }
+
+    // Category A "may" pattern
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0087-E1',
+        cardName: 'Rococo',
+        effectDescription: 'You may search your deck for 1 "Rococo" and put it in play with a +1/+1 Counter.',
+        owner: entry.owner,
+      };
+      return;
+    }
+
+    // Search deck for Rococo cards
+    const deck = state.players[player].deck;
+    const rococoInDeck = deck.filter((id) => {
+      const def = getCardDefForInstance(state, id);
+      return def.id === 'C0087';
+    });
+
+    if (rococoInDeck.length > 0) {
+      state.pendingSearch = {
+        effectId: 'C0087-E1',
+        owner: player,
+        criteria: '"Rococo" Character',
+        validCardIds: rococoInDeck,
+        sourceCardName: 'Rococo',
+      };
+    } else {
+      addLog(state, player, 'effect', 'Rococo — No Rococo found in deck');
+    }
+  },
+
+  // --------------------------------------------------------
+  // C0093 — Linda The Puffer
+  // TRIGGER [Sent to Attack]: If Field has Water or Terra,
+  //   you may draw 1 card, then move 1 hand card to deck bottom
+  // --------------------------------------------------------
+  'C0093': (state, entry) => {
+    const player = entry.owner;
+
+    // Check field has water or terra symbol
+    if (!fieldHasSymbol(state, player, 'water') && !fieldHasSymbol(state, player, 'terra')) {
+      addLog(state, player, 'effect', 'Linda The Puffer — Field has no Water or Terra symbol');
+      return;
+    }
+
+    // Category A "may" pattern
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0093-E1',
+        cardName: 'Linda The Puffer',
+        effectDescription: 'You may draw 1 card. If you do, move 1 card from your hand to the bottom of your deck.',
+        owner: entry.owner,
+      };
+      return;
+    }
+
+    // Draw 1 card
+    const drawn = drawCards(state, player, 1);
+    if (drawn.length === 0) {
+      addLog(state, player, 'effect', 'Linda The Puffer — Deck is empty, cannot draw');
+      return;
+    }
+
+    addLog(state, player, 'effect', 'Linda The Puffer — Drew 1 card');
+
+    // "And if you do" — must put 1 from hand to deck bottom
+    const hand = state.players[player].hand;
+    if (hand.length > 0) {
+      state.pendingTargetChoice = {
+        effectId: 'C0093-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: 'Choose a card from your hand to place at the bottom of your deck',
+        validTargetIds: [...hand],
+      };
+    }
+  },
+
+  // --------------------------------------------------------
   // A0038 — Swift Strike
   // At Showdown start: if target wasn't user of resolved ability → deal 1 dmg.
   // If discarded → draw 1
@@ -714,5 +839,96 @@ const effectHandlers: Record<string, EffectHandler> = {
       'effect',
       `Swift Strike — Targeting ${targetDef.name} at Showdown`
     );
+  },
+
+  // --------------------------------------------------------
+  // F0006 — Micromon Beach
+  // ACTIVATE [Your Turn|Main] (Once per turn): Apply 1 effect based on
+  // number of Terra/Water characters you control:
+  //   0: +1/+1 to 1 Character this turn (2+)
+  //   1: Draw 1 card (4+)
+  //   2: Discard 1 from opponent Essence, move 1 from your DP to Essence (4+)
+  //   3: Ability cards cannot be played this turn (6+)
+  // --------------------------------------------------------
+  'F0006': (state, entry) => {
+    const player = entry.owner;
+    const opponent = getOpponent(player);
+    const choice = entry.effectSubChoice ?? -1;
+
+    switch (choice) {
+      case 0: {
+        // 2+ → Select 1 Character, +1/+1 this turn
+        const kingdom = getCardsInZone(state, player, 'kingdom');
+        const battlefield = getCardsInZone(state, player, 'battlefield');
+        const validChars = [...kingdom, ...battlefield].filter((c) => {
+          const d = getCardDefForInstance(state, c.instanceId);
+          return d.cardType === 'character';
+        });
+
+        if (validChars.length > 0) {
+          state.pendingTargetChoice = {
+            effectId: 'F0006-E1-buff',
+            sourceCardId: entry.sourceCardInstanceId,
+            owner: player,
+            description: 'Choose a Character to give +1/+1 this turn',
+            validTargetIds: validChars.map((c) => c.instanceId),
+          };
+        } else {
+          addLog(state, player, 'effect', 'Micromon Beach — No characters to buff');
+        }
+        break;
+      }
+
+      case 1: {
+        // 4+ → Draw 1 card
+        drawCards(state, player, 1);
+        addLog(state, player, 'effect', 'Micromon Beach — Drew 1 card');
+        break;
+      }
+
+      case 2: {
+        // 4+ → Discard 1 from opponent Essence, move 1 from your DP to Essence
+        const opEssence = [...state.players[opponent].essence];
+        if (opEssence.length > 0) {
+          moveCard(state, opEssence[0], 'discard');
+          addLog(state, player, 'effect', 'Micromon Beach — Discarded 1 from opponent\'s Essence');
+        } else {
+          addLog(state, player, 'effect', 'Micromon Beach — Opponent has no Essence to discard');
+        }
+
+        // Move 1 from player's DP to Essence
+        const dp = state.players[player].discard;
+        if (dp.length > 0) {
+          state.pendingTargetChoice = {
+            effectId: 'F0006-E1-dp-to-essence',
+            sourceCardId: entry.sourceCardInstanceId,
+            owner: player,
+            description: 'Choose a card from your Discard Pile to move to Essence',
+            validTargetIds: [...dp],
+          };
+        } else {
+          addLog(state, player, 'effect', 'Micromon Beach — No cards in DP to move to Essence');
+        }
+        break;
+      }
+
+      case 3: {
+        // 6+ → Ability cards cannot be played this turn
+        state.lingeringEffects.push({
+          id: `micromon_beach_no_abilities_${entry.id}`,
+          source: entry.sourceCardInstanceId,
+          effectDescription: 'Ability cards cannot be played during this turn',
+          duration: 'turn',
+          appliedTurn: state.turnNumber,
+          data: {},
+        });
+        addLog(state, player, 'effect', 'Micromon Beach — Ability cards cannot be played this turn');
+        break;
+      }
+
+      default:
+        addLog(state, player, 'effect', 'Micromon Beach — No valid sub-effect choice');
+        break;
+    }
   },
 };

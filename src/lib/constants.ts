@@ -4,6 +4,20 @@ export const AI_VS_AI_MIN_DELAY = 200;
 export const AI_VS_AI_MAX_DELAY = 2000;
 export const AI_VS_AI_DEFAULT_DELAY = 600;
 
+export type SpeedPreset = 'slow' | 'normal' | 'fast';
+
+export interface SpeedConfig {
+  aiMoveDelay: number;
+  autoPassDelay: number;
+  animationSpeed: number;
+}
+
+export const SPEED_PRESETS: Record<SpeedPreset, SpeedConfig> = {
+  slow: { aiMoveDelay: 3000, autoPassDelay: 1500, animationSpeed: 0.5 },
+  normal: { aiMoveDelay: 1200, autoPassDelay: 600, animationSpeed: 1.0 },
+  fast: { aiMoveDelay: 400, autoPassDelay: 200, animationSpeed: 2.0 },
+};
+
 export const PHASE_LABELS: Record<string, string> = {
   setup: 'Setup',
   start: 'Start Phase',
