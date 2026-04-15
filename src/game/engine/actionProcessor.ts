@@ -16,18 +16,22 @@ import {
   getCardDefForInstance,
   moveCard,
   moveCardToBottomOfDeck,
+  drawCards,
   addLog,
   getOpponent,
   generateId,
   canPayHandCost,
   characterHasAttribute,
   cardHasSymbol,
+  fieldHasSymbol,
 } from './utils';
+import type { EventCollector } from './EventCollector';
 import {
   advanceToStartPhase,
   advanceToOrganizationPhase,
   advanceToBattlePhase,
   advanceToEndPhase,
+  finishEndPhase,
   advanceToEOA,
   advanceToShowdown,
   organizeTeams,
@@ -42,7 +46,8 @@ import { resolveChain, checkSentToAttackTriggers, checkSentToBattleTriggers } fr
 export function processAction(
   state: GameState,
   player: PlayerId,
-  action: PlayerAction
+  action: PlayerAction,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   // Validate it's this player's turn to act
   if (state.gameOver) {
@@ -57,43 +62,49 @@ export function processAction(
       return handleMulligan(state, player, action);
 
     case 'pass-priority':
-      return handlePass(state, player);
+      return handlePass(state, player, collector);
 
     case 'summon':
-      return handleSummon(state, player, action);
+      return handleSummon(state, player, action, collector);
 
     case 'play-strategy':
-      return handlePlayStrategy(state, player, action);
+      return handlePlayStrategy(state, player, action, collector);
 
     case 'play-ability':
-      return handlePlayAbility(state, player, action);
+      return handlePlayAbility(state, player, action, collector);
 
     case 'activate-effect':
-      return handleActivateEffect(state, player, action);
+      return handleActivateEffect(state, player, action, collector);
 
     case 'charge-essence':
-      return handleChargeEssence(state, player, action);
+      return handleChargeEssence(state, player, action, collector);
 
     case 'organize-teams':
       return handleOrganizeTeams(state, player, action);
 
     case 'choose-battle-or-end':
-      return handleBattleOrEnd(state, player, action);
+      return handleBattleOrEnd(state, player, action, collector);
 
     case 'select-attackers':
-      return handleSelectAttackers(state, player, action);
+      return handleSelectAttackers(state, player, action, collector);
 
     case 'select-blockers':
-      return handleSelectBlockers(state, player, action);
+      return handleSelectBlockers(state, player, action, collector);
 
     case 'choose-showdown-order':
-      return handleShowdownOrder(state, player, action);
+      return handleShowdownOrder(state, player, action, collector);
 
     case 'discard-to-hand-limit':
-      return handleDiscardToHandLimit(state, player, action);
+      return handleDiscardToHandLimit(state, player, action, collector);
 
     case 'search-select':
       return handleSearchSelect(state, player, action);
+
+    case 'resolve-target-choice':
+      return handleResolveTargetChoice(state, player, action);
+
+    case 'choose-optional-trigger':
+      return handleChooseOptionalTrigger(state, player, action, collector);
 
     default:
       return { success: false, error: `Unknown action type` };
@@ -126,21 +137,23 @@ function handleMulligan(
 
 function handlePass(
   state: GameState,
-  player: PlayerId
+  player: PlayerId,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.priorityPlayer !== player) {
     return { success: false, error: 'Not your priority' };
   }
 
   addLog(state, player, 'pass', 'Passed priority');
-  handlePassPriority(state);
+  handlePassPriority(state, collector);
   return { success: true };
 }
 
 function handleSummon(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'summon' }>
+  action: Extract<PlayerAction, { type: 'summon' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'main') {
     return { success: false, error: 'Can only summon during Main Phase' };
@@ -215,13 +228,26 @@ function handleSummon(
 
   addLog(state, player, 'summon', `Summoning ${def.name}`, action.cardInstanceId);
 
+  // Emit animation event (single close-up for summon — no separate chain notification)
+  collector?.emit({
+    type: 'card-zone-change',
+    player,
+    cardId: action.cardInstanceId,
+    cardName: def.name,
+    defId: def.id,
+    fromZone: 'hand',
+    toZone: 'general-play' as any,
+    reason: 'summon',
+  });
+
   return { success: true };
 }
 
 function handlePlayStrategy(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'play-strategy' }>
+  action: Extract<PlayerAction, { type: 'play-strategy' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'main') {
     return { success: false, error: 'Can only play strategies during Main Phase' };
@@ -300,13 +326,26 @@ function handlePlayStrategy(
 
   addLog(state, player, 'play-strategy', `Playing ${def.name}`, action.cardInstanceId);
 
+  // Single close-up for strategy play (shown as "STRATEGY!" via card-zone-change summon-style)
+  collector?.emit({
+    type: 'card-zone-change',
+    player,
+    cardId: action.cardInstanceId,
+    cardName: def.name,
+    defId: def.id,
+    fromZone: 'hand',
+    toZone: 'general-play' as any,
+    reason: 'play',
+  });
+
   return { success: true };
 }
 
 function handlePlayAbility(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'play-ability' }>
+  action: Extract<PlayerAction, { type: 'play-ability' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'battle-eoa') {
     return { success: false, error: 'Can only play abilities during Exchange of Ability' };
@@ -333,6 +372,39 @@ function handlePlayAbility(
     if (req.type === 'attribute') {
       if (!characterHasAttribute(state, action.userId, req.value)) {
         return { success: false, error: `User doesn't have required attribute: ${req.value}` };
+      }
+    }
+  }
+
+  // Validate targets are on the battlefield and opposing the user
+  if (action.targetIds && action.targetIds.length > 0) {
+    // Find the user's team
+    const userTeam = Object.values(state.teams).find(
+      (t) => t.characterIds.includes(action.userId)
+    );
+    if (!userTeam) {
+      return { success: false, error: 'User is not in any team' };
+    }
+
+    for (const tid of action.targetIds) {
+      const target = getCard(state, tid);
+      if (target.zone !== 'battlefield') {
+        return { success: false, error: 'Target must be on the battlefield' };
+      }
+
+      // Check target is in an opposing team (blocking or being blocked by user's team)
+      if (def.targetDescription && def.targetDescription.toLowerCase().includes('opposing')) {
+        const targetTeam = Object.values(state.teams).find(
+          (t) => t.characterIds.includes(tid)
+        );
+        if (!targetTeam) {
+          return { success: false, error: 'Target is not in any team' };
+        }
+        const isOpposing = (userTeam.isAttacking && targetTeam.blockingTeamId === userTeam.id) ||
+          (userTeam.isBlocking && userTeam.blockingTeamId === targetTeam.id);
+        if (!isOpposing) {
+          return { success: false, error: 'Target must be opposing the user' };
+        }
       }
     }
   }
@@ -376,7 +448,8 @@ function handlePlayAbility(
 function handleActivateEffect(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'activate-effect' }>
+  action: Extract<PlayerAction, { type: 'activate-effect' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   const card = getCard(state, action.cardInstanceId);
   const def = getCardDefForInstance(state, action.cardInstanceId);
@@ -414,12 +487,15 @@ function handleActivateEffect(
     return { success: false, error: 'Effect can only be used during EOA' };
   }
 
-  // Pay costs (handled per-card, cost cards passed in action)
-  if (action.costCardIds) {
-    for (const costId of action.costCardIds) {
-      // Cost handling is card-specific — the action includes the cards to use
-      // Actual cost validation should be done here per effect
+  // Pay costs — card-specific validation and execution
+  if (action.costCardIds && action.costCardIds.length > 0) {
+    const costResult = payActivateCost(state, player, action.effectId, action.costCardIds);
+    if (!costResult.success) {
+      return { success: false, error: costResult.error };
     }
+  } else if (effect.costDescription) {
+    // Effect has a cost but no cost cards provided
+    return { success: false, error: 'Effect requires cost payment' };
   }
 
   // Mark effect as used
@@ -449,7 +525,8 @@ function handleActivateEffect(
 function handleChargeEssence(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'charge-essence' }>
+  action: Extract<PlayerAction, { type: 'charge-essence' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'main') {
     return { success: false, error: 'Can only charge during Main Phase' };
@@ -475,6 +552,27 @@ function handleChargeEssence(
     'charge',
     `Charged ${action.cardInstanceIds.length} card(s) to Essence`
   );
+
+  // Emit charge events
+  for (const cardId of action.cardInstanceIds) {
+    let cardName = 'Card';
+    let defId = '';
+    try {
+      const def = getCardDefForInstance(state, cardId);
+      cardName = def.name;
+      defId = def.id;
+    } catch { /* skip */ }
+    collector?.emit({
+      type: 'card-zone-change',
+      player,
+      cardId,
+      cardName,
+      defId,
+      fromZone: 'hand',
+      toZone: 'essence',
+      reason: 'charge',
+    });
+  }
 
   // Charging does NOT pass priority or start a chain
   return { success: true };
@@ -514,14 +612,15 @@ function handleOrganizeTeams(
 function handleBattleOrEnd(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'choose-battle-or-end' }>
+  action: Extract<PlayerAction, { type: 'choose-battle-or-end' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'organization') {
     return { success: false, error: 'Not in Organization Phase' };
   }
 
   // First turn of the game must go to End Phase
-  if (state.turnNumber === 1) {
+  if (state.turnNumber === 0) {
     action.choice = 'end';
   }
 
@@ -537,7 +636,8 @@ function handleBattleOrEnd(
 function handleSelectAttackers(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'select-attackers' }>
+  action: Extract<PlayerAction, { type: 'select-attackers' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'battle-attack') {
     return { success: false, error: 'Not in Attack Step' };
@@ -572,7 +672,14 @@ function handleSelectAttackers(
     for (const t of triggers) {
       state.chain.push(t);
     }
-    resolveChain(state);
+    resolveChain(state, collector);
+
+    // resolveChain resets priorityPlayer to currentTurn, but sendAttackers
+    // already advanced to battle-block where defender should have priority.
+    // Restore defender priority after trigger resolution.
+    const defender = getOpponent(player);
+    state.priorityPlayer = defender;
+    state.consecutivePasses = 0;
   }
 
   return { success: true };
@@ -581,20 +688,46 @@ function handleSelectAttackers(
 function handleSelectBlockers(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'select-blockers' }>
+  action: Extract<PlayerAction, { type: 'select-blockers' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'battle-block') {
     return { success: false, error: 'Not in Block Step' };
   }
 
+  // Collect blocker character IDs before assigning (for sent-to-battle triggers)
+  const allBlockerIds: string[] = [];
+  for (const assignment of action.assignments) {
+    const team = state.teams[assignment.blockingTeamId];
+    if (team) {
+      allBlockerIds.push(...team.characterIds);
+    }
+  }
+
   assignBlockers(state, action.assignments);
+
+  // Check "sent to battle while injured" triggers for blockers
+  if (allBlockerIds.length > 0) {
+    checkSentToBattleTriggers(state, allBlockerIds, player);
+
+    if (state.pendingTriggers.length > 0) {
+      const triggers = [...state.pendingTriggers];
+      state.pendingTriggers = [];
+      for (const t of triggers) {
+        state.chain.push(t);
+      }
+      resolveChain(state, collector);
+    }
+  }
+
   return { success: true };
 }
 
 function handleShowdownOrder(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'choose-showdown-order' }>
+  action: Extract<PlayerAction, { type: 'choose-showdown-order' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (state.phase !== 'battle-showdown') {
     return { success: false, error: 'Not in Showdown Step' };
@@ -617,7 +750,8 @@ function handleShowdownOrder(
 function handleDiscardToHandLimit(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'discard-to-hand-limit' }>
+  action: Extract<PlayerAction, { type: 'discard-to-hand-limit' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   const hand = state.players[player].hand;
   const excess = hand.length - 7;
@@ -636,6 +770,9 @@ function handleDiscardToHandLimit(
 
   addLog(state, player, 'discard-hand-limit', `Discarded ${excess} card(s) to hand limit`);
 
+  // After discarding, finish the end phase (increment turn marker, switch turns)
+  finishEndPhase(state);
+
   return { success: true };
 }
 
@@ -644,6 +781,342 @@ function handleSearchSelect(
   player: PlayerId,
   action: Extract<PlayerAction, { type: 'search-select' }>
 ): { success: boolean; error?: string } {
-  // This is used for interactive deck searches — will be wired up with UI
+  if (!state.pendingSearch) {
+    return { success: false, error: 'No pending search' };
+  }
+  if (state.pendingSearch.owner !== player) {
+    return { success: false, error: 'Not your search' };
+  }
+
+  const chosen = action.cardInstanceId;
+  const { discardRest, displayCardIds } = state.pendingSearch;
+
+  if (chosen === null) {
+    // Player declined to search
+    if (discardRest && displayCardIds) {
+      // Discard all displayed cards (e.g., Vanessa — no valid pick)
+      for (const id of displayCardIds) {
+        state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
+        moveCard(state, id, 'discard');
+      }
+      addLog(state, player, 'search', `${state.pendingSearch.sourceCardName ?? 'Effect'} — No card selected, discarded ${displayCardIds.length} cards`);
+    } else {
+      const { shuffleDeck } = require('./utils');
+      shuffleDeck(state, player);
+      addLog(state, player, 'search', 'Declined to search');
+    }
+    state.pendingSearch = undefined;
+    return { success: true };
+  }
+
+  // Validate chosen card is in valid list
+  if (!state.pendingSearch.validCardIds.includes(chosen)) {
+    return { success: false, error: 'Invalid search selection' };
+  }
+
+  // Move chosen card from deck to hand
+  state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
+  const card = getCard(state, chosen);
+  card.zone = 'hand';
+  state.players[player].hand.push(chosen);
+
+  const def = getCardDefForInstance(state, chosen);
+  addLog(state, player, 'search', `Selected ${def.name}`);
+
+  if (discardRest && displayCardIds) {
+    // Discard the remaining displayed cards (e.g., Vanessa — discard the other top cards)
+    const toDiscard = displayCardIds.filter((id) => id !== chosen);
+    for (const id of toDiscard) {
+      state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
+      moveCard(state, id, 'discard');
+    }
+  } else {
+    // Standard search: shuffle deck after
+    const { shuffleDeck } = require('./utils');
+    shuffleDeck(state, player);
+  }
+
+  state.pendingSearch = undefined;
+  return { success: true };
+}
+
+// --- Activate Effect Cost Validation & Payment ---
+
+function payActivateCost(
+  state: GameState,
+  player: PlayerId,
+  effectId: string,
+  costCardIds: string[],
+): { success: boolean; error?: string } {
+  switch (effectId) {
+    // C0078 — Lucian: Discard 1 Character card with {Weapon} from your hand
+    case 'C0078-E1': {
+      if (costCardIds.length < 1) {
+        return { success: false, error: 'Lucian requires discarding 1 Weapon character from hand' };
+      }
+      const costId = costCardIds[0];
+      const costCard = getCard(state, costId);
+      if (costCard.zone !== 'hand' || costCard.owner !== player) {
+        return { success: false, error: 'Cost card must be in your hand' };
+      }
+      const costDef = getCardDefForInstance(state, costId);
+      if (costDef.cardType !== 'character') {
+        return { success: false, error: 'Cost card must be a Character' };
+      }
+      if (!characterHasAttribute(state, costId, 'Weapon')) {
+        return { success: false, error: 'Cost card must have {Weapon}' };
+      }
+      moveCard(state, costId, 'discard');
+      addLog(state, player, 'pay-cost', `Discarded ${costDef.name} as cost for Lucian`);
+      return { success: true };
+    }
+
+    // C0079 — Solomon: Expel 2 cards from your Discard Pile
+    case 'C0079-E1': {
+      if (costCardIds.length < 2) {
+        return { success: false, error: 'Solomon requires expelling 2 cards from Discard Pile' };
+      }
+      for (const costId of costCardIds.slice(0, 2)) {
+        const costCard = getCard(state, costId);
+        if (costCard.zone !== 'discard' || costCard.owner !== player) {
+          return { success: false, error: 'Cost cards must be in your Discard Pile' };
+        }
+        moveCard(state, costId, 'expel');
+      }
+      addLog(state, player, 'pay-cost', 'Expelled 2 cards from Discard Pile for Solomon');
+      return { success: true };
+    }
+
+    default:
+      // Unknown cost — allow through (effect may handle its own cost)
+      return { success: true };
+  }
+}
+
+function handleResolveTargetChoice(
+  state: GameState,
+  player: PlayerId,
+  action: Extract<PlayerAction, { type: 'resolve-target-choice' }>,
+): { success: boolean; error?: string } {
+  if (!state.pendingTargetChoice) {
+    return { success: false, error: 'No pending target choice' };
+  }
+  if (state.pendingTargetChoice.owner !== player) {
+    return { success: false, error: 'Not your target choice' };
+  }
+
+  const chosen = action.cardInstanceId;
+
+  // Handle declining (null) for "you may" effects
+  if (chosen === null) {
+    if (!state.pendingTargetChoice.allowDecline) {
+      return { success: false, error: 'This choice cannot be declined' };
+    }
+    addLog(state, player, 'effect-declined', 'Declined target choice');
+    state.pendingTargetChoice = undefined;
+    return { success: true };
+  }
+
+  if (!state.pendingTargetChoice.validTargetIds.includes(chosen)) {
+    return { success: false, error: 'Invalid target selection' };
+  }
+
+  const effectId = state.pendingTargetChoice.effectId;
+
+  // Apply the effect based on which card created the pending choice
+  switch (effectId) {
+    case 'C0078-E1': {
+      // Lucian — put chosen card from hand to bottom of deck
+      moveCardToBottomOfDeck(state, chosen);
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Lucian — Put ${def.name} at bottom of deck`);
+      break;
+    }
+    case 'S0040-E1': {
+      // Bounty Board — reveal chosen {Weapon}, put at deck bottom, draw 3
+      const revealDef = getCardDefForInstance(state, chosen);
+      // Emit card-revealed event for the opponent to see
+      moveCardToBottomOfDeck(state, chosen);
+      drawCards(state, player, 3);
+      addLog(state, player, 'effect', `Bounty Board — Revealed ${revealDef.name}, drew 3 cards`);
+      break;
+    }
+    case 'C0082-E1': {
+      // Omtaba — discard chosen injured opponent character
+      moveCard(state, chosen, 'discard');
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Omtaba — Discarded opponent's injured ${def.name}`);
+      break;
+    }
+    case 'C0083-E1': {
+      // Swordmaster Don — move chosen {Weapon} from DP to hand
+      moveCard(state, chosen, 'hand');
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Swordmaster Don — Recovered ${def.name} from DP`);
+      break;
+    }
+    case 'C0084-E1': {
+      // Sinbad — place +1/+1 counter on chosen {Weapon} character
+      const target = getCard(state, chosen);
+      target.counters.push({ type: 'plus-one' });
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Sinbad — Placed +1/+1 Counter on ${def.name}`);
+      break;
+    }
+    case 'C0085-E1': {
+      // Samanosuke — move chosen {Weapon} from DP to deck bottom, then +2/+0 if field has Necro
+      moveCardToBottomOfDeck(state, chosen);
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Samanosuke — Moved ${def.name} from DP to deck bottom`);
+
+      // Apply stat boost if field has Necro
+      const sourceCard = state.pendingTargetChoice?.sourceCardId;
+      if (sourceCard && fieldHasSymbol(state, player, 'necro')) {
+        const samCard = getCard(state, sourceCard);
+        samCard.statModifiers.push({
+          lead: 2,
+          support: 0,
+          source: 'C0085-Samanosuke',
+          duration: 'turn',
+        });
+        addLog(state, player, 'effect', 'Samanosuke — Gained +2/+0 this turn');
+      }
+      break;
+    }
+    default:
+      return { success: false, error: `Unknown pending target effect: ${effectId}` };
+  }
+
+  state.pendingTargetChoice = undefined;
+  return { success: true };
+}
+
+function handleChooseOptionalTrigger(
+  state: GameState,
+  player: PlayerId,
+  action: Extract<PlayerAction, { type: 'choose-optional-trigger' }>,
+  collector?: EventCollector,
+): { success: boolean; error?: string } {
+  if (!state.pendingOptionalEffect) {
+    return { success: false, error: 'No pending optional effect' };
+  }
+  if (state.pendingOptionalEffect.owner !== player) {
+    return { success: false, error: 'Not your optional effect' };
+  }
+
+  const { chainEntryId, lingeringEffectId } = state.pendingOptionalEffect;
+  state.pendingOptionalEffect = undefined;
+
+  if (chainEntryId) {
+    // Category A: chain-based effect
+    const entry = state.chain.find((e) => e.id === chainEntryId);
+    if (!entry) {
+      return { success: false, error: 'Chain entry not found' };
+    }
+
+    if (action.activate) {
+      // Mark as approved and re-resolve
+      entry.optionalApproved = true;
+      resolveChain(state, collector);
+    } else {
+      // Declined — mark as resolved, remove from chain
+      entry.resolved = true;
+      state.chain = state.chain.filter((e) => e.id !== chainEntryId);
+      addLog(state, player, 'effect-declined', 'Declined optional effect');
+      // Continue resolving remaining chain
+      if (state.chain.length > 0) {
+        resolveChain(state, collector);
+      } else {
+        state.isChainResolving = false;
+        // Phase-aware priority restore: defender keeps priority during battle-block
+        state.priorityPlayer = state.phase === 'battle-block'
+          ? getOpponent(state.currentTurn)
+          : state.currentTurn;
+        state.consecutivePasses = 0;
+      }
+    }
+  } else if (lingeringEffectId) {
+    // Category B: lingering effect (Solomon end-of-turn, Swift Strike draw)
+    const effect = state.lingeringEffects.find((e) => e.id === lingeringEffectId);
+
+    if (action.activate && effect) {
+      // Execute the lingering effect inline
+      if (lingeringEffectId.startsWith('solomon_')) {
+        const effectPlayer = effect.data?.player as PlayerId | undefined;
+        if (effectPlayer) {
+          const deck = state.players[effectPlayer].deck;
+          const toDiscard = deck.splice(0, Math.min(2, deck.length));
+          for (const id of toDiscard) {
+            moveCard(state, id, 'discard');
+          }
+          if (toDiscard.length > 0) {
+            addLog(state, effectPlayer, 'effect', `Solomon — Discarded top ${toDiscard.length} card(s) from deck`);
+          }
+        }
+      } else if (lingeringEffectId.startsWith('swiftstrike_draw_')) {
+        const drawPlayer = effect.data?.owner as PlayerId | undefined;
+        if (drawPlayer) {
+          drawCards(state, drawPlayer, 1);
+          addLog(state, drawPlayer, 'effect', 'Swift Strike — Drew 1 card');
+        }
+      } else if (lingeringEffectId.startsWith('stakegun_expert_')) {
+        const effectPlayer = effect.data?.player as PlayerId | undefined;
+        const effectOpponent = effect.data?.opponent as PlayerId | undefined;
+        const xVal = (effect.data?.xValue as number) ?? 0;
+        if (effectPlayer && effectOpponent && xVal > 0) {
+          const deck = state.players[effectOpponent].deck;
+          const toDiscard = deck.splice(0, Math.min(xVal, deck.length));
+          for (const id of toDiscard) {
+            moveCard(state, id, 'discard');
+          }
+          addLog(state, effectPlayer, 'effect', `Stake Gun Expert — Discarded ${toDiscard.length} from opponent's deck`);
+        }
+      }
+    } else {
+      addLog(state, player, 'effect-declined', 'Declined optional effect');
+    }
+
+    // Remove the lingering effect regardless of choice
+    state.lingeringEffects = state.lingeringEffects.filter((e) => e.id !== lingeringEffectId);
+
+    // Re-call the phase function to continue
+    if (lingeringEffectId.startsWith('solomon_')) {
+      advanceToEndPhase(state);
+    } else if (lingeringEffectId.startsWith('stakegun_expert_')) {
+      // Complete the paused ability chain entry that was waiting for the expert prompt
+      if (state.chain.length > 0) {
+        const entry = state.chain[state.chain.length - 1];
+        if (!entry.resolved && entry.type === 'ability') {
+          const def = getCardDefForInstance(state, entry.sourceCardInstanceId);
+          moveCard(state, entry.sourceCardInstanceId, 'essence');
+          addLog(state, entry.owner, 'ability-resolve', `${def.name} resolved → Essence Area`, entry.sourceCardInstanceId);
+          if (entry.userId) {
+            addLog(state, entry.owner, 'ability-user-resolved', `${def.name} used by character`, entry.userId);
+          }
+          entry.resolved = true;
+          state.chain.pop();
+        }
+      }
+      resolveChain(state, collector);
+    } else if (lingeringEffectId.startsWith('swiftstrike_draw_')) {
+      // Check for more Swift Strike draw effects
+      const moreDraws = state.lingeringEffects.filter(
+        (e) => e.id.startsWith('swiftstrike_draw_')
+      );
+      if (moreDraws.length > 0) {
+        const next = moreDraws[0];
+        state.pendingOptionalEffect = {
+          lingeringEffectId: next.id,
+          sourceCardId: next.source,
+          effectId: 'A0038-E1',
+          cardName: 'Swift Strike',
+          effectDescription: next.effectDescription,
+          owner: next.data.owner as PlayerId,
+        };
+      }
+      // Otherwise, showdown phase continues normally
+    }
+  }
+
   return { success: true };
 }

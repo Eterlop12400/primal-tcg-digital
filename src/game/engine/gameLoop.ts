@@ -23,6 +23,8 @@ import {
   dealDamage,
   generateId,
   getCardsInZone,
+  characterHasAttribute,
+  isProtectedFromCharacterEffects,
 } from './utils';
 import { resolveChain, flushPendingTriggers } from './chainResolver';
 
@@ -68,17 +70,9 @@ export function advanceToStartPhase(state: GameState): void {
 
   // 3. TODO: Check for start-of-turn trigger effects
 
-  // 4. Normal Draw (skip if P1's first turn)
-  if (!state.isFirstTurn || state.currentTurn !== state.currentTurn) {
-    // The first player's first turn skips the draw
-    if (!(state.turnNumber === 1 && state.currentTurn === state.currentTurn && state.isFirstTurn)) {
-      // Actually: skip draw on the very first turn of the game for the first player
-    }
-  }
-
-  // Simpler logic: skip draw only on turn 1 for the player who goes first
-  const isVeryFirstTurn = state.turnNumber === 1;
-  if (!isVeryFirstTurn) {
+  // 4. Normal Draw — only the current turn player draws.
+  //    Skip draw on the very first turn of the game (turn 0) for the player who goes first.
+  if (state.turnNumber > 0) {
     if (playerState.deck.length > 0) {
       drawCards(state, player, 1);
       addLog(state, player, 'normal-draw', 'Drew 1 card');
@@ -111,8 +105,12 @@ export function advanceToOrganizationPhase(state: GameState): void {
 
   // TODO: Check for start-of-organization triggers
 
-  // Clear existing teams then auto-create solo teams for each kingdom character
-  clearTeams(state, player);
+  // Preserve existing teams but clean up:
+  // 1. Remove characters no longer in kingdom from their teams
+  // 2. Delete empty teams
+  // 3. Reset battle flags
+  // 4. Create solo teams for unteamed kingdom characters
+  cleanupTeams(state, player);
   autoCreateSoloTeams(state, player);
 }
 
@@ -143,7 +141,80 @@ export function advanceToShowdown(state: GameState): void {
 
   addLog(state, state.currentTurn, 'phase-showdown', 'Showdown Step');
 
-  // TODO: Check for start-of-showdown triggers + lingering effects
+  // Process start-of-showdown lingering effects (e.g., Swift Strike)
+  const showdownEffects = state.lingeringEffects.filter(
+    (e) => e.id.startsWith('swiftstrike_')
+  );
+
+  for (const effect of showdownEffects) {
+    const targetId = effect.data?.targetId as string | undefined;
+    const owner = effect.data?.owner as PlayerId | undefined;
+    if (!targetId || !owner) continue;
+
+    const target = state.cards[targetId];
+    if (!target || target.zone !== 'battlefield') {
+      addLog(state, owner, 'effect', 'Swift Strike — Target no longer on battlefield');
+      continue;
+    }
+
+    // Check protection (Omtaba E2)
+    if (isProtectedFromCharacterEffects(state, targetId, owner)) {
+      addLog(state, owner, 'effect', 'Swift Strike — Target is protected from character effects');
+      continue;
+    }
+
+    // Check if target used an ability that resolved this turn
+    // (We check if the target character was the userId of a resolved ability)
+    const targetUsedAbility = state.log.some(
+      (log) =>
+        log.turn === state.turnNumber &&
+        log.action === 'ability-user-resolved' &&
+        log.cardInstanceId === targetId
+    );
+
+    if (!targetUsedAbility) {
+      // Deal 1 damage to the target
+      const result = dealDamage(state, targetId, 1);
+      const targetDef = getCardDefForInstance(state, targetId);
+      addLog(state, owner, 'effect', `Swift Strike — Dealt 1 damage to ${targetDef.name}`);
+
+      // If discarded, you may draw 1 card (optional)
+      if (result.discarded) {
+        state.lingeringEffects.push({
+          id: `swiftstrike_draw_${effect.id}`,
+          source: effect.source,
+          effectDescription: 'You may draw 1 card (Swift Strike target was discarded)',
+          duration: 'turn',
+          appliedTurn: state.turnNumber,
+          data: { owner, optional: true },
+        });
+      }
+    } else {
+      addLog(state, owner, 'effect', 'Swift Strike — Target used an ability, no damage dealt');
+    }
+  }
+
+  // Remove consumed Swift Strike damage effects (keep draw effects for optional prompt)
+  state.lingeringEffects = state.lingeringEffects.filter(
+    (e) => !e.id.startsWith('swiftstrike_') || e.id.startsWith('swiftstrike_draw_')
+  );
+
+  // Check for Swift Strike draw optional effects
+  const drawEffects = state.lingeringEffects.filter(
+    (e) => e.id.startsWith('swiftstrike_draw_')
+  );
+  if (drawEffects.length > 0) {
+    const first = drawEffects[0];
+    state.pendingOptionalEffect = {
+      lingeringEffectId: first.id,
+      sourceCardId: first.source,
+      effectId: 'A0038-E1',
+      cardName: 'Swift Strike',
+      effectDescription: first.effectDescription,
+      owner: first.data.owner as PlayerId,
+    };
+    return; // Pause — player must respond before continuing to showdown
+  }
 }
 
 export function advanceToEndPhase(state: GameState): void {
@@ -186,7 +257,29 @@ export function advanceToEndPhase(state: GameState): void {
     return;
   }
 
-  // 3. Clear "until end of turn" effects and lingering effects
+  // 3. Process end-of-turn lingering effects BEFORE clearing them
+
+  // Solomon's end-of-turn: may discard top 2 of deck (optional prompt)
+  const solomonEffects = state.lingeringEffects.filter(
+    (e) => e.id.startsWith('solomon_')
+  );
+  if (solomonEffects.length > 0) {
+    const first = solomonEffects[0];
+    const effectPlayer = first.data?.player as PlayerId | undefined;
+    if (effectPlayer) {
+      state.pendingOptionalEffect = {
+        lingeringEffectId: first.id,
+        sourceCardId: first.source,
+        effectId: 'C0079-E2',
+        cardName: 'Solomon',
+        effectDescription: 'You may discard the top 2 cards of your deck.',
+        owner: effectPlayer,
+      };
+      return; // Pause — player must respond before continuing end phase
+    }
+  }
+
+  // Clear "until end of turn" effects and lingering effects
   state.lingeringEffects = state.lingeringEffects.filter(
     (e) => e.duration !== 'until-end-of-turn' && e.duration !== 'turn'
   );
@@ -200,12 +293,23 @@ export function advanceToEndPhase(state: GameState): void {
     card.usedEffects = [];
   }
 
-  // 4. TODO: End-of-turn triggers
+  // 4. Hand limit check (7 cards) — player must discard down
+  if (state.players[player].hand.length > 7) {
+    state.priorityPlayer = player;
+    state.consecutivePasses = 0;
+    addLog(state, player, 'hand-limit', `Hand has ${state.players[player].hand.length} cards — must discard to 7`);
+    return; // Wait for discard-to-hand-limit action
+  }
 
-  // 5. Hand limit check (7 cards) — player must discard down
-  // This is handled by awaiting a player action if hand > 7
+  // Hand is fine — finish the end phase immediately
+  finishEndPhase(state);
+}
 
-  // 6. Increment turn marker
+export function finishEndPhase(state: GameState): void {
+  const player = state.currentTurn;
+  const opponent = getOpponent(player);
+
+  // Increment turn marker
   state.players[player].turnMarker += 1;
   addLog(
     state,
@@ -214,12 +318,12 @@ export function advanceToEndPhase(state: GameState): void {
     `Turn Marker → ${state.players[player].turnMarker}`
   );
 
-  // 7. Reset per-turn flags
+  // Reset per-turn flags
   state.players[player].hasSummonedThisTurn = false;
   state.players[player].hasPlayedStrategyThisTurn = false;
   state.players[player].hasUsedRushThisTurn = false;
 
-  // 8. Switch turns
+  // Switch turns
   const nextPlayer = opponent;
   state.currentTurn = nextPlayer;
   state.turnNumber += 1;
@@ -251,11 +355,56 @@ function clearTeams(state: GameState, player: PlayerId): void {
   }
 }
 
+function cleanupTeams(state: GameState, player: PlayerId): void {
+  const kingdomIds = new Set(state.players[player].kingdom);
+
+  for (const [teamId, team] of Object.entries(state.teams)) {
+    if (team.owner !== player) continue;
+
+    // Reset battle flags
+    team.isAttacking = false;
+    team.isBlocking = false;
+    team.blockedByTeamId = undefined;
+    team.blockingTeamId = undefined;
+
+    // Remove characters no longer in kingdom
+    team.characterIds = team.characterIds.filter((cid) => {
+      if (kingdomIds.has(cid)) return true;
+      // Character left kingdom — clear their team ref
+      const card = state.cards[cid];
+      if (card) {
+        card.teamId = undefined;
+        card.battleRole = undefined;
+      }
+      return false;
+    });
+
+    // Delete empty teams
+    if (team.characterIds.length === 0) {
+      delete state.teams[teamId];
+      continue;
+    }
+
+    // If lead was removed, promote first remaining character
+    if (!team.hasLead || !kingdomIds.has(team.characterIds[0])) {
+      const newLead = state.cards[team.characterIds[0]];
+      if (newLead) {
+        newLead.battleRole = 'team-lead';
+        team.hasLead = true;
+      }
+    }
+  }
+}
+
 function autoCreateSoloTeams(state: GameState, player: PlayerId): void {
   const kingdom = state.players[player].kingdom;
   for (const cardId of kingdom) {
     const card = state.cards[cardId];
-    if (!card || card.state === undefined) continue; // Only characters have state
+    const def = getCardDefForInstance(state, cardId);
+    if (!card || def.cardType !== 'character') continue;
+
+    // Skip characters already in a team
+    if (card.teamId && state.teams[card.teamId]) continue;
 
     const teamId = generateId('team');
     const team: Team = {
@@ -347,8 +496,18 @@ export function sendAttackers(
   );
 
   // Move to Block Step — defending player gets priority
+  const defender = getOpponent(state.currentTurn);
+
+  // Safeguard: ensure the defender has teams for their kingdom characters.
+  // Teams should already exist from the defender's last organization phase,
+  // but create solo teams as a fallback if they're missing.
+  const defenderHasTeams = Object.values(state.teams).some((t) => t.owner === defender);
+  if (!defenderHasTeams) {
+    autoCreateSoloTeams(state, defender);
+  }
+
   state.phase = 'battle-block';
-  state.priorityPlayer = getOpponent(state.currentTurn);
+  state.priorityPlayer = defender;
   state.consecutivePasses = 0;
 }
 
@@ -446,8 +605,8 @@ export function resolveShowdown(
 
   if (attackPower === blockPower) {
     // Stalemate — 1 damage to both team leads
-    applyShowdownDamage(state, attackingTeam, 'stalemate');
-    applyShowdownDamage(state, blockingTeam, 'stalemate');
+    applyShowdownDamage(state, attackingTeam, 'stalemate', blockingTeam);
+    applyShowdownDamage(state, blockingTeam, 'stalemate', attackingTeam);
     flushPendingTriggers(state);
     addLog(
       state,
@@ -465,7 +624,7 @@ export function resolveShowdown(
 
   if (difference >= 5) {
     // Outstanding Victory
-    applyShowdownDamage(state, losingTeam, 'outstanding-victory');
+    applyShowdownDamage(state, losingTeam, 'outstanding-victory', winningTeam);
     flushPendingTriggers(state);
     addLog(
       state,
@@ -476,7 +635,7 @@ export function resolveShowdown(
     return 'outstanding-victory';
   } else {
     // Victory
-    applyShowdownDamage(state, losingTeam, 'victory');
+    applyShowdownDamage(state, losingTeam, 'victory', winningTeam);
     flushPendingTriggers(state);
     addLog(
       state,
@@ -491,7 +650,8 @@ export function resolveShowdown(
 function applyShowdownDamage(
   state: GameState,
   losingTeam: Team,
-  result: 'victory' | 'outstanding-victory' | 'stalemate'
+  result: 'victory' | 'outstanding-victory' | 'stalemate',
+  winningTeam?: Team
 ): void {
   const charsOnField = losingTeam.characterIds.filter(
     (id) => state.cards[id]?.zone === 'battlefield'
@@ -499,41 +659,77 @@ function applyShowdownDamage(
 
   if (charsOnField.length === 0) return;
 
+  const discardedIds: string[] = [];
+
   if (result === 'stalemate' || result === 'victory') {
     // 1 damage to team lead only
     if (losingTeam.hasLead && charsOnField.includes(losingTeam.characterIds[0])) {
       const leadId = losingTeam.characterIds[0];
-      dealDamage(state, leadId, 1);
+      const dmgResult = dealDamage(state, leadId, 1);
       addLog(
         state,
         losingTeam.owner,
         'showdown-damage',
         `${getCardDefForInstance(state, leadId).name} takes 1 damage`
       );
+      if (dmgResult.discarded) discardedIds.push(leadId);
     }
   } else if (result === 'outstanding-victory') {
     // 2 damage to team lead
     if (losingTeam.hasLead && charsOnField.includes(losingTeam.characterIds[0])) {
       const leadId = losingTeam.characterIds[0];
-      dealDamage(state, leadId, 2);
+      const dmgResult = dealDamage(state, leadId, 2);
       addLog(
         state,
         losingTeam.owner,
         'showdown-damage',
         `${getCardDefForInstance(state, leadId).name} takes 2 damage`
       );
+      if (dmgResult.discarded) discardedIds.push(leadId);
     }
     // 1 damage to each support
     for (let i = 1; i < losingTeam.characterIds.length; i++) {
       const supportId = losingTeam.characterIds[i];
       if (charsOnField.includes(supportId)) {
-        dealDamage(state, supportId, 1);
+        const dmgResult = dealDamage(state, supportId, 1);
         addLog(
           state,
           losingTeam.owner,
           'showdown-damage',
           `${getCardDefForInstance(state, supportId).name} takes 1 damage`
         );
+        if (dmgResult.discarded) discardedIds.push(supportId);
+      }
+    }
+  }
+
+  // Check Reaped Fear trigger: if winning team has a Slayer and discarded an opponent's character
+  if (winningTeam && discardedIds.length > 0) {
+    const winningPlayer = winningTeam.owner;
+    const hasSlayer = winningTeam.characterIds.some(
+      (id) => state.cards[id] && characterHasAttribute(state, id, 'Slayer')
+    );
+
+    if (hasSlayer) {
+      // Check if winning player has Reaped Fear in kingdom
+      const kingdom = state.players[winningPlayer].kingdom;
+      for (const cardId of kingdom) {
+        const card = state.cards[cardId];
+        if (!card) continue;
+        const def = getCardDefForInstance(state, cardId);
+        if (def.id !== 'S0039') continue;
+        if (card.usedEffects.includes('S0039-E1')) continue;
+
+        // Trigger Reaped Fear
+        state.pendingTriggers.push({
+          id: `trigger_${cardId}_S0039-E1`,
+          type: 'trigger-effect',
+          sourceCardInstanceId: cardId,
+          effectId: 'S0039-E1',
+          resolved: false,
+          negated: false,
+          owner: winningPlayer,
+        });
       }
     }
   }
@@ -568,12 +764,26 @@ export function returnFromBattlefield(state: GameState): void {
     }
   }
 
-  // Clear all teams
+  // Clean up teams: remove dead characters and delete empty teams
   for (const [teamId, team] of Object.entries(state.teams)) {
     team.isAttacking = false;
     team.isBlocking = false;
     team.blockedByTeamId = undefined;
     team.blockingTeamId = undefined;
+
+    // Remove characters no longer in kingdom (discarded/expelled during battle)
+    team.characterIds = team.characterIds.filter((cid) => {
+      const inst = state.cards[cid];
+      return inst && inst.zone === 'kingdom';
+    });
+
+    // Delete empty teams
+    if (team.characterIds.length === 0) {
+      delete state.teams[teamId];
+    } else if (!team.characterIds.includes(team.characterIds[0])) {
+      // If lead was removed, mark hasLead false
+      team.hasLead = false;
+    }
   }
 }
 
@@ -581,7 +791,7 @@ export function returnFromBattlefield(state: GameState): void {
 // Priority / Pass Handling
 // ============================================================
 
-export function handlePassPriority(state: GameState): void {
+export function handlePassPriority(state: GameState, collector?: import('./EventCollector').EventCollector): void {
   state.consecutivePasses += 1;
 
   if (state.consecutivePasses >= 2) {
@@ -589,10 +799,19 @@ export function handlePassPriority(state: GameState): void {
     state.consecutivePasses = 0;
 
     if (state.chain.length > 0 && !state.isChainResolving) {
-      resolveChain(state);
+      resolveChain(state, collector);
     } else {
       // No chain — advance to next phase
+      const prevPhase = state.phase;
       advancePhase(state);
+      if (state.phase !== prevPhase) {
+        collector?.emit({
+          type: 'phase-change',
+          player: state.currentTurn,
+          fromPhase: prevPhase,
+          toPhase: state.phase,
+        });
+      }
     }
   } else {
     // Pass priority to other player
@@ -626,6 +845,16 @@ export function getLegalActions(state: GameState, player: PlayerId): PlayerActio
 
   if (state.gameOver) return [];
   if (state.priorityPlayer !== player) return [];
+
+  // Pending optional effect takes priority over everything
+  if (state.pendingOptionalEffect && state.pendingOptionalEffect.owner === player) {
+    return ['choose-optional-trigger'];
+  }
+
+  // Pending target choice takes priority over everything
+  if (state.pendingTargetChoice && state.pendingTargetChoice.owner === player) {
+    return ['resolve-target-choice'];
+  }
 
   const playerState = state.players[player];
   const isTurnPlayer = state.currentTurn === player;

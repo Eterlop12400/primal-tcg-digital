@@ -16,6 +16,8 @@ import {
   getEffectiveStats,
   getCardsInZone,
   getOpponent,
+  fieldHasName,
+  characterHasAttribute,
 } from '@/game/engine';
 
 /**
@@ -161,6 +163,18 @@ export function canPlayStrategyCard(
       return d.printNumber === stratDef.printNumber;
     });
     if (inPlay) return false;
+  }
+
+  // Card-specific pre-validation
+  if (def.id === 'S0040') {
+    // Bounty Board: requires field "Slayer Guild's Hideout" AND {Weapon} character in hand
+    if (!fieldHasName(state, player, "Slayer Guild's Hideout")) return false;
+    const hasWeapon = playerState.hand.some((id) => {
+      if (id === instanceId) return false; // Exclude Bounty Board itself
+      const d = getCardDefForInstance(state, id);
+      return d.cardType === 'character' && characterHasAttribute(state, id, 'Weapon');
+    });
+    if (!hasWeapon) return false;
   }
 
   return true;

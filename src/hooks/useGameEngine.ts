@@ -1,14 +1,17 @@
 'use client';
 
 import { useReducer, useCallback, useMemo } from 'react';
-import { GameState, PlayerAction, PlayerId } from '@/game/types';
+import { GameState, PlayerAction, PlayerId, AbilityCardDef, CharacterCardDef } from '@/game/types';
 import {
   createNewGame,
   performMulligan,
   advanceToStartPhase,
   processAction,
   getLegalActions,
+  EventCollector,
+  getCardDefForInstance,
 } from '@/game/engine';
+import type { AnimationEvent } from '@/game/engine/animationEvents';
 import { getActingPlayer, isHumanTurn } from '@/lib/gameHelpers';
 
 // ============================================================
@@ -27,7 +30,17 @@ export type SelectionMode =
   | { type: 'team-organize' }
   | { type: 'select-attackers' }
   | { type: 'select-blockers' }
-  | { type: 'discard-to-hand-limit'; count: number };
+  | { type: 'discard-to-hand-limit'; count: number }
+  // Ability card flow: select ability → select user → select targets → pay essence
+  | { type: 'ability-select' }
+  | { type: 'ability-user-select'; abilityCardId: string }
+  | { type: 'ability-target-select'; abilityCardId: string; userId: string; needed: number }
+  | { type: 'ability-essence-cost'; abilityCardId: string; userId: string; targetIds: string[]; needed: number; isXCost?: boolean; specificCosts?: { symbol: string; count: number }[]; cardSymbols?: string[] }
+  // Activate effect flow: select character → select targets → pay cost
+  | { type: 'activate-effect-select' }
+  | { type: 'activate-pick-effect'; cardId: string; effects: { id: string; desc: string }[] }
+  | { type: 'activate-target-select'; cardId: string; effectId: string; needed: number }
+  | { type: 'activate-cost-select'; cardId: string; effectId: string; targetIds: string[]; needed: number; costSource: 'hand' | 'discard' | 'essence'; costDescription?: string };
 
 export interface UIState {
   gameState: GameState | null;
@@ -42,6 +55,7 @@ export interface UIState {
   aiSpeed: number;
   lastError: string | null;
   gameStarted: boolean;
+  pendingEvents: AnimationEvent[];
 }
 
 // ============================================================
@@ -78,6 +92,7 @@ const initialUIState: UIState = {
   aiSpeed: 800,
   lastError: null,
   gameStarted: false,
+  pendingEvents: [],
 };
 
 // ============================================================
@@ -149,7 +164,8 @@ function uiReducer(state: UIState, action: UIAction): UIState {
       if (!state.gameState) return state;
 
       const clone = structuredClone(state.gameState);
-      const result = processAction(clone, action.player, action.action);
+      const collector = new EventCollector();
+      const result = processAction(clone, action.player, action.action, collector);
 
       if (!result.success) {
         return {
@@ -165,6 +181,7 @@ function uiReducer(state: UIState, action: UIAction): UIState {
         selectedTeamIds: [],
         selectionMode: { type: 'none' },
         lastError: null,
+        pendingEvents: collector.drain(),
       };
     }
 

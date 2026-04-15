@@ -336,6 +336,30 @@ export function getEffectiveStats(
     support += mod.support;
   }
 
+  // Apply ongoing effects (e.g., Rosita's team-based buffs)
+  if (charDef.effects) {
+    for (const effect of charDef.effects) {
+      if (effect.type !== 'ongoing') continue;
+
+      // Check if card is in a team
+      const team = getTeamForCharacter(state, instanceId);
+      if (!team) continue;
+
+      // C0086 — Rosita: +1/+1 while teamed with {Mercenary} or {Slayer}
+      if (effect.id === 'C0086-E1') {
+        if (teamHasCharacterWithAttribute(state, team, 'Mercenary', instanceId)) {
+          lead += 1;
+          support += 1;
+        }
+      } else if (effect.id === 'C0086-E2') {
+        if (teamHasCharacterWithAttribute(state, team, 'Slayer', instanceId)) {
+          lead += 1;
+          support += 1;
+        }
+      }
+    }
+  }
+
   return { lead, support };
 }
 
@@ -349,7 +373,7 @@ export function calculateTeamPower(state: GameState, team: Team): number {
   for (let i = 0; i < team.characterIds.length; i++) {
     const charId = team.characterIds[i];
     const card = state.cards[charId];
-    if (!card || card.zone !== 'battlefield') continue;
+    if (!card || (card.zone !== 'battlefield' && card.zone !== 'kingdom')) continue;
 
     const stats = getEffectiveStats(state, charId);
 
@@ -376,6 +400,17 @@ export function dealDamage(
 
   const card = getCard(state, targetId);
   if (card.state === undefined) return { injured: false, discarded: false };
+
+  // Check for damage prevention lingering effects (e.g., Deflection)
+  const preventIdx = state.lingeringEffects.findIndex(
+    (e) => e.data?.preventNextDamage && e.data?.targetId === targetId
+  );
+  if (preventIdx !== -1) {
+    // Consume the prevention — damage becomes 0
+    state.lingeringEffects.splice(preventIdx, 1);
+    addLog(state, card.owner, 'damage-prevented', `Damage to ${getCardDef(card.defId).name} was prevented!`);
+    return { injured: false, discarded: false };
+  }
 
   if (card.state === 'healthy') {
     if (amount === 1) {
@@ -449,6 +484,40 @@ export function teamHasCharacterWithAttribute(
   return team.characterIds.some(
     (id) => id !== excludeId && characterHasAttribute(state, id, attribute)
   );
+}
+
+// --- Protection Checks ---
+
+/**
+ * Check if a character is protected from opponent character effects.
+ * Currently: Omtaba (C0082-E2) is unaffected by opponent's Character effects
+ * while in a team with another {Slayer}.
+ */
+export function isProtectedFromCharacterEffects(
+  state: GameState,
+  targetId: string,
+  effectOwner: PlayerId,
+): boolean {
+  const targetCard = state.cards[targetId];
+  if (!targetCard) return false;
+  // Only protects against opponent's effects
+  if (targetCard.owner === effectOwner) return false;
+
+  const def = getCardDefForInstance(state, targetId);
+  if (def.cardType !== 'character') return false;
+
+  // Check if target has the C0082-E2 ongoing effect
+  const charDef = def as CharacterCardDef;
+  const hasProtection = charDef.effects.some(
+    (e) => e.id === 'C0082-E2' && e.type === 'ongoing'
+  );
+  if (!hasProtection) return false;
+
+  // Check if teamed with another Slayer
+  const team = getTeamForCharacter(state, targetId);
+  if (!team) return false;
+
+  return teamHasCharacterWithAttribute(state, team, 'Slayer', targetId);
 }
 
 // --- Logging ---

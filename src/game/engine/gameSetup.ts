@@ -87,7 +87,7 @@ export function createNewGame(
     players: {} as Record<PlayerId, PlayerState>,
     cards: {},
     teams: {},
-    turnNumber: 1,
+    turnNumber: 0,
     currentTurn: 'player1', // will be set by coin flip
     phase: 'setup',
     isFirstTurn: true,

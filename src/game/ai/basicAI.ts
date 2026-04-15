@@ -455,7 +455,7 @@ function decideOrganization(state: GameState, player: PlayerId): PlayerAction {
   if (existingTeams.length > 0) {
     // Teams already organized — choose battle or end
     // First turn of the game must skip to End Phase
-    if (state.turnNumber === 1) {
+    if (state.turnNumber === 0) {
       return { type: 'choose-battle-or-end', choice: 'end' };
     }
 
@@ -717,14 +717,32 @@ function chooseAbility(
     // Find target (opposing characters)
     let targetIds: string[] | undefined;
     if (abilityDef.targetDescription?.includes('opposing')) {
-      if (opponentBattlefield.length === 0) continue;
+      // Find the user's team and its opposing team
+      const userTeam = Object.values(state.teams).find((t) => t.characterIds.includes(validUser.instanceId));
+      if (!userTeam) continue;
+
+      // Find the opposing team
+      let opposingTeam: typeof userTeam | undefined;
+      if (userTeam.isAttacking && userTeam.blockedByTeamId) {
+        opposingTeam = state.teams[userTeam.blockedByTeamId];
+      } else if (userTeam.isBlocking && userTeam.blockingTeamId) {
+        opposingTeam = state.teams[userTeam.blockingTeamId];
+      }
+      if (!opposingTeam) continue;
+
+      // Only target characters from the opposing team that are on the battlefield
+      const opposingChars = opposingTeam.characterIds.filter(
+        (id) => state.cards[id]?.zone === 'battlefield'
+      );
+      if (opposingChars.length === 0) continue;
+
       // Target the strongest opposing character
-      const sorted = [...opponentBattlefield].sort((a, b) => {
-        const aStats = getEffectiveStats(state, a.instanceId);
-        const bStats = getEffectiveStats(state, b.instanceId);
+      const sorted = [...opposingChars].sort((a, b) => {
+        const aStats = getEffectiveStats(state, a);
+        const bStats = getEffectiveStats(state, b);
         return bStats.lead - aStats.lead;
       });
-      targetIds = [sorted[0].instanceId];
+      targetIds = [sorted[0]];
     }
 
     return {
@@ -733,7 +751,9 @@ function chooseAbility(
       userId: validUser.instanceId,
       targetIds,
       essenceCostCardIds: canPayEssence.cardIds,
-      xValue: abilityDef.essenceCost.x ? Math.min(2, canPayEssence.cardIds.length) : undefined,
+      xValue: abilityDef.essenceCost.x
+        ? Math.max(0, canPayEssence.cardIds.length - abilityDef.essenceCost.specific.reduce((s, c) => s + c.count, 0) - abilityDef.essenceCost.neutral - (abilityDef.essenceCost.cardSymbol ?? 0))
+        : undefined,
     };
   }
 
@@ -759,15 +779,27 @@ function checkEssenceCost(
     }
   }
 
-  // Pay neutral
-  const neutralNeeded = abilityDef.essenceCost.x
-    ? Math.min(2, essence.length - toPay.length) // For X costs, pay 2 if we can
-    : abilityDef.essenceCost.neutral;
+  // Pay cardSymbol costs (any of the ability card's symbols)
+  const cardSymbolCount = abilityDef.essenceCost.cardSymbol ?? 0;
+  for (let i = 0; i < cardSymbolCount; i++) {
+    const matching = essence.find(
+      (id) => !toPay.includes(id) && abilityDef.symbols.some(sym => cardHasSymbol(state, id, sym))
+    );
+    if (!matching) return { canPay: false, cardIds: [] };
+    toPay.push(matching);
+  }
+
+  // Pay neutral (base cost + X if applicable)
+  const baseNeutral = abilityDef.essenceCost.neutral;
+  const xExtra = abilityDef.essenceCost.x
+    ? Math.min(2, essence.length - toPay.length - baseNeutral) // For X costs, pay 2 extra if we can
+    : 0;
+  const neutralNeeded = baseNeutral + Math.max(0, xExtra);
 
   for (let i = 0; i < neutralNeeded; i++) {
     const available = essence.find((id) => !toPay.includes(id));
     if (!available) {
-      if (abilityDef.essenceCost.x) break; // X can be 0
+      if (i >= baseNeutral && abilityDef.essenceCost.x) break; // X part can be 0, but base is required
       return { canPay: false, cardIds: [] };
     }
     toPay.push(available);

@@ -108,6 +108,7 @@ export interface EssenceCost {
   specific: { symbol: Symbol; count: number }[];
   neutral: number;        // fixed neutral cost
   x: boolean;             // has X cost component
+  cardSymbol?: number;    // N cards matching any of the ability card's symbols
 }
 
 // --- Ability Requirements ---
@@ -206,6 +207,7 @@ export interface ChainEntry {
   resolved: boolean;
   negated: boolean;
   owner: PlayerId;
+  optionalApproved?: boolean;
 }
 
 // --- Player State ---
@@ -261,6 +263,38 @@ export interface GameState {
   // RNG
   rngSeed?: number;
 
+  // Pending interactive search (e.g., Secret Meeting, Vanessa)
+  pendingSearch?: {
+    effectId: string;
+    owner: PlayerId;
+    criteria: string; // human-readable description
+    validCardIds: string[];
+    displayCardIds?: string[]; // all cards to show (some may not be selectable)
+    sourceCardName?: string; // card name for overlay header (e.g., "Vanessa")
+    discardRest?: boolean; // discard non-selected display cards after selection
+  };
+
+  // Pending optional effect prompt (e.g., "you may draw 1 card")
+  pendingOptionalEffect?: {
+    chainEntryId?: string;       // ID of the chain entry waiting (Category A)
+    lingeringEffectId?: string;  // ID of the lingering effect waiting (Category B)
+    sourceCardId: string;        // instanceId of the card with the effect
+    effectId: string;            // e.g. 'F0005-E1'
+    cardName: string;            // e.g. "Slayer Guild's Hideout"
+    effectDescription: string;   // Full text shown to player
+    owner: PlayerId;
+  };
+
+  // Pending target choice (e.g., Sinbad — choose which character gets +1/+1)
+  pendingTargetChoice?: {
+    effectId: string;
+    sourceCardId: string;
+    owner: PlayerId;
+    description: string; // human-readable description
+    validTargetIds: string[];
+    allowDecline?: boolean; // show SKIP button for "you may" effects
+  };
+
   // Action log
   log: GameLogEntry[];
 }
@@ -304,4 +338,5 @@ export type PlayerAction =
   | { type: 'concede' }
   | { type: 'coin-flip-result'; results: ('heads' | 'tails')[] } // for Stake Gun etc.
   | { type: 'choose-optional-trigger'; effectId: string; activate: boolean }
-  | { type: 'search-select'; cardInstanceId: string | null }; // for deck searches
+  | { type: 'search-select'; cardInstanceId: string | null } // for deck searches
+  | { type: 'resolve-target-choice'; cardInstanceId: string | null }; // for pending target choices (e.g., Sinbad)

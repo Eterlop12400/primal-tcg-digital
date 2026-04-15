@@ -209,7 +209,7 @@ export const C0083: CharacterCardDef = {
   name: 'Swordmaster Don',
   cardType: 'character',
   symbols: ['plasma'],
-  turnCost: 0,
+  turnCost: 1,
   handCost: 0,
   healthyStats: { lead: 2, support: 2 },
   injuredStats: { lead: 0, support: 0 },
@@ -235,7 +235,7 @@ export const C0084: CharacterCardDef = {
   name: 'Sinbad',
   cardType: 'character',
   symbols: ['plasma'],
-  turnCost: 0,
+  turnCost: 1,
   handCost: 0,
   healthyStats: { lead: 0, support: 2 },
   injuredStats: { lead: 0, support: 0 },
@@ -418,9 +418,10 @@ export const A0036: AbilityCardDef = {
   cardType: 'ability',
   symbols: ['necro', 'plasma'],
   essenceCost: {
-    specific: [], // Necro OR Plasma (player chooses) — handled in effect logic
+    specific: [],
     neutral: 0,
     x: true,
+    cardSymbol: 1, // 1 Necro or 1 Plasma + X
   },
   requirements: [{ type: 'attribute', value: 'Weapon' }],
   targetDescription: '1 Character opposing the user',

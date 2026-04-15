@@ -6,6 +6,7 @@
 import { Container, Graphics, Text, TextStyle } from 'pixi.js';
 import gsap from 'gsap';
 import { COLORS, BoardLayout } from '../layout';
+import { FONT } from '../SharedStyles';
 import type { GameState, PlayerId } from '@/game/types';
 import type { GameMode } from '@/hooks/useGameEngine';
 
@@ -53,7 +54,7 @@ export class CoinFlipOverlay extends Container {
       style: new TextStyle({
         fontSize: 20,
         fill: 0xf59e0b,
-        fontFamily: 'Arial, sans-serif',
+        fontFamily: FONT,
         fontWeight: 'bold',
       }),
     });
@@ -67,7 +68,7 @@ export class CoinFlipOverlay extends Container {
       style: new TextStyle({
         fontSize: 9,
         fill: COLORS.textMuted,
-        fontFamily: 'Arial, sans-serif',
+        fontFamily: FONT,
         fontWeight: 'bold',
         letterSpacing: 4,
       }),
@@ -82,7 +83,7 @@ export class CoinFlipOverlay extends Container {
       style: new TextStyle({
         fontSize: 20,
         fill: accentColor,
-        fontFamily: 'Arial, sans-serif',
+        fontFamily: FONT,
         fontWeight: 'bold',
       }),
     });

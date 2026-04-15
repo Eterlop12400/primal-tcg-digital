@@ -1,13 +1,41 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
+import { useEffect, useRef } from 'react';
+import { MenuRenderer } from '@/pixi/MenuRenderer';
 
 export function MainMenu() {
   const router = useRouter();
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rendererRef = useRef<MenuRenderer | null>(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || rendererRef.current) return;
+    const renderer = new MenuRenderer();
+    rendererRef.current = renderer;
+    renderer.init(canvasRef.current);
+
+    const handleResize = () => renderer.resize();
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      renderer.destroy();
+      rendererRef.current = null;
+    };
+  }, []);
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-[#0d1117] px-4">
-      <div className="text-center mb-16">
+    <div className="min-h-screen flex flex-col items-center justify-center bg-[#0d1117] px-4 relative">
+      {/* Animated PixiJS background */}
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 w-full h-full"
+        style={{ zIndex: 0 }}
+      />
+
+      {/* Content overlay */}
+      <div className="relative z-10 text-center mb-16">
         <h1 className="text-6xl font-bold tracking-tight text-white mb-2">
           PRIMAL <span className="text-amber-400">TCG</span>
         </h1>
@@ -16,7 +44,7 @@ export function MainMenu() {
         </p>
       </div>
 
-      <div className="flex gap-6 max-w-2xl w-full">
+      <div className="relative z-10 flex gap-6 max-w-2xl w-full">
         {/* Player vs AI */}
         <button
           onClick={() => router.push('/game?mode=pvai')}
@@ -66,7 +94,7 @@ export function MainMenu() {
         </button>
       </div>
 
-      <p className="mt-12 text-white/20 text-xs">
+      <p className="relative z-10 mt-12 text-white/20 text-xs">
         Starter Deck 1: Slayer Guild (Necro/Plasma)
       </p>
     </div>

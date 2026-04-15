@@ -16,6 +16,7 @@ import { PlayerId, PlayerAction } from '@/game/types';
 import { getAIAction } from '@/game/ai';
 import { getCardDefForInstance, getLegalActions } from '@/game/engine';
 import { getActingPlayer, isHumanTurn } from '@/lib/gameHelpers';
+import { AUTO_PASS_DELAY_MS } from '@/lib/constants';
 import { GameRenderer } from './GameRenderer';
 
 interface PixiGameCanvasProps {
@@ -28,6 +29,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<GameRenderer | null>(null);
   const initRef = useRef(false);
+  const consumedEventsRef = useRef<Set<number>>(new Set());
   const [rendererReady, setRendererReady] = useState(false);
 
   // ============================================================
@@ -49,15 +51,23 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
 
     renderer.init(canvasRef.current).then(() => {
       renderer.setDispatch(dispatch);
+      if (mode === 'pvai') {
+        renderer.setHumanPlayer('player1');
+      }
       setRendererReady(true);
     });
 
-    // Handle resize
-    const handleResize = () => renderer.resize();
+    // Handle resize with debounce to avoid layout thrashing
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const handleResize = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => renderer.resize(), 50);
+    };
     window.addEventListener('resize', handleResize);
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      if (resizeTimer) clearTimeout(resizeTimer);
       renderer.destroy();
       rendererRef.current = null;
       initRef.current = false;
@@ -70,7 +80,21 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
   // ============================================================
   useEffect(() => {
     if (!rendererReady || !rendererRef.current || !gameState) return;
-    rendererRef.current.update(gameState, uiState);
+    // Filter out events that were already consumed to prevent duplicate animations
+    const newEvents = uiState.pendingEvents.filter(
+      (e) => !consumedEventsRef.current.has(e.sequenceId),
+    );
+    // Mark these events as consumed
+    for (const e of newEvents) {
+      consumedEventsRef.current.add(e.sequenceId);
+    }
+    // Prevent unbounded growth — clear old IDs periodically
+    if (consumedEventsRef.current.size > 500) {
+      consumedEventsRef.current = new Set(
+        [...consumedEventsRef.current].slice(-200),
+      );
+    }
+    rendererRef.current.update(gameState, uiState, newEvents);
   }, [gameState, uiState, rendererReady]);
 
   // ============================================================
@@ -135,6 +159,9 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
     if (!gameState || !isMyTurn || uiState.mode !== 'pvai' || gameState.gameOver) return;
     if (!uiState.gameStarted) return;
 
+    // Don't auto-pass when there's a pending interactive choice
+    if (gameState.pendingSearch || gameState.pendingTargetChoice || gameState.pendingOptionalEffect) return;
+
     const humanPlayer = uiState.humanPlayer;
     const isTurnPlayer = gameState.currentTurn === humanPlayer;
     const phase = gameState.phase;
@@ -149,18 +176,68 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
       } catch { return false; }
     });
 
+    // Check if player has any teams to block with
+    const myTeams = Object.values(gameState.teams).filter(
+      (t) => t.owner === humanPlayer && !t.isAttacking && !t.isBlocking,
+    );
+
+    // Check if player has characters with usable activate effects
+    const hasActivateEffects = gameState.players[humanPlayer].kingdom
+      .concat(gameState.players[humanPlayer].battlefield)
+      .some((id) => {
+        try {
+          const def = getCardDefForInstance(gameState, id);
+          if (def.cardType !== 'character') return false;
+          const card = gameState.cards[id];
+          return def.effects.some((e) =>
+            e.type === 'activate' &&
+            !card?.usedEffects.includes(e.id) &&
+            (e.timing === 'eoa' || e.timing === 'both')
+          );
+        } catch { return false; }
+      });
+
+    // Check if player has characters on the battlefield (needed to use abilities)
+    const hasBattlefieldChars = gameState.players[humanPlayer].battlefield.some((id) => {
+      const card = gameState.cards[id];
+      return card && card.owner === humanPlayer;
+    });
+
+    const hasEOAOptions = hasBattlefieldChars && (hasAbilityCards || hasActivateEffects);
+
     if (!isTurnPlayer) {
       if (phase === 'main') {
         const hasCounterStrategies = legalActions.includes('play-strategy');
         if (!hasCounterStrategies) shouldAutoPass = true;
       } else if (phase === 'battle-eoa') {
-        if (!hasAbilityCards) shouldAutoPass = true;
+        if (!hasEOAOptions) shouldAutoPass = true;
+      }
+
+      // Auto-submit empty blockers when player has no teams to block with
+      // (defender is the non-turn player during battle-block)
+      if (phase === 'battle-block' && legalActions.includes('select-blockers') && myTeams.length === 0) {
+        autoPassRef.current = setTimeout(() => {
+          dispatch({
+            type: 'PERFORM_ACTION',
+            player: humanPlayer,
+            action: { type: 'select-blockers', assignments: [] },
+          });
+          autoPassRef.current = null;
+        }, AUTO_PASS_DELAY_MS);
+        return () => {
+          if (autoPassRef.current) {
+            clearTimeout(autoPassRef.current);
+            autoPassRef.current = null;
+          }
+        };
       }
     } else {
       if (hasChain && phase === 'main') shouldAutoPass = true;
       if (phase === 'start') shouldAutoPass = true;
-      if (phase === 'end' && gameState.players[humanPlayer].hand.length <= 7) shouldAutoPass = true;
-      if (phase === 'battle-eoa' && !hasAbilityCards) shouldAutoPass = true;
+      // End phase with hand <= 7 is handled immediately by finishEndPhase —
+      // no need to auto-pass since the phase won't linger at 'end'
+      if (phase === 'battle-eoa' && !hasEOAOptions) shouldAutoPass = true;
+
       if (phase === 'battle-showdown' && legalActions.includes('choose-showdown-order')) {
         const myAttackingTeams = Object.values(gameState.teams).filter(
           (t) => t.owner === humanPlayer && t.isAttacking,
@@ -176,7 +253,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
               },
             });
             autoPassRef.current = null;
-          }, 100);
+          }, AUTO_PASS_DELAY_MS);
           return () => {
             if (autoPassRef.current) {
               clearTimeout(autoPassRef.current);
@@ -221,6 +298,7 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
       <canvas
         ref={canvasRef}
         style={{ width: '100%', height: '100%', display: 'block' }}
+        onContextMenu={(e) => e.preventDefault()}
       />
     </div>
   );

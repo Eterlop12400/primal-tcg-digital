@@ -11,6 +11,7 @@ export {
   advanceToOrganizationPhase,
   advanceToBattlePhase,
   advanceToEndPhase,
+  finishEndPhase,
   advanceToEOA,
   advanceToShowdown,
   organizeTeams,
@@ -25,6 +26,8 @@ export {
 export { resolveChain, flushPendingTriggers } from './chainResolver';
 export { executeEffect } from './effectExecutor';
 export { processAction } from './actionProcessor';
+export { EventCollector } from './EventCollector';
+export type { AnimationEvent, AnimationEventType } from './animationEvents';
 
 export {
   getCard,

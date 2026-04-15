@@ -9,24 +9,59 @@ import { CARD_IMAGE_MAP, CARD_BACK_IMAGE } from '@/lib/cardImageMap';
 
 let loaded = false;
 
+export type AssetProgressCallback = (progress: number, label: string) => void;
+
 /**
  * Preload all card textures. Safe to call multiple times — only loads once.
+ * Optional onProgress callback receives (0-1 fraction, label string).
  */
-export async function loadAllAssets(): Promise<void> {
-  if (loaded) return;
+export async function loadAllAssets(onProgress?: AssetProgressCallback): Promise<void> {
+  if (loaded) {
+    onProgress?.(1, 'Ready');
+    return;
+  }
+
+  onProgress?.(0, 'Loading fonts...');
+
+  // Load Google Fonts (Rajdhani for headers, Inter for body)
+  await loadGoogleFonts();
 
   // Build the asset manifest: one entry per card + card back
-  const bundle: Record<string, string> = {};
+  const entries = Object.entries(CARD_IMAGE_MAP);
+  const allAssets = [...entries.map(([, path]) => path), CARD_BACK_IMAGE];
+  const total = allAssets.length;
+  let completed = 0;
 
-  for (const [defId, path] of Object.entries(CARD_IMAGE_MAP)) {
-    bundle[defId] = path;
+  onProgress?.(0.05, 'Loading card assets...');
+
+  // Load assets one by one to report progress
+  for (const src of allAssets) {
+    const alias = getAlias(src);
+    await Assets.load({ alias, src });
+    completed++;
+    onProgress?.(0.05 + (completed / total) * 0.95, `Loading assets (${completed}/${total})`);
   }
-  bundle['card-back'] = CARD_BACK_IMAGE;
-
-  // Load all at once
-  await Assets.load(Object.values(bundle).map((src) => ({ alias: getAlias(src), src })));
 
   loaded = true;
+  onProgress?.(1, 'Ready');
+}
+
+async function loadGoogleFonts(): Promise<void> {
+  // Inject Google Fonts stylesheet
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = 'https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap';
+  document.head.appendChild(link);
+
+  // Wait for fonts to actually load
+  try {
+    await Promise.all([
+      document.fonts.load('700 16px Rajdhani'),
+      document.fonts.load('400 16px Inter'),
+    ]);
+  } catch {
+    // Fonts will fall back to Arial — non-critical
+  }
 }
 
 function getAlias(path: string): string {

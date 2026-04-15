@@ -108,8 +108,8 @@ export interface BoardLayout {
 }
 
 export function computeLayout(width: number, height: number): BoardLayout {
-  const uiBarH = 36;
-  const centerBarH = 44;
+  const uiBarH = 44;
+  const centerBarH = 52;
   const playableH = height - uiBarH;
   const halfH = (playableH - centerBarH) / 2;
 
@@ -118,19 +118,25 @@ export function computeLayout(width: number, height: number): BoardLayout {
   const centerColW = width - sideColW * 2;
   const centerColX = sideColW;
 
-  // Card sizing — bigger cards for the center, smaller for piles
+  // Card sizing — pick the largest card size that fits within the player half.
+  // Player half must hold: hand(cardH+12) + pad(6) + actionBtnSpace(38) + kingdom(cardH)
+  // So we need: 2*cardH + 56 <= halfH
+  const maxCardH = (halfH - 56) / 2;
   let cardSize: CardSize;
   let pileSize: CardSize;
 
-  if (height < 600) {
-    cardSize = CARD_SIZES.sm;
-    pileSize = CARD_SIZES.xs;
-  } else if (height < 800) {
+  if (maxCardH >= CARD_SIZES.xl.height) {
+    cardSize = CARD_SIZES.xl;
+    pileSize = CARD_SIZES.md;
+  } else if (maxCardH >= CARD_SIZES.lg.height) {
+    cardSize = CARD_SIZES.lg;
+    pileSize = CARD_SIZES.sm;
+  } else if (maxCardH >= CARD_SIZES.md.height) {
     cardSize = CARD_SIZES.md;
     pileSize = CARD_SIZES.sm;
   } else {
-    cardSize = CARD_SIZES.lg;
-    pileSize = CARD_SIZES.md;
+    cardSize = CARD_SIZES.sm;
+    pileSize = CARD_SIZES.xs;
   }
 
   return {

@@ -17,8 +17,9 @@ import {
   getOpponent,
 } from './utils';
 import { executeEffect } from './effectExecutor';
+import type { EventCollector } from './EventCollector';
 
-export function resolveChain(state: GameState): void {
+export function resolveChain(state: GameState, collector?: EventCollector): void {
   if (state.chain.length === 0) return;
 
   state.isChainResolving = true;
@@ -32,7 +33,14 @@ export function resolveChain(state: GameState): void {
       continue;
     }
 
-    resolveChainEntry(state, entry);
+    resolveChainEntry(state, entry, collector);
+
+    // If the effect set a pending optional prompt, pause chain resolution
+    if (state.pendingOptionalEffect) {
+      state.isChainResolving = false;
+      return;
+    }
+
     entry.resolved = true;
     state.chain.pop();
   }
@@ -59,12 +67,17 @@ export function resolveChain(state: GameState): void {
     // If new chain formed, it will need priority passes to resolve
     // For now, auto-resolve (will be interactive later)
     if (state.chain.length > 0) {
-      resolveChain(state);
+      resolveChain(state, collector);
     }
   }
 
-  // Turn player regains priority after chain resolves
-  state.priorityPlayer = state.currentTurn;
+  // Restore priority after chain resolves — phase-aware
+  // During battle-block, defender (non-turn player) should keep priority
+  if (state.phase === 'battle-block') {
+    state.priorityPlayer = getOpponent(state.currentTurn);
+  } else {
+    state.priorityPlayer = state.currentTurn;
+  }
   state.consecutivePasses = 0;
 }
 
@@ -73,7 +86,7 @@ export function resolveChain(state: GameState): void {
  * Call this after non-chain events that can create triggers
  * (e.g. showdown damage discarding characters).
  */
-export function flushPendingTriggers(state: GameState): void {
+export function flushPendingTriggers(state: GameState, collector?: EventCollector): void {
   if (state.pendingTriggers.length === 0) return;
 
   const turnPlayerTriggers = state.pendingTriggers.filter(
@@ -90,11 +103,11 @@ export function flushPendingTriggers(state: GameState): void {
   }
 
   if (state.chain.length > 0) {
-    resolveChain(state);
+    resolveChain(state, collector);
   }
 }
 
-function resolveChainEntry(state: GameState, entry: ChainEntry): void {
+function resolveChainEntry(state: GameState, entry: ChainEntry, collector?: EventCollector): void {
   // Check if negated
   if (entry.negated) {
     addLog(state, entry.owner, 'effect-negated', 'Effect was negated', entry.sourceCardInstanceId);
@@ -107,14 +120,14 @@ function resolveChainEntry(state: GameState, entry: ChainEntry): void {
       resolveSummon(state, entry);
       break;
     case 'strategy':
-      resolveStrategy(state, entry);
+      resolveStrategy(state, entry, collector);
       break;
     case 'ability':
-      resolveAbility(state, entry);
+      resolveAbility(state, entry, collector);
       break;
     case 'activate-effect':
     case 'trigger-effect':
-      resolveCardEffect(state, entry);
+      resolveCardEffect(state, entry, collector);
       break;
   }
 }
@@ -139,12 +152,12 @@ function resolveSummon(state: GameState, entry: ChainEntry): void {
   checkPutInPlayTriggers(state, entry.sourceCardInstanceId, entry.owner);
 }
 
-function resolveStrategy(state: GameState, entry: ChainEntry): void {
+function resolveStrategy(state: GameState, entry: ChainEntry, collector?: EventCollector): void {
   const card = getCard(state, entry.sourceCardInstanceId);
   const def = getCardDefForInstance(state, entry.sourceCardInstanceId) as StrategyCardDef;
 
   // Execute the strategy's effect
-  executeEffect(state, entry);
+  executeEffect(state, entry, collector);
 
   // Determine where the strategy goes after resolving
   if (def.keywords.includes('permanent')) {
@@ -178,7 +191,7 @@ function resolveStrategy(state: GameState, entry: ChainEntry): void {
   }
 }
 
-function resolveAbility(state: GameState, entry: ChainEntry): void {
+function resolveAbility(state: GameState, entry: ChainEntry, collector?: EventCollector): void {
   const def = getCardDefForInstance(state, entry.sourceCardInstanceId);
 
   // Check if user is still valid
@@ -226,7 +239,7 @@ function resolveAbility(state: GameState, entry: ChainEntry): void {
   }
 
   // Execute the ability's effect
-  executeEffect(state, entry);
+  executeEffect(state, entry, collector);
 
   // Move ability to essence
   moveCard(state, entry.sourceCardInstanceId, 'essence');
@@ -237,9 +250,14 @@ function resolveAbility(state: GameState, entry: ChainEntry): void {
     `${def.name} resolved → Essence Area`,
     entry.sourceCardInstanceId
   );
+
+  // Log which character used this ability (for Swift Strike check)
+  if (entry.userId) {
+    addLog(state, entry.owner, 'ability-user-resolved', `${def.name} used by character`, entry.userId);
+  }
 }
 
-function resolveCardEffect(state: GameState, entry: ChainEntry): void {
+function resolveCardEffect(state: GameState, entry: ChainEntry, collector?: EventCollector): void {
   const card = getCard(state, entry.sourceCardInstanceId);
   const def = getCardDefForInstance(state, entry.sourceCardInstanceId);
 
@@ -271,7 +289,7 @@ function resolveCardEffect(state: GameState, entry: ChainEntry): void {
     }
   }
 
-  executeEffect(state, entry);
+  executeEffect(state, entry, collector);
 }
 
 function handlePostResolution(state: GameState, entry: ChainEntry): void {

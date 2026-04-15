@@ -6,6 +6,7 @@
 import { Container, Graphics, Text, TextStyle } from 'pixi.js';
 import gsap from 'gsap';
 import { COLORS } from '../layout';
+import { FONT } from '../SharedStyles';
 
 // ============================================================
 // Turn Banner — sweeping "YOUR TURN" / "OPPONENT'S TURN" banner
@@ -41,7 +42,7 @@ export function showTurnBanner(
     style: new TextStyle({
       fontSize: 28,
       fill: COLORS.textBright,
-      fontFamily: 'Arial, sans-serif',
+      fontFamily: FONT,
       fontWeight: 'bold',
       letterSpacing: 8,
     }),
@@ -72,6 +73,17 @@ export function showTurnBanner(
 // Phase Banner — smaller phase label sweep
 // ============================================================
 
+// Phase-to-accent-color mapping
+const PHASE_ACCENT_COLORS: Record<string, number> = {
+  'Main Phase': COLORS.accentCyan,
+  'Organization': COLORS.accentGold,
+  'Attack Step': 0xef4444,        // red
+  'Block Step': 0x3b82f6,         // blue
+  'Exchange of Ability': 0xa855f7, // purple
+  'Showdown': 0xf59e0b,           // gold
+  'End Phase': 0x6b7280,          // gray
+};
+
 export function showPhaseBanner(
   parent: Container,
   text: string,
@@ -79,50 +91,82 @@ export function showPhaseBanner(
   screenH: number,
 ): void {
   const banner = new Container();
+  const accentColor = PHASE_ACCENT_COLORS[text] ?? COLORS.accentBlue;
 
+  const barH = 38;
+  const barW = screenW * 0.55;
+
+  // Skewed background (diagonal wipe look via parallelogram)
   const bg = new Graphics();
-  const barH = 36;
-  bg.rect(0, 0, screenW * 0.5, barH);
-  bg.fill({ color: 0x0c1425, alpha: 0.9 });
+  const skew = 12;
+  bg.moveTo(skew, 0);
+  bg.lineTo(barW + skew, 0);
+  bg.lineTo(barW - skew, barH);
+  bg.lineTo(-skew, barH);
+  bg.closePath();
+  bg.fill({ color: 0x0c1425, alpha: 0.92 });
   banner.addChild(bg);
 
-  const line = new Graphics();
-  line.moveTo(0, barH);
-  line.lineTo(screenW * 0.5, barH);
-  line.stroke({ color: COLORS.accentBlue, width: 1, alpha: 0.5 });
-  banner.addChild(line);
+  // Top accent line
+  const topLine = new Graphics();
+  topLine.moveTo(skew, 0);
+  topLine.lineTo(barW + skew, 0);
+  topLine.stroke({ color: accentColor, width: 2, alpha: 0.9 });
+  banner.addChild(topLine);
 
+  // Bottom accent line
+  const botLine = new Graphics();
+  botLine.moveTo(-skew, barH);
+  botLine.lineTo(barW - skew, barH);
+  botLine.stroke({ color: accentColor, width: 2, alpha: 0.9 });
+  banner.addChild(botLine);
+
+  // Inner glow band
+  const glowBand = new Graphics();
+  glowBand.rect(0, 1, barW, barH - 2);
+  glowBand.fill({ color: accentColor, alpha: 0.06 });
+  banner.addChild(glowBand);
+
+  // Text
   const txt = new Text({
     text: text.toUpperCase(),
     style: new TextStyle({
-      fontSize: 16,
-      fill: COLORS.accentBlue,
-      fontFamily: 'Arial, sans-serif',
+      fontSize: 17,
+      fill: accentColor,
+      fontFamily: FONT,
       fontWeight: 'bold',
-      letterSpacing: 3,
+      letterSpacing: 5,
     }),
   });
   txt.anchor.set(0.5, 0.5);
-  txt.x = screenW * 0.25;
+  txt.x = barW / 2;
   txt.y = barH / 2;
   banner.addChild(txt);
 
-  banner.x = screenW * 0.25;
-  banner.y = screenH / 2 - barH / 2 - 60; // above center bar
+  // Position centered above the center bar
+  banner.x = (screenW - barW) / 2;
+  banner.y = screenH / 2 - barH / 2 - 60;
   banner.alpha = 0;
   parent.addChild(banner);
 
   const tl = gsap.timeline({
     onComplete: () => {
       parent.removeChild(banner);
-      banner.destroy();
+      banner.destroy({ children: true });
     },
   });
 
-  tl.fromTo(banner, { alpha: 0 }, { alpha: 1, duration: 0.2, ease: 'power2.out' })
-    .fromTo(txt.scale, { x: 1.3, y: 1.3 }, { x: 1, y: 1, duration: 0.2, ease: 'back.out' }, '<')
+  // Diagonal wipe entrance: slide in from left with fade
+  tl.fromTo(banner, { alpha: 0, x: -barW * 0.3 }, { alpha: 1, x: (screenW - barW) / 2, duration: 0.25, ease: 'power3.out' })
+    .fromTo(txt.scale, { x: 1.2, y: 1.2 }, { x: 1, y: 1, duration: 0.2, ease: 'back.out(1.5)' }, '<0.05')
+    // Small particle accent on entrance
+    .call(() => {
+      particleBurst(parent, screenW / 2, banner.y + barH / 2, accentColor, 8);
+    })
+    // Hold
     .to(banner, { duration: 0.5 })
-    .to(banner, { alpha: 0, y: banner.y - 20, duration: 0.2 });
+    // Diagonal wipe exit: slide out right
+    .to(banner, { alpha: 0, x: screenW * 0.3, duration: 0.2, ease: 'power2.in' });
 }
 
 // ============================================================
@@ -140,7 +184,7 @@ export function showDamageNumber(
     style: new TextStyle({
       fontSize: 24,
       fill: COLORS.injuredDot,
-      fontFamily: 'Arial, sans-serif',
+      fontFamily: FONT,
       fontWeight: 'bold',
       stroke: { color: 0x000000, width: 3 },
     }),
@@ -149,6 +193,9 @@ export function showDamageNumber(
   txt.x = x;
   txt.y = y;
   parent.addChild(txt);
+
+  // Impact particles on damage
+  particleBurst(parent, x, y, COLORS.injuredDot, 6);
 
   gsap.to(txt, {
     y: y - 60,
@@ -253,8 +300,15 @@ export function animateCardSummon(
 // Card Destroy Animation — card dissolves
 // ============================================================
 
-export function animateCardDestroy(card: Container): Promise<void> {
+export function animateCardDestroy(card: Container, parent?: Container): Promise<void> {
   return new Promise((resolve) => {
+    // Destruction particles at card position
+    const burstParent = parent ?? card.parent;
+    if (burstParent) {
+      const bounds = card.getBounds();
+      particleBurst(burstParent, bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, 0xef4444, 10);
+    }
+
     gsap.to(card, {
       alpha: 0,
       y: card.y + 20,
@@ -398,7 +452,7 @@ export function showChainNotification(
     style: new TextStyle({
       fontSize: 12,
       fill: COLORS.accentGold,
-      fontFamily: 'Arial, sans-serif',
+      fontFamily: FONT,
       fontWeight: 'bold',
     }),
   });
@@ -422,4 +476,353 @@ export function showChainNotification(
     .to(c.scale, { x: 1, y: 1, duration: 0.15, ease: 'back.out' }, '<')
     .to(c, { duration: 0.5 })
     .to(c, { alpha: 0, y: c.y - 30, duration: 0.3 });
+}
+
+// ============================================================
+// Effect Description Callout — wider panel with multi-line text
+// ============================================================
+
+export interface EffectCalloutOptions {
+  waitForClick?: boolean;
+}
+
+export function showEffectCallout(
+  parent: Container,
+  cardName: string,
+  description: string,
+  screenW: number,
+  screenH: number,
+  options?: EffectCalloutOptions,
+): Promise<void> {
+  const waitForClick = options?.waitForClick ?? false;
+
+  return new Promise((resolve) => {
+    const c = new Container();
+
+    const maxW = Math.min(400, screenW * 0.7);
+    const padX = 16;
+    const padY = 12;
+
+    // Clickable backdrop (only when waitForClick)
+    let backdropHit: Graphics | null = null;
+    if (waitForClick) {
+      backdropHit = new Graphics();
+      backdropHit.rect(-screenW, -screenH, screenW * 2, screenH * 2);
+      backdropHit.fill({ color: 0x000000, alpha: 0.001 }); // invisible but clickable
+      backdropHit.eventMode = 'static';
+      c.addChild(backdropHit);
+    }
+
+    // Card name header
+    const nameTxt = new Text({
+      text: cardName.toUpperCase(),
+      style: new TextStyle({
+        fontSize: 13,
+        fill: COLORS.accentGold,
+        fontFamily: FONT,
+        fontWeight: 'bold',
+        letterSpacing: 2,
+      }),
+    });
+    nameTxt.anchor.set(0.5, 0);
+    nameTxt.x = 0;
+    nameTxt.y = padY;
+
+    // Description text
+    const descTxt = new Text({
+      text: description,
+      style: new TextStyle({
+        fontSize: 11,
+        fill: COLORS.text,
+        fontFamily: FONT,
+        wordWrap: true,
+        wordWrapWidth: maxW - padX * 2,
+        lineHeight: 16,
+      }),
+    });
+    descTxt.anchor.set(0.5, 0);
+    descTxt.x = 0;
+    descTxt.y = padY + nameTxt.height + 8;
+
+    let totalH = padY + nameTxt.height + 8 + descTxt.height + padY;
+
+    // "Tap to continue" hint
+    let hintTxt: Text | null = null;
+    if (waitForClick) {
+      hintTxt = new Text({
+        text: 'TAP TO CONTINUE',
+        style: new TextStyle({
+          fontSize: 10,
+          fill: COLORS.textMuted,
+          fontFamily: FONT,
+          fontWeight: 'bold',
+          letterSpacing: 2,
+        }),
+      });
+      hintTxt.anchor.set(0.5, 0);
+      hintTxt.x = 0;
+      hintTxt.y = totalH;
+      totalH += hintTxt.height + padY;
+    }
+
+    const panelW = Math.max(nameTxt.width + padX * 2, descTxt.width + padX * 2, 200);
+
+    // Background panel
+    const bg = new Graphics();
+    bg.roundRect(-panelW / 2, 0, panelW, totalH, 10);
+    bg.fill({ color: 0x0f1729, alpha: 0.95 });
+    bg.stroke({ color: COLORS.accentGold, width: 2, alpha: 0.5 });
+    c.addChild(bg);
+
+    // Accent line under card name
+    const accent = new Graphics();
+    accent.moveTo(-panelW / 2 + padX, padY + nameTxt.height + 4);
+    accent.lineTo(panelW / 2 - padX, padY + nameTxt.height + 4);
+    accent.stroke({ color: COLORS.accentGold, width: 1, alpha: 0.3 });
+    c.addChild(accent);
+
+    c.addChild(nameTxt);
+    c.addChild(descTxt);
+    if (hintTxt) c.addChild(hintTxt);
+
+    c.x = screenW / 2;
+    c.y = screenH / 2 + 80; // Below center
+    c.alpha = 0;
+    c.scale.set(0.9);
+    parent.addChild(c);
+
+    const cleanup = () => {
+      parent.removeChild(c);
+      c.destroy({ children: true });
+      resolve();
+    };
+
+    if (waitForClick) {
+      // Animate in, then wait for click
+      const tl = gsap.timeline();
+      tl.to(c, { alpha: 1, duration: 0.2 })
+        .to(c.scale, { x: 1, y: 1, duration: 0.2, ease: 'back.out(1.5)' }, '<')
+        .call(() => {
+          if (hintTxt) {
+            gsap.to(hintTxt, {
+              alpha: 0.4,
+              duration: 0.8,
+              repeat: -1,
+              yoyo: true,
+              ease: 'sine.inOut',
+            });
+          }
+
+          // Make panel clickable
+          bg.eventMode = 'static';
+          bg.cursor = 'pointer';
+          const dismiss = () => {
+            gsap.to(c, {
+              alpha: 0,
+              y: c.y - 20,
+              duration: 0.3,
+              ease: 'power2.in',
+              onComplete: cleanup,
+            });
+          };
+          bg.on('pointerdown', dismiss);
+          if (backdropHit) backdropHit.on('pointerdown', dismiss);
+        });
+    } else {
+      // Original auto-dismiss behavior
+      const tl = gsap.timeline({
+        onComplete: cleanup,
+      });
+
+      tl.to(c, { alpha: 1, duration: 0.2 })
+        .to(c.scale, { x: 1, y: 1, duration: 0.2, ease: 'back.out(1.5)' }, '<')
+        .to(c, { duration: 1.5 }) // Hold longer for reading
+        .to(c, { alpha: 0, y: c.y - 20, duration: 0.3, ease: 'power2.in' });
+    }
+  });
+}
+
+// ============================================================
+// Team Clash Animation — attackers and blockers collide
+// ============================================================
+
+export function showTeamClash(
+  parent: Container,
+  screenW: number,
+  screenH: number,
+  attackerPower: number,
+  blockerPower: number,
+): Promise<void> {
+  return new Promise((resolve) => {
+    const centerX = screenW / 2;
+    const centerY = screenH / 2;
+
+    // Attacker indicator (from left/bottom)
+    const atkIndicator = new Graphics();
+    atkIndicator.roundRect(-30, -20, 60, 40, 8);
+    atkIndicator.fill({ color: 0xef4444, alpha: 0.8 });
+    atkIndicator.x = -50;
+    atkIndicator.y = centerY;
+    parent.addChild(atkIndicator);
+
+    const atkTxt = new Text({
+      text: `${attackerPower}`,
+      style: new TextStyle({ fontSize: 20, fill: 0xffffff, fontFamily: FONT, fontWeight: 'bold' }),
+    });
+    atkTxt.anchor.set(0.5, 0.5);
+    atkIndicator.addChild(atkTxt);
+
+    // Blocker indicator (from right/top)
+    const blkIndicator = new Graphics();
+    blkIndicator.roundRect(-30, -20, 60, 40, 8);
+    blkIndicator.fill({ color: 0x3b82f6, alpha: 0.8 });
+    blkIndicator.x = screenW + 50;
+    blkIndicator.y = centerY;
+    parent.addChild(blkIndicator);
+
+    const blkTxt = new Text({
+      text: `${blockerPower}`,
+      style: new TextStyle({ fontSize: 20, fill: 0xffffff, fontFamily: FONT, fontWeight: 'bold' }),
+    });
+    blkTxt.anchor.set(0.5, 0.5);
+    blkIndicator.addChild(blkTxt);
+
+    const tl = gsap.timeline({
+      onComplete: () => {
+        parent.removeChild(atkIndicator);
+        parent.removeChild(blkIndicator);
+        atkIndicator.destroy({ children: true });
+        blkIndicator.destroy({ children: true });
+        resolve();
+      },
+    });
+
+    // Slide toward center
+    tl.to(atkIndicator, { x: centerX - 40, duration: 0.3, ease: 'power2.in' })
+      .to(blkIndicator, { x: centerX + 40, duration: 0.3, ease: 'power2.in' }, '<')
+      // Impact
+      .call(() => {
+        screenShake(parent, 8, 0.35);
+        particleBurst(parent, centerX, centerY, 0xffffff, 24);
+        particleBurst(parent, centerX, centerY, COLORS.accentGold, 8);
+        screenFlash(parent, screenW, screenH, 0xffffff);
+      })
+      // Hold
+      .to({}, { duration: 0.4 })
+      // Fade out
+      .to(atkIndicator, { alpha: 0, duration: 0.2 })
+      .to(blkIndicator, { alpha: 0, duration: 0.2 }, '<');
+  });
+}
+
+// ============================================================
+// Enhanced Battle Reward Celebration
+// ============================================================
+
+export function showBattleRewardCelebration(
+  parent: Container,
+  screenW: number,
+  screenH: number,
+  rewardCount: number,
+): void {
+  // Multi-wave particle bursts (center + offset positions)
+  particleBurst(parent, screenW / 2, screenH / 2, COLORS.accentGold, 30);
+  // Delayed secondary bursts at offset positions
+  setTimeout(() => particleBurst(parent, screenW * 0.35, screenH / 2 - 20, COLORS.accentGold, 12), 100);
+  setTimeout(() => particleBurst(parent, screenW * 0.65, screenH / 2 + 20, COLORS.accentGold, 12), 200);
+
+  // Screen flash
+  screenFlash(parent, screenW, screenH, COLORS.accentGold);
+
+  // Heavier screen shake
+  screenShake(parent, 8, 0.5);
+
+  // "BATTLE REWARD!" sweep banner
+  const banner = new Container();
+  const bg = new Graphics();
+  const barH = 44;
+  bg.rect(0, 0, screenW * 0.6, barH);
+  bg.fill({ color: 0x000000, alpha: 0.85 });
+  banner.addChild(bg);
+
+  const topLine = new Graphics();
+  topLine.moveTo(0, 0);
+  topLine.lineTo(screenW * 0.6, 0);
+  topLine.stroke({ color: COLORS.accentGold, width: 2, alpha: 0.8 });
+  banner.addChild(topLine);
+
+  const botLine = new Graphics();
+  botLine.moveTo(0, barH);
+  botLine.lineTo(screenW * 0.6, barH);
+  botLine.stroke({ color: COLORS.accentGold, width: 2, alpha: 0.8 });
+  banner.addChild(botLine);
+
+  const txt = new Text({
+    text: `BATTLE REWARD! ×${rewardCount}`,
+    style: new TextStyle({
+      fontSize: 22,
+      fill: COLORS.accentGold,
+      fontFamily: FONT,
+      fontWeight: 'bold',
+      letterSpacing: 4,
+    }),
+  });
+  txt.anchor.set(0.5, 0.5);
+  txt.x = screenW * 0.3;
+  txt.y = barH / 2;
+  banner.addChild(txt);
+
+  banner.x = screenW * 0.2;
+  banner.y = screenH / 2 - barH / 2;
+  banner.alpha = 0;
+  parent.addChild(banner);
+
+  const tl = gsap.timeline({
+    onComplete: () => {
+      parent.removeChild(banner);
+      banner.destroy({ children: true });
+    },
+  });
+
+  tl.fromTo(banner, { alpha: 0, x: -screenW * 0.3 }, { alpha: 1, x: screenW * 0.2, duration: 0.3, ease: 'power2.out' })
+    .to(banner, { duration: 0.8 }) // hold
+    .to(banner, { alpha: 0, x: screenW, duration: 0.3, ease: 'power2.in' });
+}
+
+// ============================================================
+// Active Player Border Glow
+// ============================================================
+
+export function drawActivePlayerGlow(
+  parent: Container,
+  screenW: number,
+  dividerY: number,
+  isPlayerTurn: boolean,
+): Graphics {
+  const glow = new Graphics();
+  const color = isPlayerTurn ? COLORS.accentCyan : COLORS.player2Color;
+  const glowY = isPlayerTurn ? dividerY + 2 : dividerY - 2;
+
+  // Gradient-like glow line
+  glow.moveTo(0, glowY);
+  glow.lineTo(screenW, glowY);
+  glow.stroke({ color, width: 3, alpha: 0.4 });
+
+  // Softer outer glow
+  glow.moveTo(0, glowY);
+  glow.lineTo(screenW, glowY);
+  glow.stroke({ color, width: 8, alpha: 0.1 });
+
+  parent.addChild(glow);
+
+  // Pulse animation
+  gsap.to(glow, {
+    alpha: 0.6,
+    duration: 1,
+    repeat: -1,
+    yoyo: true,
+    ease: 'sine.inOut',
+  });
+
+  return glow;
 }

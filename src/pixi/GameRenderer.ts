@@ -19,10 +19,18 @@ import {
 } from './layout';
 import { CardSprite } from './CardSprite';
 import { loadAllAssets } from './AssetLoader';
+import { LoadingScreen } from './LoadingScreen';
 import { MulliganOverlay } from './overlays/MulliganOverlay';
 import { TeamOrgOverlay } from './overlays/TeamOrgOverlay';
 import { BattleOverlay } from './overlays/BattleOverlay';
 import { CoinFlipOverlay } from './overlays/CoinFlipOverlay';
+import { CardPreviewOverlay } from './overlays/CardPreviewOverlay';
+import { PileViewerOverlay } from './overlays/PileViewerOverlay';
+import { DeckSearchOverlay } from './overlays/DeckSearchOverlay';
+import { EssencePickerOverlay } from './overlays/EssencePickerOverlay';
+import { showCardCloseUp } from './effects/CardCloseUp';
+import { showEffectCallout } from './effects/Animations';
+import gsap from 'gsap';
 import {
   showTurnBanner,
   showPhaseBanner,
@@ -32,7 +40,11 @@ import {
   particleBurst,
   showChainNotification,
   animateCardSummon,
+  showBattleRewardCelebration,
+  drawActivePlayerGlow,
 } from './effects/Animations';
+import { shatterEffect } from './effects/ShatterEffect';
+import { STYLES, FONT } from './SharedStyles';
 import type {
   GameState,
   PlayerId,
@@ -40,12 +52,17 @@ import type {
   CardDef,
   CharacterCardDef,
   StrategyCardDef,
+  AbilityCardDef,
 } from '@/game/types';
+import type { AnimationEvent } from '@/game/engine/animationEvents';
+import { AnimationQueue } from './animation/AnimationQueue';
+import { AnimationRouter } from './animation/AnimationRouter';
 import type { UIState, UIAction } from '@/hooks/useGameEngine';
 import {
   getCardDefForInstance,
   getEffectiveStats,
   getLegalActions,
+  characterHasAttribute,
 } from '@/game/engine';
 import {
   getActingPlayer,
@@ -73,12 +90,27 @@ export class GameRenderer {
   private prevCurrentTurn: PlayerId | null = null;
   private coinFlipShown = false;
 
+  // AI thinking indicator
+  private aiThinkingContainer: Container | null = null;
+  private aiThinkingTween: gsap.core.Tween | null = null;
+
+  // Track card screen positions for zone-change animations
+  private cardPositions = new Map<string, { x: number; y: number; w: number; h: number; zone: string }>();
+
+  // Card preview / pile viewer
+  private previewOverlay: CardPreviewOverlay | null = null;
+  private pileViewerOverlay: PileViewerOverlay | null = null;
+
+  // Animation system
+  private animationQueue: AnimationQueue;
+  private animationRouter: AnimationRouter | null = null;
+
   constructor() {
     this.app = new Application();
+    this.animationQueue = new AnimationQueue();
   }
 
   async init(canvas: HTMLCanvasElement): Promise<void> {
-    await loadAllAssets();
     await this.app.init({
       canvas,
       resizeTo: canvas.parentElement ?? undefined,
@@ -87,12 +119,34 @@ export class GameRenderer {
       resolution: window.devicePixelRatio || 1,
       autoDensity: true,
     });
+
+    // Show loading screen while assets load
+    const screenW = this.app.screen.width;
+    const screenH = this.app.screen.height;
+    const loadingScreen = new LoadingScreen(screenW, screenH);
+    this.app.stage.addChild(loadingScreen);
+
+    await loadAllAssets((progress, label) => {
+      loadingScreen.setProgress(progress, label);
+    });
+
+    await loadingScreen.fadeOut();
+
+    this.boardLayer.sortableChildren = true;
     this.app.stage.addChild(this.boardLayer);
     this.app.stage.addChild(this.overlayLayer);
     this.app.stage.addChild(this.effectsLayer);
     this.app.stage.addChild(this.uiLayer);
-    this.layout = computeLayout(this.app.screen.width, this.app.screen.height);
+    this.layout = computeLayout(screenW, screenH);
+    this.animationRouter = new AnimationRouter(this.effectsLayer, this.boardLayer, this.layout);
+    this.animationQueue.setPlayer((event) => this.animationRouter!.play(event));
     this.initialized = true;
+  }
+
+  setHumanPlayer(player: PlayerId): void {
+    if (this.animationRouter) {
+      this.animationRouter.setHumanPlayer(player);
+    }
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -102,16 +156,47 @@ export class GameRenderer {
 
   resize(): void {
     if (!this.initialized) return;
-    this.layout = computeLayout(this.app.screen.width, this.app.screen.height);
-    if (this.currentGameState && this.currentUIState) {
-      this.update(this.currentGameState, this.currentUIState);
+    // Manually sync renderer size with parent container to avoid stale dimensions
+    const parent = this.app.canvas?.parentElement;
+    if (parent) {
+      const w = parent.clientWidth;
+      const h = parent.clientHeight;
+      if (w > 0 && h > 0) {
+        this.app.renderer.resize(w, h);
+        this.layout = computeLayout(w, h);
+        if (this.animationRouter) {
+          this.animationRouter.updateLayout(this.layout);
+        }
+        if (this.currentGameState && this.currentUIState) {
+          this.update(this.currentGameState, this.currentUIState);
+        }
+      }
     }
   }
 
-  update(gameState: GameState, uiState: UIState): void {
+  update(gameState: GameState, uiState: UIState, events?: AnimationEvent[]): void {
     const prevState = this.currentGameState;
     this.currentGameState = gameState;
     this.currentUIState = uiState;
+
+    // Update animation router layout
+    if (this.animationRouter) {
+      this.animationRouter.updateLayout(this.layout);
+    }
+
+    // Track whether EventCollector events were provided (to avoid duplicate animations)
+    const hasCollectorEvents = events != null && events.length > 0;
+
+    // Pass current card positions to AnimationRouter before enqueueing
+    // (positions from previous frame are used for zone-change animations)
+    if (this.animationRouter) {
+      this.animationRouter.setCardPositions(this.cardPositions);
+    }
+
+    // Enqueue animation events if provided
+    if (hasCollectorEvents) {
+      this.animationQueue.enqueue(events);
+    }
 
     this.boardLayer.removeChildren();
     this.overlayLayer.removeChildren();
@@ -119,8 +204,8 @@ export class GameRenderer {
     this.uiLayer.removeChildren();
     this.layout = computeLayout(this.app.screen.width, this.app.screen.height);
 
-    // Trigger animations on state transitions
-    this.checkAnimationTriggers(gameState, uiState, prevState);
+    // Trigger animations on state transitions (skip chain/summon checks if EventCollector already handled them)
+    this.checkAnimationTriggers(gameState, uiState, prevState, hasCollectorEvents);
 
     this.drawBackground();
     this.renderBoard(gameState, uiState);
@@ -143,6 +228,29 @@ export class GameRenderer {
       this.renderBattleOverlay(gameState, uiState);
     }
 
+    // Essence picker overlay (ability/activate cost payment — only for essence-source costs)
+    if (this.dispatch && (
+      uiState.selectionMode.type === 'ability-essence-cost' ||
+      (uiState.selectionMode.type === 'activate-cost-select' && uiState.selectionMode.costSource === 'essence')
+    )) {
+      this.renderEssencePickerOverlay(gameState, uiState);
+    }
+
+    // Deck search overlay (e.g., Secret Meeting)
+    if (gameState.pendingSearch && gameState.pendingSearch.owner === uiState.humanPlayer && this.dispatch) {
+      this.renderDeckSearchOverlay(gameState, uiState);
+    }
+
+    // Target choice overlay (e.g., Sinbad — choose which character gets +1/+1)
+    if (gameState.pendingTargetChoice && gameState.pendingTargetChoice.owner === uiState.humanPlayer && this.dispatch) {
+      this.renderTargetChoiceOverlay(gameState, uiState);
+    }
+
+    // Optional effect overlay (e.g., "you may draw 1 card")
+    if (gameState.pendingOptionalEffect && gameState.pendingOptionalEffect.owner === uiState.humanPlayer && this.dispatch) {
+      this.renderOptionalEffectOverlay(gameState, uiState);
+    }
+
     // Coin flip overlay (fires once, self-destroys via GSAP)
     this.checkCoinFlip(gameState, uiState);
   }
@@ -151,7 +259,7 @@ export class GameRenderer {
   // Animation Triggers
   // ============================================================
 
-  private checkAnimationTriggers(state: GameState, ui: UIState, prev: GameState | null): void {
+  private checkAnimationTriggers(state: GameState, ui: UIState, prev: GameState | null, hasCollectorEvents = false): void {
     if (!prev) {
       this.prevPhase = state.phase;
       this.prevTurn = state.turnNumber;
@@ -169,33 +277,85 @@ export class GameRenderer {
       showTurnBanner(this.effectsLayer, label, L.width, L.height);
     }
 
-    // Phase change banner
+    // Phase change banner + subtle board scale pulse
     if (state.phase !== this.prevPhase && state.currentTurn === this.prevCurrentTurn) {
       const phaseText = PHASE_LABELS[state.phase] ?? state.phase;
       if (state.phase !== 'start' && state.phase !== 'setup') {
         showPhaseBanner(this.effectsLayer, phaseText, L.width, L.height);
+        // Brief scale pulse on board for "snap" feel
+        gsap.fromTo(this.boardLayer.scale, { x: 1.015, y: 1.015 }, { x: 1, y: 1, duration: 0.3, ease: 'power2.out' });
+
+        // Screen-width color sweep on battle start
+        if (state.phase === 'battle-attack' && this.prevPhase !== 'battle-attack') {
+          const sweep = new Graphics();
+          sweep.rect(0, L.height / 2 - 2, L.width, 4);
+          sweep.fill({ color: 0xef4444, alpha: 0.8 });
+          this.effectsLayer.addChild(sweep);
+          sweep.scale.x = 0;
+          gsap.to(sweep.scale, {
+            x: 1, duration: 0.3, ease: 'power2.out',
+            onComplete: () => {
+              gsap.to(sweep, {
+                alpha: 0, duration: 0.3,
+                onComplete: () => { this.effectsLayer.removeChild(sweep); sweep.destroy(); },
+              });
+            },
+          });
+        }
       }
     }
 
-    // Battle reward gained — screen flash + particles
+    // Battle reward gained — enhanced celebration
     const prevP1BR = prev.players.player1.battleRewards.length;
     const prevP2BR = prev.players.player2.battleRewards.length;
     const curP1BR = state.players.player1.battleRewards.length;
     const curP2BR = state.players.player2.battleRewards.length;
 
-    if (curP1BR > prevP1BR || curP2BR > prevP2BR) {
-      screenFlash(this.effectsLayer, L.width, L.height, COLORS.accentGold);
-      particleBurst(this.effectsLayer, L.width / 2, L.height / 2, COLORS.accentGold, 20);
+    if (curP1BR > prevP1BR) {
+      showBattleRewardCelebration(this.effectsLayer, L.width, L.height, curP1BR - prevP1BR);
+    }
+    if (curP2BR > prevP2BR) {
+      showBattleRewardCelebration(this.effectsLayer, L.width, L.height, curP2BR - prevP2BR);
     }
 
-    // Character discarded — shake
+    // Character discarded — shake + shatter at last known position
     const prevTotalKingdom = prev.players.player1.kingdom.length + prev.players.player2.kingdom.length;
     const curTotalKingdom = state.players.player1.kingdom.length + state.players.player2.kingdom.length;
     if (curTotalKingdom < prevTotalKingdom) {
       screenShake(this.boardLayer, 3, 0.2);
     }
 
-    // Card drawn — flash effect from deck to hand
+    // Defeated card animations — detect cards that left battlefield/kingdom → discard
+    for (const pid of ['player1', 'player2'] as PlayerId[]) {
+      const prevOnField = new Set([
+        ...prev.players[pid].battlefield,
+        ...prev.players[pid].kingdom,
+      ]);
+      const curOnField = new Set([
+        ...state.players[pid].battlefield,
+        ...state.players[pid].kingdom,
+      ]);
+      for (const cardId of prevOnField) {
+        if (!curOnField.has(cardId) && state.cards[cardId]?.zone === 'discard') {
+          // Card was defeated — play shatter at last known position
+          const pos = this.cardPositions.get(cardId);
+          if (pos) {
+            shatterEffect(this.effectsLayer, pos.x, pos.y, pos.w, pos.h, COLORS.injuredDot);
+          }
+        }
+      }
+    }
+
+    // Card drawn — flash effect from deck to hand (skip if EventCollector already handled)
+    if (hasCollectorEvents) {
+      // EventCollector events handle card-zone-change, chain-entry-added, etc.
+      // Skip the duplicate state-diff based animations below.
+      this.prevPhase = state.phase;
+      this.prevTurn = state.turnNumber;
+      this.prevCurrentTurn = state.currentTurn;
+      return;
+    }
+
     for (const pid of ['player1', 'player2'] as PlayerId[]) {
       const prevHand = prev.players[pid].hand.length;
       const curHand = state.players[pid].hand.length;
@@ -204,33 +364,65 @@ export class GameRenderer {
         const deckX = L.width - L.sideColW / 2;
         const deckY = isBottom ? L.playerY + L.playerH / 2 : L.opponentY + L.opponentH / 2;
         const handY = isBottom ? L.height - L.uiBarH - 80 : 80;
-        // Draw flash: a small card-like shape flies from deck to hand
+        // Draw flash: a card-shaped sprite flies from deck to hand with landing particle burst
         const drawCount = curHand - prevHand;
         for (let d = 0; d < drawCount; d++) {
+          const targetX = L.width / 2 + d * 20;
           const flash = new Graphics();
           flash.roundRect(0, 0, 30, 42, 3);
           flash.fill({ color: COLORS.accentCyan, alpha: 0.7 });
           flash.stroke({ color: COLORS.accentCyan, width: 1 });
           this.effectsLayer.addChild(flash);
-          animateCardSummon(flash, deckX, deckY, L.width / 2 + d * 20, handY);
-          // Auto-cleanup after animation
+          animateCardSummon(flash, deckX, deckY, targetX, handY);
+          // Landing burst + cleanup after animation
+          const layer = this.effectsLayer;
           setTimeout(() => {
-            try { this.effectsLayer.removeChild(flash); flash.destroy(); } catch { /* ok */ }
+            particleBurst(layer, targetX + 15, handY + 21, COLORS.accentCyan, 6);
+          }, 350);
+          setTimeout(() => {
+            try { layer.removeChild(flash); flash.destroy(); } catch { /* ok */ }
           }, 600);
         }
       }
     }
 
-    // Chain entry — show what's activating
+    // Chain entry — show card close-up (Master Duel style)
     if (state.chain.length > prev.chain.length) {
       const newEntry = state.chain[state.chain.length - 1];
       if (newEntry) {
         let cardName = 'Effect';
+        let defId = '';
+        let effectDesc = '';
         try {
           const def = getCardDefForInstance(state, newEntry.sourceCardInstanceId);
           cardName = def.name;
+          defId = def.id;
+          // Get effect description if available
+          if ('effects' in def && def.effects.length > 0) {
+            const effectId = newEntry.effectId;
+            const effect = effectId ? def.effects.find(e => e.id === effectId) : def.effects[0];
+            if (effect) effectDesc = effect.effectDescription;
+          }
         } catch { /* skip */ }
-        showChainNotification(this.effectsLayer, `${cardName} activates!`, L.width, L.height);
+
+        const actionText = newEntry.type === 'summon' ? 'SUMMONED!'
+          : newEntry.type === 'strategy' ? 'STRATEGY!'
+          : newEntry.type === 'ability' ? 'ABILITY!'
+          : 'EFFECT!';
+
+        // Show close-up
+        if (defId) {
+          showCardCloseUp(this.effectsLayer, defId, cardName, actionText, L.width, L.height);
+        } else {
+          showChainNotification(this.effectsLayer, `${cardName} activates!`, L.width, L.height);
+        }
+
+        // Show effect description callout if available
+        if (effectDesc) {
+          setTimeout(() => {
+            showEffectCallout(this.effectsLayer, cardName, effectDesc, L.width, L.height);
+          }, 400);
+        }
       }
     }
 
@@ -255,6 +447,21 @@ export class GameRenderer {
     bg.fill({ color: COLORS.background });
     this.boardLayer.addChild(bg);
 
+    // Subtle grid pattern on play area
+    const gridGfx = new Graphics();
+    const gridSpacing = 40;
+    const gridAlpha = 0.04;
+    for (let gx = this.layout.sideColW; gx < width - this.layout.sideColW; gx += gridSpacing) {
+      gridGfx.moveTo(gx, 0);
+      gridGfx.lineTo(gx, height - this.layout.uiBarH);
+    }
+    for (let gy = 0; gy < height - this.layout.uiBarH; gy += gridSpacing) {
+      gridGfx.moveTo(this.layout.sideColW, gy);
+      gridGfx.lineTo(width - this.layout.sideColW, gy);
+    }
+    gridGfx.stroke({ color: 0x1a2535, width: 1, alpha: gridAlpha });
+    this.boardLayer.addChild(gridGfx);
+
     const topPanel = new Graphics();
     topPanel.rect(0, 0, width, this.layout.centerBarY);
     topPanel.fill({ color: 0x0a1020, alpha: 0.5 });
@@ -272,13 +479,73 @@ export class GameRenderer {
       this.boardLayer.addChild(sidePanel);
     }
 
+    // Soft glow bands instead of thin divider lines
     for (const x of [this.layout.sideColW, width - this.layout.sideColW]) {
+      const glowBand = new Graphics();
+      glowBand.rect(x - 3, 4, 6, height - this.layout.uiBarH - 8);
+      glowBand.fill({ color: COLORS.accentBlue, alpha: 0.03 });
+      this.boardLayer.addChild(glowBand);
       const line = new Graphics();
       line.moveTo(x, 4);
       line.lineTo(x, height - this.layout.uiBarH - 4);
-      line.stroke({ color: 0x1a2535, width: 1, alpha: 0.5 });
+      line.stroke({ color: COLORS.accentBlue, width: 1, alpha: 0.15 });
       this.boardLayer.addChild(line);
     }
+
+    // Active player border glow along center divider
+    if (this.currentGameState && this.currentUIState) {
+      const isPlayerTurn = this.currentUIState.mode === 'pvai'
+        ? this.currentGameState.currentTurn === this.currentUIState.humanPlayer
+        : this.currentGameState.currentTurn === 'player1';
+      drawActivePlayerGlow(
+        this.boardLayer,
+        width,
+        this.layout.centerBarY,
+        isPlayerTurn,
+      );
+    }
+
+    // Spawn floating particles (on effectsLayer so they persist across frames)
+    this.spawnBoardParticles();
+  }
+
+  // Board particle system — spawns a few dim, slow particles per frame
+  private boardParticleCount = 0;
+  private spawnBoardParticles(): void {
+    const maxParticles = 15;
+    if (this.boardParticleCount >= maxParticles) return;
+
+    // Spawn 1 particle per update call, up to max
+    const { width, height } = this.layout;
+    const x = this.layout.sideColW + Math.random() * (width - this.layout.sideColW * 2);
+    const y = Math.random() * (height - this.layout.uiBarH);
+    const size = 1 + Math.random() * 1.5;
+    const color = Math.random() > 0.7 ? COLORS.accentGold : COLORS.accentCyan;
+
+    const particle = new Graphics();
+    particle.circle(0, 0, size);
+    particle.fill({ color, alpha: 0.15 });
+    particle.x = x;
+    particle.y = y;
+    this.effectsLayer.addChild(particle);
+    this.boardParticleCount++;
+
+    // Slow upward drift + fade out
+    const duration = 8 + Math.random() * 12;
+    gsap.to(particle, {
+      y: y - 60 - Math.random() * 80,
+      x: x + (Math.random() - 0.5) * 40,
+      alpha: 0,
+      duration,
+      ease: 'none',
+      onComplete: () => {
+        try {
+          this.effectsLayer.removeChild(particle);
+          particle.destroy();
+        } catch { /* ok */ }
+        this.boardParticleCount--;
+      },
+    });
   }
 
   // ============================================================
@@ -290,6 +557,54 @@ export class GameRenderer {
     const topPlayer: PlayerId = bottomPlayer === 'player1' ? 'player2' : 'player1';
     this.renderPlayerHalf(state, topPlayer, true, ui);
     this.renderPlayerHalf(state, bottomPlayer, false, ui);
+    this.renderZoneLabels(state);
+  }
+
+  // ============================================================
+  // Zone Labels
+  // ============================================================
+
+  private renderZoneLabels(state: GameState): void {
+    const L = this.layout;
+    const phase = state.phase;
+
+    // Determine which zones glow based on current phase
+    const activeZones = new Set<string>();
+    if (phase === 'main') {
+      activeZones.add('hand');
+      activeZones.add('kingdom');
+      activeZones.add('essence');
+    } else if (phase === 'organization') {
+      activeZones.add('kingdom');
+    } else if (phase === 'battle-attack' || phase === 'battle-block' || phase === 'battle-eoa' || phase === 'battle-showdown') {
+      activeZones.add('battlefield');
+    } else if (phase === 'end') {
+      activeZones.add('hand');
+    }
+
+    // Center zone labels for kingdom area
+    const centerLabels = [
+      { text: 'KINGDOM', y: L.playerY + 2, zone: 'kingdom' },
+    ];
+
+    for (const label of centerLabels) {
+      const isActive = activeZones.has(label.zone);
+      const txt = new Text({
+        text: label.text,
+        style: new TextStyle({
+          fontSize: 13,
+          fill: isActive ? COLORS.accentBlue : COLORS.textMuted,
+          fontFamily: FONT,
+          fontWeight: 'bold',
+          letterSpacing: 3,
+        }),
+      });
+      txt.anchor.set(0, 0);
+      txt.x = L.centerColX + 8;
+      txt.y = label.y;
+      txt.alpha = isActive ? 0.6 : 0.2;
+      this.boardLayer.addChild(txt);
+    }
   }
 
   // ============================================================
@@ -305,21 +620,25 @@ export class GameRenderer {
     this.renderPileColumn(state, player, L.width - L.sideColW, areaY, L.sideColW, areaH, 'right');
 
     const cardSize = L.cardSize;
-    const pad = 8;
-    const handH = cardSize.height + 16;
-    const kingdomH = areaH - handH - pad;
+    // Use smaller cards for opponent's hand (face-down anyway) to save space
+    const handCardSize = isTop ? L.pileSize : cardSize;
+    const pad = 6;
+    // Leave room for action buttons below the hand (bottom player only)
+    const actionBtnSpace = isTop ? 0 : 38;
+    const handH = handCardSize.height + 12;
+    const kingdomH = areaH - handH - pad - actionBtnSpace;
 
     let kingdomY: number, handY: number;
     if (isTop) {
       handY = areaY;
       kingdomY = areaY + handH + pad;
     } else {
-      handY = areaY + areaH - handH;
+      handY = areaY + areaH - handH - actionBtnSpace;
       kingdomY = areaY;
     }
 
     this.renderKingdom(state, player, L.centerColX, kingdomY, L.centerColW, kingdomH, cardSize);
-    this.renderHand(state, player, L.centerColX, handY, L.centerColW, handH, cardSize, isTop, ui);
+    this.renderHand(state, player, L.centerColX, handY, L.centerColW, handH, handCardSize, isTop, ui);
   }
 
   // ============================================================
@@ -331,16 +650,16 @@ export class GameRenderer {
     const pileSize = this.layout.pileSize;
     const gap = 6;
 
-    type PileInfo = { label: string; instanceId?: string; count?: number; faceDown?: boolean };
+    type PileInfo = { label: string; zone: string; instanceId?: string; count?: number; faceDown?: boolean; allIds?: string[] };
     const piles: PileInfo[] = side === 'left'
       ? [
-          { label: 'FIELD', instanceId: pState.fieldCard },
-          { label: 'BR', count: pState.battleRewards.length, instanceId: pState.battleRewards[pState.battleRewards.length - 1], faceDown: true },
+          { label: 'FIELD', zone: 'field', instanceId: pState.fieldCard },
+          { label: 'BR', zone: 'br', count: pState.battleRewards.length, instanceId: pState.battleRewards[pState.battleRewards.length - 1], faceDown: true },
         ]
       : [
-          { label: 'DECK', count: pState.deck.length, faceDown: true },
-          { label: 'DISCARD', count: pState.discard.length, instanceId: pState.discard[pState.discard.length - 1] },
-          { label: 'ESSENCE', count: pState.essence.length, instanceId: pState.essence[0] },
+          { label: 'DECK', zone: 'deck', count: pState.deck.length, faceDown: true },
+          { label: 'DISCARD', zone: 'discard', count: pState.discard.length, instanceId: pState.discard[pState.discard.length - 1], allIds: [...pState.discard] },
+          { label: 'ESSENCE', zone: 'essence', count: pState.essence.length, allIds: [...pState.essence] },
         ];
 
     const labelH = 12;
@@ -354,7 +673,7 @@ export class GameRenderer {
 
       const lbl = new Text({
         text: pile.count !== undefined ? `${pile.label} (${pile.count})` : pile.label,
-        style: new TextStyle({ fontSize: 8, fill: COLORS.zoneLabel, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 1 }),
+        style: new TextStyle({ fontSize: 12, fill: COLORS.zoneLabel, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
       });
       lbl.anchor.set(0.5, 0);
       lbl.x = x + w / 2;
@@ -363,6 +682,171 @@ export class GameRenderer {
 
       const cardY = slotY + labelH + 2;
 
+      // Essence: symbol dot summary for at-a-glance reading
+      // (During cost selection, the EssencePickerOverlay handles interaction)
+      if (pile.zone === 'essence' && pile.allIds && pile.allIds.length > 0) {
+        // Symbol dot summary — count each symbol for at-a-glance reading
+        const symbolCounts = new Map<string, number>();
+        for (const eid of pile.allIds) {
+          const eInst = state.cards[eid];
+          if (!eInst) continue;
+          let eDef: CardDef | undefined;
+          try { eDef = getCardDefForInstance(state, eid); } catch { /* skip */ }
+          const sym = eDef?.symbols?.[0] ?? 'neutral';
+          symbolCounts.set(sym, (symbolCounts.get(sym) ?? 0) + 1);
+        }
+
+        // Background panel
+        const panelW = pileSize.width + 8;
+        const panelH = pileSize.height;
+        const panelX = centerX - 4;
+        const panelBg = new Graphics();
+        panelBg.roundRect(panelX, cardY, panelW, panelH, 6);
+        panelBg.fill({ color: 0x0a1020, alpha: 0.7 });
+        panelBg.stroke({ color: COLORS.panelBorder, width: 1, alpha: 0.5 });
+        this.boardLayer.addChild(panelBg);
+
+        // Render symbol rows: [dot] [symbol] x[count]
+        const entries = [...symbolCounts.entries()].sort((a, b) => b[1] - a[1]);
+        const rowH = Math.min(16, (panelH - 8) / Math.max(entries.length, 1));
+        const startRowY = cardY + (panelH - entries.length * rowH) / 2;
+
+        for (let si = 0; si < entries.length; si++) {
+          const [sym, count] = entries[si];
+          const rowY = startRowY + si * rowH;
+          const dotColor = COLORS.symbols[sym] ?? 0x888888;
+
+          // Colored dot
+          const dot = new Graphics();
+          dot.circle(panelX + 12, rowY + rowH / 2, 5);
+          dot.fill({ color: dotColor });
+          this.boardLayer.addChild(dot);
+
+          // Symbol label + count
+          const symLabel = sym === 'neutral' ? 'N' : sym.charAt(0).toUpperCase();
+          const txt = new Text({
+            text: `${symLabel} x${count}`,
+            style: new TextStyle({
+              fontSize: 11,
+              fill: dotColor,
+              fontFamily: FONT,
+              fontWeight: 'bold',
+            }),
+          });
+          txt.anchor.set(0, 0.5);
+          txt.x = panelX + 22;
+          txt.y = rowY + rowH / 2;
+          this.boardLayer.addChild(txt);
+        }
+
+        // Clickable area for pile viewer (right-click for full detail)
+        const hitArea = new Graphics();
+        hitArea.roundRect(panelX, cardY, panelW, panelH, 6);
+        hitArea.fill({ color: 0x000000, alpha: 0.001 });
+        hitArea.eventMode = 'static';
+        hitArea.cursor = 'pointer';
+        hitArea.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+          if (e.button === 2) {
+            e.preventDefault?.();
+            this.showPileViewer('ESSENCE', pile.allIds!);
+          }
+        });
+        this.boardLayer.addChild(hitArea);
+        return;
+      }
+
+      // Battle Rewards: horizontal cards stacking vertically downward
+      if (pile.zone === 'br' && (pile.count ?? 0) > 0) {
+        const brCount = pile.count ?? 0;
+        const brCardW = pileSize.height; // rotated: height becomes visual width
+        const brCardH = pileSize.width;  // rotated: width becomes visual height
+        const overlapY = Math.min(14, (pileSize.height - 10) / Math.max(brCount, 1));
+        const maxShow = Math.min(brCount, 10);
+
+        // Center the rotated cards horizontally in the column
+        const brCenterX = x + w / 2;
+
+        for (let bi = 0; bi < maxShow; bi++) {
+          const brCard = new CardSprite({ defId: '', size: pileSize, faceDown: true });
+          brCard.pivot.set(pileSize.width / 2, pileSize.height / 2);
+          brCard.rotation = Math.PI / 2; // 90° clockwise
+          brCard.x = brCenterX;
+          brCard.y = cardY + brCardH / 2 + bi * overlapY;
+          brCard.alpha = bi === 0 ? 1 : 0.8;
+          this.boardLayer.addChild(brCard);
+        }
+
+        // Count badge
+        const badgeSize = 22;
+        const badgeX = brCenterX + brCardW / 2 - badgeSize / 2 + 2;
+        const badgeY = cardY - 2;
+        const badge = new Graphics();
+        badge.circle(badgeX, badgeY, badgeSize / 2);
+        badge.fill({ color: brCount >= 7 ? COLORS.injuredDot : COLORS.accentGold, alpha: 0.9 });
+        this.boardLayer.addChild(badge);
+
+        const badgeTxt = new Text({
+          text: `${brCount}`,
+          style: new TextStyle({
+            fontSize: 13,
+            fill: 0xffffff,
+            fontFamily: FONT,
+            fontWeight: 'bold',
+          }),
+        });
+        badgeTxt.anchor.set(0.5, 0.5);
+        badgeTxt.x = badgeX;
+        badgeTxt.y = badgeY;
+        this.boardLayer.addChild(badgeTxt);
+
+        // "/ 10" label under the badge
+        const goalTxt = new Text({
+          text: `/ 10`,
+          style: new TextStyle({
+            fontSize: 10,
+            fill: COLORS.textMuted,
+            fontFamily: FONT,
+            fontWeight: 'bold',
+          }),
+        });
+        goalTxt.anchor.set(0.5, 0);
+        goalTxt.x = badgeX;
+        goalTxt.y = badgeY + badgeSize / 2 + 2;
+        this.boardLayer.addChild(goalTxt);
+
+        return;
+      }
+
+      // Discard: show top card + right-click opens pile viewer
+      if (pile.zone === 'discard' && pile.instanceId) {
+        const inst = state.cards[pile.instanceId];
+        if (inst) {
+          let def: CardDef | undefined;
+          let stats: { lead: number; support: number } | undefined;
+          try {
+            def = getCardDefForInstance(state, pile.instanceId);
+            if (def.cardType === 'character') stats = getEffectiveStats(state, pile.instanceId);
+          } catch { /* skip */ }
+          const card = new CardSprite({ defId: inst.defId, size: pileSize, cardDef: def, instance: inst, effectiveStats: stats, showName: pileSize.width >= 56 });
+          card.x = centerX;
+          card.y = cardY;
+
+          // Right-click opens full discard pile viewer
+          card.eventMode = 'static';
+          card.cursor = 'pointer';
+          card.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+            if (e.button === 2) {
+              e.preventDefault?.();
+              this.showPileViewer('DISCARD', pile.allIds!);
+            }
+          });
+
+          this.boardLayer.addChild(card);
+          return;
+        }
+      }
+
+      // Field card + other face-up single cards
       if (pile.instanceId && !pile.faceDown) {
         const inst = state.cards[pile.instanceId];
         if (inst) {
@@ -375,6 +859,18 @@ export class GameRenderer {
           const card = new CardSprite({ defId: inst.defId, size: pileSize, cardDef: def, instance: inst, effectiveStats: stats, showName: pileSize.width >= 56 });
           card.x = centerX;
           card.y = cardY;
+
+          if (def) {
+            card.eventMode = 'static';
+            card.cursor = 'pointer';
+            card.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+              if (e.button === 2) {
+                e.preventDefault?.();
+                this.showCardPreview(inst.defId, inst, stats);
+              }
+            });
+          }
+
           this.boardLayer.addChild(card);
           return;
         }
@@ -407,13 +903,29 @@ export class GameRenderer {
   private renderKingdom(state: GameState, player: PlayerId, x: number, y: number, w: number, h: number, cardSize: CardSize): void {
     const pState = state.players[player];
     const teams = Object.values(state.teams).filter((t) => t.owner === player);
-    const teamedIds = new Set(teams.flatMap((t) => t.characterIds));
-    const soloChars = pState.kingdom.filter((id) => !teamedIds.has(id));
+    const teamedIds = new Set(teams.flatMap((t) => t.characterIds.filter((cid) => {
+      const inst = state.cards[cid];
+      return inst && (inst.zone === 'kingdom' || inst.zone === 'battlefield');
+    })));
+    const soloChars = pState.kingdom.filter((id) => {
+      if (teamedIds.has(id)) return false;
+      try {
+        const def = getCardDefForInstance(state, id);
+        if (def.cardType === 'strategy') return false;
+      } catch { /* skip */ }
+      return true;
+    });
+    const permStrategies = pState.kingdom.filter((id) => {
+      try {
+        const def = getCardDefForInstance(state, id);
+        return def.cardType === 'strategy';
+      } catch { return false; }
+    });
 
-    if (teams.length === 0 && soloChars.length === 0) {
+    if (teams.length === 0 && soloChars.length === 0 && permStrategies.length === 0) {
       const txt = new Text({
         text: 'KINGDOM',
-        style: new TextStyle({ fontSize: 11, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', letterSpacing: 2 }),
+        style: new TextStyle({ fontSize: 14, fill: COLORS.textMuted, fontFamily: FONT, letterSpacing: 2 }),
       });
       txt.anchor.set(0.5, 0.5);
       txt.x = x + w / 2;
@@ -423,12 +935,19 @@ export class GameRenderer {
       return;
     }
 
-    type Group = { label: string; charIds: string[]; power: number };
+    type Group = { label: string; charIds: string[]; power: number; isTeam: boolean; teamId?: string };
     const groups: Group[] = [];
 
     for (const team of teams) {
+      // Filter to only characters still in kingdom (discard/expel removes from play)
+      const aliveChars = team.characterIds.filter((cid) => {
+        const inst = state.cards[cid];
+        return inst && (inst.zone === 'kingdom' || inst.zone === 'battlefield');
+      });
+      if (aliveChars.length === 0) continue; // Skip empty teams
+
       let power = 0;
-      for (const cid of team.characterIds) {
+      for (const cid of aliveChars) {
         try {
           const stats = getEffectiveStats(state, cid);
           const inst = state.cards[cid];
@@ -436,52 +955,98 @@ export class GameRenderer {
           else power += stats.support;
         } catch { /* skip */ }
       }
-      groups.push({ label: `${power}`, charIds: team.characterIds, power });
+      groups.push({ label: `${power}`, charIds: aliveChars, power, isTeam: true, teamId: team.id });
     }
 
-    if (soloChars.length > 0) groups.push({ label: '', charIds: soloChars, power: 0 });
+    if (soloChars.length > 0) groups.push({ label: '', charIds: soloChars, power: 0, isTeam: false });
 
     const groupGap = 24;
-    const cardGap = 4;
+
+    // Calculate pyramid-based widths for teams
+    let actualSize = cardSize;
+    const getGroupW = (g: Group, sz: CardSize) => {
+      if (g.isTeam) {
+        // Pyramid width: enough for 2 cards side-by-side below leader
+        return g.charIds.length <= 1 ? sz.width : sz.width * 2.3;
+      }
+      // Solo chars: horizontal row
+      return g.charIds.length * sz.width + (g.charIds.length - 1) * 4;
+    };
 
     let totalW = 0;
-    for (const g of groups) totalW += g.charIds.length * cardSize.width + (g.charIds.length - 1) * cardGap;
+    for (const g of groups) totalW += getGroupW(g, cardSize);
     totalW += (groups.length - 1) * groupGap;
 
-    let actualSize = cardSize;
     if (totalW > w - 20) {
       const scale = (w - 20) / totalW;
       actualSize = { width: Math.floor(cardSize.width * scale), height: Math.floor(cardSize.height * scale) };
       totalW = 0;
-      for (const g of groups) totalW += g.charIds.length * actualSize.width + (g.charIds.length - 1) * cardGap;
+      for (const g of groups) totalW += getGroupW(g, actualSize);
       totalW += (groups.length - 1) * groupGap;
     }
 
     let curX = x + (w - totalW) / 2;
-    const cardY = y + (h - actualSize.height) / 2;
+    // Pyramid layout needs more vertical space; compress if kingdom area is too short
+    // Use 0.65 * height offset so only ~35% of the support card is hidden
+    const idealPyramidH = actualSize.height * 1.65;
+    const pyramidH = Math.min(idealPyramidH, h);
+    const supportVOffset = Math.max(0, pyramidH - actualSize.height);
+    const baseCardY = y + (h - pyramidH) / 2;
 
     for (const group of groups) {
-      const groupW = group.charIds.length * actualSize.width + (group.charIds.length - 1) * cardGap;
+      const groupW = getGroupW(group, actualSize);
+      const groupCenterX = curX + groupW / 2;
 
       if (group.label) {
         const panelPad = 6;
+        const uiSt = this.currentUIState;
+        const isSelectingAttackers = uiSt?.selectionMode.type === 'select-attackers'
+          && player === uiSt.humanPlayer && group.teamId;
+        const isTeamSelected = isSelectingAttackers && uiSt!.selectedTeamIds.includes(group.teamId!);
+        const maxAttackers = 3;
+        const atLimit = isSelectingAttackers && uiSt!.selectedTeamIds.length >= maxAttackers && !isTeamSelected;
+
         const panelBg = new Graphics();
-        panelBg.roundRect(curX - panelPad, cardY - 18, groupW + panelPad * 2, actualSize.height + 24, 6);
-        panelBg.fill({ color: 0x111827, alpha: 0.6 });
-        panelBg.stroke({ color: COLORS.panelBorder, width: 1, alpha: 0.4 });
+        panelBg.roundRect(curX - panelPad, baseCardY - 6, groupW + panelPad * 2, pyramidH + 14, 6);
+        panelBg.fill({ color: isTeamSelected ? 0x1e1020 : 0x111827, alpha: 0.6 });
+        panelBg.stroke({
+          color: isTeamSelected ? COLORS.buttonDanger : COLORS.panelBorder,
+          width: isTeamSelected ? 2 : 1,
+          alpha: isTeamSelected ? 1 : 0.4,
+        });
+
+        // Make team panels clickable for attacker selection
+        if (isSelectingAttackers && this.dispatch && !atLimit) {
+          panelBg.eventMode = 'static';
+          panelBg.cursor = 'pointer';
+          const tId = group.teamId!;
+          panelBg.on('pointerdown', () => {
+            this.dispatch!({ type: 'TOGGLE_TEAM_SELECTION', teamId: tId });
+          });
+        }
         this.boardLayer.addChild(panelBg);
 
         const pwrTxt = new Text({
           text: `PWR ${group.power}`,
-          style: new TextStyle({ fontSize: 9, fill: COLORS.textGold, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+          style: new TextStyle({ fontSize: 10, fill: isTeamSelected ? COLORS.buttonDanger : COLORS.textGold, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
         });
         pwrTxt.anchor.set(0.5, 1);
-        pwrTxt.x = curX + groupW / 2;
-        pwrTxt.y = cardY - 4;
+        pwrTxt.x = groupCenterX;
+        pwrTxt.y = baseCardY - 1;
         this.boardLayer.addChild(pwrTxt);
       }
 
-      for (let i = 0; i < group.charIds.length; i++) {
+      // Render supports first (behind), then leader last (on top) for teams
+      const renderOrder = group.isTeam && group.charIds.length > 1
+        ? [...group.charIds.keys()].sort((a, b) => {
+            // Leader (index 0) goes last so it draws on top
+            if (a === 0) return 1;
+            if (b === 0) return -1;
+            return a - b;
+          })
+        : [...group.charIds.keys()];
+
+      for (const i of renderOrder) {
         const cid = group.charIds[i];
         const inst = state.cards[cid];
         if (!inst) continue;
@@ -491,19 +1056,139 @@ export class GameRenderer {
         try { def = getCardDefForInstance(state, cid); stats = getEffectiveStats(state, cid); } catch { /* skip */ }
 
         const isInjured = inst.state === 'injured';
-        const card = new CardSprite({ defId: inst.defId, size: actualSize, cardDef: def, instance: inst, effectiveStats: stats, injured: isInjured });
+        const smType = this.currentUIState?.selectionMode.type;
+        const isTargetMode = !!(this.currentUIState &&
+          (smType === 'ability-target-select' || smType === 'activate-target-select'));
+        const isUserSelectMode = !!(this.currentUIState && smType === 'ability-user-select');
+        const isKingdomSelected = this.currentUIState?.selectedCardIds.includes(cid) ?? false;
+        const isKingdomHighlighted = (isTargetMode || isUserSelectMode) && (inst.zone === 'battlefield' || inst.zone === 'kingdom');
+        const card = new CardSprite({ defId: inst.defId, size: actualSize, cardDef: def, instance: inst, effectiveStats: stats, injured: isInjured, highlighted: isKingdomHighlighted, selected: isKingdomSelected, interactive: isKingdomHighlighted });
 
-        if (isInjured) {
-          card.x = curX + i * (actualSize.width + cardGap) + actualSize.width / 2;
-          card.y = cardY + actualSize.height / 2;
+        if (group.isTeam) {
+          // Pyramid positioning
+          let cardX: number, cardY: number;
+          if (i === 0) {
+            // Leader: top center
+            cardX = groupCenterX - actualSize.width / 2;
+            cardY = baseCardY;
+          } else if (group.charIds.length === 2) {
+            // 2-card team: support centered below
+            cardX = groupCenterX - actualSize.width / 2;
+            cardY = baseCardY + supportVOffset;
+          } else {
+            // 3-card team: supports fanned left/right below
+            const offset = i === 1 ? -actualSize.width * 0.6 : actualSize.width * 0.6;
+            cardX = groupCenterX + offset - actualSize.width / 2;
+            cardY = baseCardY + supportVOffset;
+          }
+
+          if (isInjured) {
+            card.x = cardX + actualSize.width / 2;
+            card.y = cardY + actualSize.height / 2;
+          } else {
+            card.x = cardX;
+            card.y = cardY;
+          }
         } else {
-          card.x = curX + i * (actualSize.width + cardGap);
-          card.y = cardY;
+          // Solo chars: horizontal row
+          if (isInjured) {
+            card.x = curX + i * (actualSize.width + 4) + actualSize.width / 2;
+            card.y = baseCardY + actualSize.height / 2;
+          } else {
+            card.x = curX + i * (actualSize.width + 4);
+            card.y = baseCardY;
+          }
         }
+
+        // Right-click preview + left-click for ability/activate selection
+        // During attacker selection, let clicks pass through to team panels
+        const isInAttackerSelect = this.currentUIState?.selectionMode.type === 'select-attackers';
+        if (def && !isInAttackerSelect) {
+          card.eventMode = 'static';
+          card.cursor = 'pointer';
+          card.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+            if (e.button === 2) {
+              e.preventDefault?.();
+              this.showCardPreview(inst.defId, inst, stats);
+              return;
+            }
+            // Left-click: handle kingdom card selection for ability/activate flows
+            if (this.dispatch && this.currentUIState) {
+              this.handleKingdomCardClick(state, this.currentUIState, cid, def!, this.dispatch);
+            }
+          });
+        } else if (isInAttackerSelect) {
+          card.eventMode = 'none';
+        }
+
         this.boardLayer.addChild(card);
+
+        // Track card screen position for zone-change animations
+        this.cardPositions.set(cid, { x: card.x, y: card.y, w: actualSize.width, h: actualSize.height, zone: 'kingdom' });
       }
 
       curX += groupW + groupGap;
+    }
+
+    // Render permanent strategy cards on right edge of kingdom
+    if (permStrategies.length > 0) {
+      const permSize = CARD_SIZES.sm;
+      const permGap = 6;
+      const permX = x + w - permSize.width - 8;
+      let permY = y + 4;
+
+      for (const pid of permStrategies) {
+        const inst = state.cards[pid];
+        if (!inst) continue;
+
+        let def: CardDef | undefined;
+        try { def = getCardDefForInstance(state, pid); } catch { /* skip */ }
+
+        const card = new CardSprite({ defId: inst.defId, size: permSize, cardDef: def, instance: inst, interactive: false });
+
+        card.x = permX;
+        card.y = permY;
+
+        // Right-click preview only (not selectable for attack/block)
+        if (def) {
+          card.eventMode = 'static';
+          card.cursor = 'pointer';
+          card.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+            if (e.button === 2) {
+              e.preventDefault?.();
+              this.showCardPreview(inst.defId, inst);
+            }
+          });
+        }
+
+        this.boardLayer.addChild(card);
+
+        // Permanent counter badge
+        const permCount = inst.counters.filter((c) => c.type === 'permanent').length;
+        if (permCount > 0) {
+          const badgeW = 28;
+          const badgeH = 16;
+          const badgeBg = new Graphics();
+          badgeBg.roundRect(permX + permSize.width - badgeW + 4, permY - 4, badgeW, badgeH, 4);
+          badgeBg.fill({ color: 0x2a1f00, alpha: 0.9 });
+          badgeBg.stroke({ color: COLORS.textGold, width: 1, alpha: 0.8 });
+          this.boardLayer.addChild(badgeBg);
+
+          const badgeTxt = new Text({
+            text: `P${permCount}`,
+            style: new TextStyle({ fontSize: 10, fill: COLORS.textGold, fontFamily: FONT, fontWeight: 'bold' }),
+          });
+          badgeTxt.anchor.set(0.5, 0.5);
+          badgeTxt.x = permX + permSize.width - badgeW / 2 + 4;
+          badgeTxt.y = permY - 4 + badgeH / 2;
+          this.boardLayer.addChild(badgeTxt);
+        }
+
+        // Track position for animations
+        this.cardPositions.set(pid, { x: card.x, y: card.y, w: permSize.width, h: permSize.height, zone: 'kingdom' });
+
+        permY += permSize.height + permGap;
+      }
     }
   }
 
@@ -518,7 +1203,7 @@ export class GameRenderer {
     if (pState.hand.length === 0) {
       const txt = new Text({
         text: `${playerLabel} HAND — EMPTY`,
-        style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', letterSpacing: 1 }),
+        style: new TextStyle({ fontSize: 14, fill: COLORS.textMuted, fontFamily: FONT, letterSpacing: 1 }),
       });
       txt.anchor.set(0.5, 0.5);
       txt.x = x + w / 2;
@@ -539,12 +1224,20 @@ export class GameRenderer {
         'hand-cost': `Select ${(ui.selectionMode as { needed: number }).needed} card(s) to pay hand cost`,
         'charge-essence': 'Select cards to charge as essence',
         'discard-to-hand-limit': `Discard ${(ui.selectionMode as { count: number }).count} card(s)`,
+        'ability-select': 'Select an ability card from hand',
+        'ability-user-select': 'Select a character on battlefield to use the ability',
+        'ability-target-select': `Select ${(ui.selectionMode as { needed: number }).needed} target(s)`,
+        'ability-essence-cost': `Select ${(ui.selectionMode as { needed: number }).needed} essence card(s) to pay cost`,
+        'activate-effect-select': 'Select a character with an activate effect',
+        'activate-pick-effect': 'Select which effect to activate',
+        'activate-target-select': `Select ${(ui.selectionMode as { needed: number }).needed} target(s)`,
+        'activate-cost-select': (ui.selectionMode as { costDescription?: string }).costDescription || `Select ${(ui.selectionMode as { needed: number }).needed} card(s) to pay cost`,
       };
       const hint = hints[ui.selectionMode.type];
       if (hint) {
         const hintTxt = new Text({
           text: hint,
-          style: new TextStyle({ fontSize: 10, fill: COLORS.accentCyan, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+          style: new TextStyle({ fontSize: 14, fill: COLORS.accentCyan, fontFamily: FONT, fontWeight: 'bold' }),
         });
         hintTxt.anchor.set(0.5, 0);
         hintTxt.x = x + w / 2;
@@ -555,7 +1248,7 @@ export class GameRenderer {
 
     const lbl = new Text({
       text: `${playerLabel} HAND (${pState.hand.length})`,
-      style: new TextStyle({ fontSize: 9, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 1 }),
+      style: new TextStyle({ fontSize: 13, fill: COLORS.textMuted, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
     });
     lbl.x = x + 12;
     lbl.y = isTop ? y + h - 10 : y + 2;
@@ -583,6 +1276,12 @@ export class GameRenderer {
       const isHighlighted = isHumanHand && this.isCardHighlighted(state, ui, instanceId, def);
       const isInteractive = isHumanHand && !state.gameOver;
 
+      // Type-based highlight color
+      const highlightColor = def?.cardType === 'character' ? 0x3b82f6  // blue
+        : def?.cardType === 'strategy' ? 0x10b981  // green
+        : def?.cardType === 'ability' ? 0xf59e0b   // amber
+        : 0x6b7280; // gray (charge fallback)
+
       const card = new CardSprite({
         defId: inst.defId,
         size: cardSize,
@@ -592,7 +1291,9 @@ export class GameRenderer {
         effectiveStats: stats,
         selected: isSelected,
         highlighted: isHighlighted,
+        highlightColor: isHighlighted ? highlightColor : undefined,
         interactive: isInteractive,
+        showName: !isFaceDown,
       });
       card.x = positions[i]?.x ?? 0;
       card.y = positions[i]?.y ?? 0;
@@ -603,10 +1304,30 @@ export class GameRenderer {
       // Click handler
       if (isInteractive && this.dispatch) {
         const d = this.dispatch;
-        card.on('pointerdown', () => this.handleHandCardClick(state, ui, instanceId, def, d));
+        card.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+          // Right-click → preview
+          if (e.button === 2) {
+            e.preventDefault?.();
+            this.showCardPreview(inst.defId, inst, stats);
+            return;
+          }
+          this.handleHandCardClick(state, ui, instanceId, def, d);
+        });
+      } else if (!isFaceDown && def) {
+        // Even non-interactive cards support right-click preview
+        card.eventMode = 'static';
+        card.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+          if (e.button === 2) {
+            e.preventDefault?.();
+            this.showCardPreview(inst.defId, inst, stats);
+          }
+        });
       }
 
       this.boardLayer.addChild(card);
+
+      // Track hand card positions for zone-change animations
+      this.cardPositions.set(instanceId, { x: card.x, y: card.y, w: cardSize.width, h: cardSize.height, zone: 'hand' });
     }
   }
 
@@ -684,15 +1405,112 @@ export class GameRenderer {
         break;
       }
 
+      case 'ability-select': {
+        // Pick an ability card from hand
+        if (def?.cardType === 'ability') {
+          dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'ability-user-select', abilityCardId: instanceId } });
+        }
+        break;
+      }
+
+      case 'ability-essence-cost': {
+        // Toggle essence cost selection from essence zone (handled in kingdom click)
+        // But also allow selecting essence cards if they happen to be in hand (unlikely)
+        break;
+      }
+
+      case 'activate-cost-select': {
+        // Only handle if cost source is 'hand'
+        if (sm.costSource !== 'hand') break;
+        if (!this.isValidActivateHandCost(state, instanceId, sm.effectId)) return;
+
+        dispatch({ type: 'TOGGLE_CARD_SELECTION', cardId: instanceId });
+
+        const newSelected = ui.selectedCardIds.includes(instanceId)
+          ? ui.selectedCardIds.filter((id) => id !== instanceId)
+          : [...ui.selectedCardIds, instanceId];
+
+        if (newSelected.length >= sm.needed) {
+          dispatch({
+            type: 'PERFORM_ACTION',
+            player: hp,
+            action: {
+              type: 'activate-effect',
+              cardInstanceId: sm.cardId,
+              effectId: sm.effectId,
+              targetIds: sm.targetIds,
+              costCardIds: newSelected,
+            },
+          });
+        }
+        break;
+      }
+
       case 'none': {
-        // Direct summon during main phase
-        if (def?.cardType === 'character' && canSummonCard(state, hp, instanceId)) {
-          const charDef = def as CharacterCardDef;
-          if (charDef.handCost > 0) {
-            dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'hand-cost', forCardId: instanceId, needed: charDef.handCost } });
-          } else {
-            dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'summon', cardInstanceId: instanceId } });
+        const isMainPhase = state.phase === 'main' && state.currentTurn === hp;
+        const isEOAPhase = state.phase === 'battle-eoa';
+        const isActing = getActingPlayer(state) === hp;
+
+        // Direct ability — ability cards (only during battle-eoa)
+        if (def?.cardType === 'ability' && isEOAPhase && isActing) {
+          const abilityDef = def as AbilityCardDef;
+
+          // Check that at least one battlefield character meets the ability requirements
+          const playerCards = Object.values(state.cards).filter(
+            (c) => c.owner === hp && c.zone === 'battlefield'
+          );
+          const hasValidUser = playerCards.some((c) => {
+            try {
+              const cDef = getCardDefForInstance(state, c.instanceId);
+              if (cDef.cardType !== 'character') return false;
+              const charDef = cDef as CharacterCardDef;
+              return abilityDef.requirements.every((req) => {
+                if (req.type === 'attribute') return charDef.attributes.includes(req.value);
+                return true;
+              });
+            } catch { return false; }
+          });
+
+          if (!hasValidUser) break; // No valid user on battlefield — can't play this ability
+
+          dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'ability-user-select', abilityCardId: instanceId } });
+          break;
+        }
+
+        if (!isMainPhase) break;
+
+        // Direct summon — character cards
+        if (def?.cardType === 'character') {
+          if (canSummonCard(state, hp, instanceId)) {
+            const charDef = def as CharacterCardDef;
+            if (charDef.handCost > 0) {
+              dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'hand-cost', forCardId: instanceId, needed: charDef.handCost } });
+            } else {
+              dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'summon', cardInstanceId: instanceId } });
+            }
           }
+          // Character cards never fall through to charge — click does nothing if can't summon
+          break;
+        }
+
+        // Direct play — strategy cards
+        if (def?.cardType === 'strategy') {
+          if (canPlayStrategyCard(state, hp, instanceId)) {
+            const stratDef = def as StrategyCardDef;
+            if (stratDef.handCost > 0) {
+              dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'hand-cost', forCardId: instanceId, needed: stratDef.handCost } });
+            } else {
+              dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'play-strategy', cardInstanceId: instanceId } });
+            }
+          }
+          // Strategy cards never fall through to charge — click does nothing if can't play
+          break;
+        }
+
+        // Direct charge — only non-character, non-strategy, non-ability cards
+        // (In practice this means field cards or other types charge on click)
+        if (state.chain.length === 0) {
+          dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'charge-essence', cardInstanceIds: [instanceId] } });
         }
         break;
       }
@@ -719,11 +1537,485 @@ export class GameRenderer {
       case 'charge-essence':
       case 'discard-to-hand-limit':
         return true;
-      case 'none':
-        // Highlight summonable during main phase
-        return state.phase === 'main' && state.currentTurn === hp && def?.cardType === 'character' && canSummonCard(state, hp, instanceId);
+      case 'ability-select':
+        return def?.cardType === 'ability';
+      case 'activate-cost-select': {
+        if (sm.costSource === 'hand') {
+          return this.isValidActivateHandCost(state, instanceId, sm.effectId);
+        }
+        return false;
+      }
+      case 'none': {
+        // Highlight ability cards during battle-eoa (only if valid user + can pay cost)
+        if (state.phase === 'battle-eoa' && getActingPlayer(state) === hp) {
+          if (def?.cardType === 'ability') {
+            const abilityDef = def as AbilityCardDef;
+
+            // Check essence cost is payable (base cost — non-X portion)
+            {
+              const baseCost = abilityDef.essenceCost.specific.reduce((sum, s) => sum + s.count, 0) + abilityDef.essenceCost.neutral + (abilityDef.essenceCost.cardSymbol ?? 0);
+              const essenceCount = state.players[hp].essence.length;
+              if (baseCost > 0 && essenceCount < baseCost) return false;
+
+              // Also check specific symbol requirements
+              if (abilityDef.essenceCost.specific.length > 0 || (abilityDef.essenceCost.cardSymbol ?? 0) > 0) {
+                const symbolCounts: Record<string, number> = {};
+                for (const eid of state.players[hp].essence) {
+                  try {
+                    const eDef = getCardDefForInstance(state, eid);
+                    const sym = eDef.symbols?.[0];
+                    if (sym) symbolCounts[sym] = (symbolCounts[sym] || 0) + 1;
+                  } catch { /* skip */ }
+                }
+                // Check specific symbol costs
+                const canPaySymbols = abilityDef.essenceCost.specific.every(
+                  (c) => (symbolCounts[c.symbol] || 0) >= c.count
+                );
+                if (!canPaySymbols) return false;
+                // Check cardSymbol costs (any of the ability's symbols)
+                if (abilityDef.essenceCost.cardSymbol && abilityDef.essenceCost.cardSymbol > 0) {
+                  // Consume specific costs first
+                  const remaining = { ...symbolCounts };
+                  for (const c of abilityDef.essenceCost.specific) {
+                    remaining[c.symbol] = Math.max(0, (remaining[c.symbol] || 0) - c.count);
+                  }
+                  // Check remaining essence has enough matching card symbols
+                  let cardSymbolMatch = 0;
+                  for (const sym of abilityDef.symbols) {
+                    cardSymbolMatch += remaining[sym] || 0;
+                  }
+                  if (cardSymbolMatch < abilityDef.essenceCost.cardSymbol) return false;
+                }
+              }
+            }
+
+            // Check that at least one battlefield character meets the ability requirements
+            const playerBattleCards = Object.values(state.cards).filter(
+              (c) => c.owner === hp && c.zone === 'battlefield'
+            );
+            return playerBattleCards.some((c) => {
+              try {
+                const cDef = getCardDefForInstance(state, c.instanceId);
+                if (cDef.cardType !== 'character') return false;
+                const charDef = cDef as CharacterCardDef;
+                return abilityDef.requirements.every((req) => {
+                  if (req.type === 'attribute') return charDef.attributes.includes(req.value);
+                  return true;
+                });
+              } catch { return false; }
+            });
+          }
+          return false;
+        }
+        // Highlight playable cards during main phase
+        if (state.phase !== 'main' || state.currentTurn !== hp) return false;
+        if (def?.cardType === 'character') return canSummonCard(state, hp, instanceId);
+        if (def?.cardType === 'strategy') return canPlayStrategyCard(state, hp, instanceId);
+        return false;
+      }
       default:
         return false;
+    }
+  }
+
+  // ============================================================
+  // Activate Cost Info Helper
+  // ============================================================
+
+  private getActivateCostInfo(effectId: string, costDescription: string): { source: 'hand' | 'discard' | 'essence'; needed: number } {
+    switch (effectId) {
+      case 'C0078-E1': // Lucian — Discard 1 Character card with {Weapon} from your hand
+        return { source: 'hand', needed: 1 };
+      case 'C0079-E1': // Solomon — Expel 2 cards from your Discard Pile
+        return { source: 'discard', needed: 2 };
+      default:
+        // Parse needed count from cost description if possible
+        const match = costDescription.match(/(\d+)/);
+        return { source: 'essence', needed: match ? parseInt(match[1], 10) : 1 };
+    }
+  }
+
+  /** Check if a hand card is a valid cost for the current activate-cost-select */
+  private isValidActivateHandCost(state: GameState, instanceId: string, effectId: string): boolean {
+    try {
+      const def = getCardDefForInstance(state, instanceId);
+      switch (effectId) {
+        case 'C0078-E1': // Lucian — must be a Character with {Weapon}
+          return def.cardType === 'character' && characterHasAttribute(state, instanceId, 'Weapon');
+        default:
+          return true;
+      }
+    } catch { return false; }
+  }
+
+  // ============================================================
+  // Kingdom/Battlefield Card Click Logic (for ability/activate flows)
+  // ============================================================
+
+  private handleKingdomCardClick(state: GameState, ui: UIState, instanceId: string, def: CardDef, dispatch: (action: UIAction) => void): void {
+    const hp = ui.humanPlayer;
+    const sm = ui.selectionMode;
+    const inst = state.cards[instanceId];
+    if (!inst) return;
+
+    switch (sm.type) {
+      case 'ability-user-select': {
+        // Click character on battlefield/kingdom to use ability
+        if (inst.owner !== hp) return;
+        if (inst.zone !== 'battlefield' && inst.zone !== 'kingdom') return;
+        if (def.cardType !== 'character') return;
+
+        // Validate user meets ability requirements
+        const abilityInst = state.cards[sm.abilityCardId];
+        if (!abilityInst) return;
+        let abilityDef: AbilityCardDef;
+        try {
+          const rawDef = getCardDefForInstance(state, sm.abilityCardId);
+          if (rawDef.cardType !== 'ability') return;
+          abilityDef = rawDef as AbilityCardDef;
+        } catch { return; }
+
+        // Check requirements
+        const charDef = def as CharacterCardDef;
+        for (const req of abilityDef.requirements) {
+          if (req.type === 'attribute') {
+            if (!charDef.attributes.includes(req.value)) return;
+          }
+        }
+
+        // Check if ability needs targets
+        const needsTargets = !!abilityDef.targetDescription;
+        const numTargets = 1; // Most abilities target 1; extend if needed
+
+        if (needsTargets) {
+          // Go to target selection step first
+          dispatch({
+            type: 'SET_SELECTION_MODE',
+            mode: {
+              type: 'ability-target-select',
+              abilityCardId: sm.abilityCardId,
+              userId: instanceId,
+              needed: numTargets,
+            },
+          });
+        } else {
+          // No targets needed — go to essence cost or submit
+          const totalEssenceCost = abilityDef.essenceCost.specific.reduce((sum, s) => sum + s.count, 0) + abilityDef.essenceCost.neutral + (abilityDef.essenceCost.cardSymbol ?? 0);
+          const hasXCost = !!abilityDef.essenceCost.x;
+
+          if (totalEssenceCost > 0 || hasXCost) {
+            dispatch({
+              type: 'SET_SELECTION_MODE',
+              mode: {
+                type: 'ability-essence-cost',
+                abilityCardId: sm.abilityCardId,
+                userId: instanceId,
+                targetIds: [],
+                needed: totalEssenceCost,
+                isXCost: hasXCost,
+                specificCosts: abilityDef.essenceCost.specific,
+                cardSymbols: abilityDef.essenceCost.cardSymbol ? abilityDef.symbols : undefined,
+              },
+            });
+          } else {
+            dispatch({
+              type: 'PERFORM_ACTION',
+              player: hp,
+              action: {
+                type: 'play-ability',
+                cardInstanceId: sm.abilityCardId,
+                userId: instanceId,
+                essenceCostCardIds: [],
+              },
+            });
+          }
+        }
+        break;
+      }
+
+      case 'ability-target-select': {
+        // Validate target is opposing the user (if ability requires opposing targets)
+        try {
+          const abDef2 = getCardDefForInstance(state, sm.abilityCardId) as AbilityCardDef;
+          if (abDef2.targetDescription && abDef2.targetDescription.toLowerCase().includes('opposing')) {
+            const userTeam = Object.values(state.teams).find((t) => t.characterIds.includes(sm.userId));
+            const targetTeam = Object.values(state.teams).find((t) => t.characterIds.includes(instanceId));
+            // If either team can't be found, reject — opposing requires both to be in battle teams
+            if (!userTeam || !targetTeam) return;
+            const isOpposing = (userTeam.isAttacking && targetTeam.blockingTeamId === userTeam.id) ||
+              (userTeam.isBlocking && userTeam.blockingTeamId === targetTeam.id) ||
+              // Also check the reverse direction (attacker's blockedBy)
+              (userTeam.isAttacking && userTeam.blockedByTeamId === targetTeam.id) ||
+              (targetTeam.isAttacking && targetTeam.blockedByTeamId === userTeam.id);
+            if (!isOpposing) return; // Target is not opposing the user — ignore click
+          }
+        } catch { return; }
+
+        // Select a target for the ability
+        dispatch({ type: 'TOGGLE_CARD_SELECTION', cardId: instanceId });
+        const newSelected = ui.selectedCardIds.includes(instanceId)
+          ? ui.selectedCardIds.filter((id) => id !== instanceId)
+          : [...ui.selectedCardIds, instanceId];
+
+        if (newSelected.length >= sm.needed) {
+          // Calculate essence cost from the ability def
+          let totalCost = 0;
+          let hasXCost = false;
+          let abSpecificCosts: { symbol: string; count: number }[] = [];
+          try {
+            const rawDef = getCardDefForInstance(state, sm.abilityCardId);
+            if (rawDef.cardType === 'ability') {
+              const abDef = rawDef as AbilityCardDef;
+              totalCost = abDef.essenceCost.specific.reduce((sum, s) => sum + s.count, 0) + abDef.essenceCost.neutral + (abDef.essenceCost.cardSymbol ?? 0);
+              hasXCost = !!abDef.essenceCost.x;
+              abSpecificCosts = abDef.essenceCost.specific;
+            }
+          } catch { /* skip */ }
+
+          if (totalCost > 0 || hasXCost) {
+            let abCardSymbols: string[] | undefined;
+            try {
+              const rawDef2 = getCardDefForInstance(state, sm.abilityCardId);
+              if (rawDef2.cardType === 'ability') {
+                const abDef2 = rawDef2 as AbilityCardDef;
+                if (abDef2.essenceCost.cardSymbol) {
+                  abCardSymbols = abDef2.symbols;
+                }
+              }
+            } catch { /* skip */ }
+            dispatch({
+              type: 'SET_SELECTION_MODE',
+              mode: {
+                type: 'ability-essence-cost',
+                abilityCardId: sm.abilityCardId,
+                userId: sm.userId,
+                targetIds: newSelected,
+                needed: totalCost,
+                isXCost: hasXCost,
+                specificCosts: abSpecificCosts,
+                cardSymbols: abCardSymbols,
+              },
+            });
+          } else {
+            dispatch({
+              type: 'PERFORM_ACTION',
+              player: hp,
+              action: {
+                type: 'play-ability',
+                cardInstanceId: sm.abilityCardId,
+                userId: sm.userId,
+                targetIds: newSelected,
+                essenceCostCardIds: [],
+              },
+            });
+          }
+        }
+        break;
+      }
+
+      case 'activate-effect-select': {
+        // Click own character with activate effect
+        if (inst.owner !== hp) return;
+        if (def.cardType !== 'character') return;
+        const charDef = def as CharacterCardDef;
+
+        // Find usable activate effects
+        const usableEffects = charDef.effects.filter((e) => {
+          if (e.type !== 'activate') return false;
+          if (e.oncePerTurn && inst.usedEffects.includes(e.id)) return false;
+          if (e.timing === 'main' && state.phase !== 'main') return false;
+          if (e.timing === 'eoa' && state.phase !== 'battle-eoa') return false;
+          if (inst.state === 'injured' && !e.isValid) return false;
+          return true;
+        });
+
+        if (usableEffects.length === 0) return;
+
+        if (usableEffects.length === 1) {
+          const effect = usableEffects[0];
+          // Determine if cost cards are needed
+          const hasCost = !!effect.costDescription;
+          if (hasCost) {
+            const costInfo = this.getActivateCostInfo(effect.id, effect.costDescription || '');
+            dispatch({
+              type: 'SET_SELECTION_MODE',
+              mode: {
+                type: 'activate-cost-select',
+                cardId: instanceId,
+                effectId: effect.id,
+                targetIds: [],
+                needed: costInfo.needed,
+                costSource: costInfo.source,
+                costDescription: effect.costDescription,
+              },
+            });
+          } else {
+            // No cost, submit directly
+            dispatch({
+              type: 'PERFORM_ACTION',
+              player: hp,
+              action: {
+                type: 'activate-effect',
+                cardInstanceId: instanceId,
+                effectId: effect.id,
+              },
+            });
+          }
+        } else {
+          // Multiple effects — show picker
+          dispatch({
+            type: 'SET_SELECTION_MODE',
+            mode: {
+              type: 'activate-pick-effect',
+              cardId: instanceId,
+              effects: usableEffects.map((e) => ({ id: e.id, desc: e.effectDescription })),
+            },
+          });
+        }
+        break;
+      }
+
+      case 'activate-target-select': {
+        dispatch({ type: 'TOGGLE_CARD_SELECTION', cardId: instanceId });
+        const newSelected = ui.selectedCardIds.includes(instanceId)
+          ? ui.selectedCardIds.filter((id) => id !== instanceId)
+          : [...ui.selectedCardIds, instanceId];
+
+        if (newSelected.length >= sm.needed) {
+          dispatch({
+            type: 'PERFORM_ACTION',
+            player: hp,
+            action: {
+              type: 'activate-effect',
+              cardInstanceId: sm.cardId,
+              effectId: sm.effectId,
+              targetIds: newSelected,
+            },
+          });
+        }
+        break;
+      }
+
+      case 'none': {
+        // Direct activate-effect during main or EOA: click own character with effects
+        if (inst.owner !== hp) return;
+        if (def.cardType !== 'character') return;
+        const isMainPhase = state.phase === 'main' && state.currentTurn === hp;
+        const isEOAPhase = state.phase === 'battle-eoa';
+        const isActing = getActingPlayer(state) === hp;
+        if (!isMainPhase && !(isEOAPhase && isActing)) return;
+
+        const charDef = def as CharacterCardDef;
+        const timing = isEOAPhase ? 'eoa' : 'main';
+        const usableEffects = charDef.effects.filter((e) => {
+          if (e.type !== 'activate') return false;
+          if (e.oncePerTurn && inst.usedEffects.includes(e.id)) return false;
+          if (e.timing !== timing && e.timing !== 'both') return false;
+          if (inst.state === 'injured' && !e.isValid) return false;
+          return true;
+        });
+
+        if (usableEffects.length === 0) return;
+
+        if (usableEffects.length === 1) {
+          const effect = usableEffects[0];
+          const hasCost = !!effect.costDescription;
+          if (hasCost) {
+            const costInfo = this.getActivateCostInfo(effect.id, effect.costDescription || '');
+            dispatch({
+              type: 'SET_SELECTION_MODE',
+              mode: {
+                type: 'activate-cost-select',
+                cardId: instanceId,
+                effectId: effect.id,
+                targetIds: [],
+                needed: costInfo.needed,
+                costSource: costInfo.source,
+                costDescription: effect.costDescription,
+              },
+            });
+          } else {
+            dispatch({
+              type: 'PERFORM_ACTION',
+              player: hp,
+              action: {
+                type: 'activate-effect',
+                cardInstanceId: instanceId,
+                effectId: effect.id,
+              },
+            });
+          }
+        } else {
+          dispatch({
+            type: 'SET_SELECTION_MODE',
+            mode: {
+              type: 'activate-pick-effect',
+              cardId: instanceId,
+              effects: usableEffects.map((e) => ({ id: e.id, desc: e.effectDescription })),
+            },
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  // ============================================================
+  // Essence Card Click Logic (for paying ability costs)
+  // ============================================================
+
+  private handleEssenceCardClick(state: GameState, ui: UIState, instanceId: string, dispatch: (action: UIAction) => void): void {
+    const hp = ui.humanPlayer;
+    const sm = ui.selectionMode;
+
+    if (sm.type === 'ability-essence-cost') {
+      const isDeselecting = ui.selectedCardIds.includes(instanceId);
+      const isXCost = !!sm.isXCost;
+
+      // For non-X costs, prevent selecting more cards than needed
+      if (!isXCost && !isDeselecting && ui.selectedCardIds.length >= sm.needed) {
+        return;
+      }
+
+      dispatch({ type: 'TOGGLE_CARD_SELECTION', cardId: instanceId });
+
+      const newSelected = isDeselecting
+        ? ui.selectedCardIds.filter((id) => id !== instanceId)
+        : [...ui.selectedCardIds, instanceId];
+
+      if (newSelected.length >= sm.needed) {
+        dispatch({
+          type: 'PERFORM_ACTION',
+          player: hp,
+          action: {
+            type: 'play-ability',
+            cardInstanceId: sm.abilityCardId,
+            userId: sm.userId,
+            targetIds: sm.targetIds,
+            essenceCostCardIds: newSelected,
+          },
+        });
+      }
+    } else if (sm.type === 'activate-cost-select') {
+      dispatch({ type: 'TOGGLE_CARD_SELECTION', cardId: instanceId });
+
+      const newSelected = ui.selectedCardIds.includes(instanceId)
+        ? ui.selectedCardIds.filter((id) => id !== instanceId)
+        : [...ui.selectedCardIds, instanceId];
+
+      if (newSelected.length >= sm.needed) {
+        dispatch({
+          type: 'PERFORM_ACTION',
+          player: hp,
+          action: {
+            type: 'activate-effect',
+            cardInstanceId: sm.cardId,
+            effectId: sm.effectId,
+            targetIds: sm.targetIds,
+            costCardIds: newSelected,
+          },
+        });
+      }
     }
   }
 
@@ -740,8 +2032,8 @@ export class GameRenderer {
 
     const sm = ui.selectionMode;
     const d = this.dispatch;
-    const btnY = L.uiBarY - 44;
-    const btnH = 32;
+    const btnY = L.uiBarY - 48;
+    const btnH = 36;
     const btnGap = 8;
     const buttons: { label: string; color: number; onClick: () => void }[] = [];
 
@@ -759,48 +2051,83 @@ export class GameRenderer {
       buttons.push({ label: 'CANCEL', color: 0x374151, onClick: () => d({ type: 'CLEAR_SELECTION' }) });
     } else if (sm.type === 'summon-select' || sm.type === 'strategy-select' || sm.type === 'hand-cost') {
       buttons.push({ label: 'CANCEL', color: 0x374151, onClick: () => d({ type: 'CLEAR_SELECTION' }) });
+    } else if (
+      sm.type === 'ability-select' || sm.type === 'ability-user-select' ||
+      sm.type === 'ability-target-select' || sm.type === 'ability-essence-cost' ||
+      sm.type === 'activate-effect-select' || sm.type === 'activate-pick-effect' ||
+      sm.type === 'activate-target-select' || sm.type === 'activate-cost-select'
+    ) {
+      buttons.push({ label: 'CANCEL', color: 0x374151, onClick: () => d({ type: 'CLEAR_SELECTION' }) });
+    } else if (sm.type === 'select-attackers') {
+      // Attacker selection mode — tap teams to toggle, then confirm
+      const selectedCount = ui.selectedTeamIds.length;
+      buttons.push({
+        label: selectedCount > 0 ? `ATTACK (${selectedCount})` : 'ATTACK',
+        color: selectedCount > 0 ? COLORS.buttonDanger : 0x374151,
+        onClick: () => {
+          if (selectedCount > 0) {
+            d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'select-attackers', teamIds: ui.selectedTeamIds } });
+          }
+        },
+      });
+      buttons.push({
+        label: 'SKIP',
+        color: 0x374151,
+        onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'select-attackers', teamIds: [] } }),
+      });
+    } else if (sm.type === 'discard-to-hand-limit') {
+      const count = sm.count;
+      const selected = ui.selectedCardIds.length;
+      buttons.push({
+        label: `DISCARD (${selected}/${count})`,
+        color: selected >= count ? COLORS.buttonDanger : 0x374151,
+        onClick: () => {
+          if (selected >= count) {
+            d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'discard-to-hand-limit', cardInstanceIds: ui.selectedCardIds } });
+          }
+        },
+      });
     } else if (sm.type === 'none') {
       // Phase-specific buttons
       if (state.phase === 'main' && state.currentTurn === hp) {
-        buttons.push({ label: 'SUMMON', color: COLORS.accentBlue, onClick: () => d({ type: 'SET_SELECTION_MODE', mode: { type: 'summon-select' } }) });
-        buttons.push({ label: 'STRATEGY', color: 0x7c3aed, onClick: () => d({ type: 'SET_SELECTION_MODE', mode: { type: 'strategy-select' } }) });
-        buttons.push({ label: 'CHARGE', color: 0x0891b2, onClick: () => d({ type: 'SET_SELECTION_MODE', mode: { type: 'charge-essence' } }) });
+        // Direct interaction: cards are clicked directly for summon/strategy
+        buttons.push({ label: 'CHARGE', color: COLORS.accentCyan, onClick: () => d({ type: 'SET_SELECTION_MODE', mode: { type: 'charge-essence' } }) });
         buttons.push({ label: 'PASS', color: 0x374151, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'pass-priority' } }) });
       } else if (state.phase === 'organization') {
         buttons.push({ label: 'ORGANIZE', color: COLORS.accentBlue, onClick: () => d({ type: 'SET_SELECTION_MODE', mode: { type: 'team-organize' } }) });
-        buttons.push({ label: 'BATTLE', color: COLORS.buttonPrimary, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'choose-battle-or-end', choice: 'battle' } }) });
+        // First turn of the game — cannot battle
+        if (state.turnNumber > 0) {
+          buttons.push({ label: 'BATTLE', color: COLORS.buttonPrimary, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'choose-battle-or-end', choice: 'battle' } }) });
+        }
         buttons.push({ label: 'END TURN', color: 0x374151, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'choose-battle-or-end', choice: 'end' } }) });
       } else if (state.phase === 'battle-attack') {
-        const myTeams = Object.values(state.teams).filter((t) => t.owner === hp);
-        buttons.push({
-          label: 'ATTACK',
-          color: COLORS.buttonDanger,
-          onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'select-attackers', teamIds: myTeams.slice(0, 3).map((t) => t.id) } }),
-        });
-        buttons.push({
-          label: 'SKIP',
-          color: 0x374151,
-          onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'select-attackers', teamIds: [] } }),
-        });
+        // Auto-enter attacker selection mode — teams are immediately clickable
+        d({ type: 'SET_SELECTION_MODE', mode: { type: 'select-attackers' } });
       } else if (state.phase === 'battle-eoa') {
+        // Direct interaction: ability cards are clicked directly from hand,
+        // activate effects by clicking kingdom characters. Only PASS needed.
         buttons.push({ label: 'PASS PRIORITY', color: 0x374151, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'pass-priority' } }) });
       } else if (state.phase === 'end') {
-        buttons.push({ label: 'PASS', color: 0x374151, onClick: () => d({ type: 'PERFORM_ACTION', player: hp, action: { type: 'pass-priority' } }) });
+        // Auto-enter discard mode if hand > 7
+        if (state.players[hp].hand.length > 7) {
+          const excess = state.players[hp].hand.length - 7;
+          d({ type: 'SET_SELECTION_MODE', mode: { type: 'discard-to-hand-limit', count: excess } });
+        }
       }
     }
 
     if (buttons.length === 0) return;
 
-    const totalW = buttons.length * 90 + (buttons.length - 1) * btnGap;
+    const totalW = buttons.length * 100 + (buttons.length - 1) * btnGap;
     let curX = L.width / 2 - totalW / 2;
 
     for (const btn of buttons) {
-      const container = this.makeButton(btn.label, 90, btnH, btn.color);
+      const container = this.makeButton(btn.label, 100, btnH, btn.color);
       container.x = curX;
       container.y = btnY;
       container.on('pointerdown', btn.onClick);
       this.uiLayer.addChild(container);
-      curX += 90 + btnGap;
+      curX += 100 + btnGap;
     }
   }
 
@@ -811,12 +2138,25 @@ export class GameRenderer {
   private renderCenterBar(state: GameState, ui: UIState): void {
     const L = this.layout;
 
+    // Gradient center bar — darker edges, slightly lighter center
     const barBg = new Graphics();
     barBg.rect(0, L.centerBarY, L.width, L.centerBarH);
     barBg.fill({ color: 0x0c1425 });
     this.boardLayer.addChild(barBg);
 
+    // Center highlight band
+    const centerGlow = new Graphics();
+    const glowW = L.width * 0.4;
+    centerGlow.rect(L.width / 2 - glowW / 2, L.centerBarY, glowW, L.centerBarH);
+    centerGlow.fill({ color: COLORS.accentBlue, alpha: 0.04 });
+    this.boardLayer.addChild(centerGlow);
+
     for (const lineY of [L.centerBarY, L.centerBarY + L.centerBarH]) {
+      // Soft glow band
+      const glowLine = new Graphics();
+      glowLine.rect(0, lineY - 2, L.width, 4);
+      glowLine.fill({ color: COLORS.accentBlue, alpha: 0.03 });
+      this.boardLayer.addChild(glowLine);
       const line = new Graphics();
       line.moveTo(0, lineY);
       line.lineTo(L.width, lineY);
@@ -831,7 +2171,7 @@ export class GameRenderer {
 
     const turnTxt = new Text({
       text: `TURN ${state.turnNumber}`,
-      style: new TextStyle({ fontSize: 11, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 2 }),
+      style: new TextStyle({ fontSize: 14, fill: COLORS.textMuted, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
     });
     turnTxt.anchor.set(0, 0.5);
     turnTxt.x = L.centerColX + 16;
@@ -841,43 +2181,125 @@ export class GameRenderer {
     // Player indicator (left-center)
     const playerTxt = new Text({
       text: playerLabel,
-      style: new TextStyle({ fontSize: 12, fill: COLORS.textBright, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 1 }),
+      style: new TextStyle({ fontSize: 15, fill: COLORS.textBright, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
     });
     playerTxt.anchor.set(0.5, 0.5);
-    playerTxt.x = L.width / 2 - 60;
+    playerTxt.x = L.width / 2 - 80;
     playerTxt.y = L.centerBarY + L.centerBarH / 2;
     this.boardLayer.addChild(playerTxt);
 
     // Phase label (right-center)
     const phaseTxt = new Text({
       text: phaseText.toUpperCase(),
-      style: new TextStyle({ fontSize: 12, fill: COLORS.accentBlue, fontFamily: 'Arial, sans-serif', fontWeight: 'bold', letterSpacing: 2 }),
+      style: new TextStyle({ fontSize: 15, fill: COLORS.accentBlue, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
     });
     phaseTxt.anchor.set(0.5, 0.5);
-    phaseTxt.x = L.width / 2 + 60;
+    phaseTxt.x = L.width / 2 + 80;
     phaseTxt.y = L.centerBarY + L.centerBarH / 2;
     this.boardLayer.addChild(phaseTxt);
 
     if (state.chain.length > 0) {
-      const chainTxt = new Text({
-        text: `CHAIN ×${state.chain.length}`,
-        style: new TextStyle({ fontSize: 10, fill: COLORS.textGold, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
-      });
-      chainTxt.anchor.set(0.5, 0);
-      chainTxt.x = L.width / 2;
-      chainTxt.y = L.centerBarY + L.centerBarH / 2 + 10;
-      this.boardLayer.addChild(chainTxt);
+      // Chain link badges — numbered circles
+      const badgeR = 10;
+      const badgeGap = 6;
+      const totalBadgeW = state.chain.length * (badgeR * 2 + badgeGap) - badgeGap;
+      const badgeStartX = L.width / 2 - totalBadgeW / 2;
+      const badgeY = L.centerBarY - badgeR - 4;
+
+      for (let i = 0; i < state.chain.length; i++) {
+        const cx = badgeStartX + i * (badgeR * 2 + badgeGap) + badgeR;
+        const isLatest = i === state.chain.length - 1;
+
+        // Badge circle
+        const badge = new Graphics();
+        badge.circle(cx, badgeY, badgeR);
+        badge.fill({ color: isLatest ? COLORS.accentGold : 0x1a2535 });
+        badge.stroke({ color: COLORS.accentGold, width: 1, alpha: isLatest ? 1 : 0.4 });
+        this.uiLayer.addChild(badge);
+
+        // Badge number
+        const numTxt = new Text({
+          text: `${i + 1}`,
+          style: new TextStyle({ fontSize: 11, fill: isLatest ? 0x000000 : COLORS.accentGold, fontFamily: FONT, fontWeight: 'bold' }),
+        });
+        numTxt.anchor.set(0.5, 0.5);
+        numTxt.x = cx;
+        numTxt.y = badgeY;
+        this.uiLayer.addChild(numTxt);
+
+        // Card name below badge
+        let cardName = '';
+        try {
+          const entry = state.chain[i];
+          const def = getCardDefForInstance(state, entry.sourceCardInstanceId);
+          cardName = def.name.length > 8 ? def.name.substring(0, 7) + '…' : def.name;
+        } catch { /* skip */ }
+
+        if (cardName) {
+          const nameTxt = new Text({
+            text: cardName,
+            style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: FONT }),
+          });
+          nameTxt.anchor.set(0.5, 0);
+          nameTxt.x = cx;
+          nameTxt.y = badgeY + badgeR + 2;
+          this.uiLayer.addChild(nameTxt);
+        }
+
+        // Pulse animation on latest badge
+        if (isLatest) {
+          gsap.to(badge, {
+            alpha: 0.6,
+            duration: 0.4,
+            repeat: 3,
+            yoyo: true,
+            ease: 'sine.inOut',
+          });
+        }
+      }
     }
 
     if (ui.isAIThinking) {
+      // Animated AI thinking indicator
+      const aiContainer = new Container();
+
+      // Pulsing dot
+      const dot = new Graphics();
+      dot.circle(0, 0, 4);
+      dot.fill({ color: COLORS.accentCyan });
+      aiContainer.addChild(dot);
+
+      // Animated text with ellipsis
       const thinkTxt = new Text({
-        text: '● AI',
-        style: new TextStyle({ fontSize: 10, fill: COLORS.accentCyan, fontFamily: 'Arial, sans-serif', fontStyle: 'italic' }),
+        text: 'AI THINKING',
+        style: STYLES.aiThinking,
       });
-      thinkTxt.anchor.set(1, 0.5);
-      thinkTxt.x = L.width - L.sideColW - 16;
-      thinkTxt.y = L.centerBarY + L.centerBarH / 2;
-      this.boardLayer.addChild(thinkTxt);
+      thinkTxt.anchor.set(0, 0.5);
+      thinkTxt.x = 10;
+      thinkTxt.y = 0;
+      aiContainer.addChild(thinkTxt);
+
+      aiContainer.x = L.width - L.sideColW - 16 - thinkTxt.width - 14;
+      aiContainer.y = L.centerBarY + L.centerBarH / 2;
+      this.boardLayer.addChild(aiContainer);
+
+      // Pulse the dot
+      if (this.aiThinkingTween) this.aiThinkingTween.kill();
+      this.aiThinkingTween = gsap.to(dot, {
+        alpha: 0.2,
+        duration: 0.5,
+        repeat: -1,
+        yoyo: true,
+        ease: 'sine.inOut',
+      });
+      this.aiThinkingContainer = aiContainer;
+    } else {
+      // Clean up AI thinking animation
+      if (this.aiThinkingTween) {
+        this.aiThinkingTween.kill();
+        this.aiThinkingTween = null;
+      }
+      this.aiThinkingContainer = null;
     }
   }
 
@@ -901,30 +2323,80 @@ export class GameRenderer {
 
     const centerY = L.uiBarY + L.uiBarH / 2;
     const phases: Phase[] = ['start', 'main', 'organization', 'battle-attack', 'battle-block', 'battle-eoa', 'battle-showdown', 'end'];
-    const dotR = 3;
-    const dotGap = 16;
-    const dotsW = phases.length * dotGap;
-    const dotsStartX = L.width / 2 - dotsW / 2;
+    const phaseShortLabels: Record<Phase, string> = {
+      'setup': 'SET',
+      'start': 'STR',
+      'main': 'MN',
+      'organization': 'ORG',
+      'battle-attack': 'ATK',
+      'battle-block': 'BLK',
+      'battle-eoa': 'EOA',
+      'battle-showdown': 'SHD',
+      'end': 'END',
+    };
+    const segW = 36;
+    const segH = 18;
+    const segGap = 2;
+    const totalSegW = phases.length * segW + (phases.length - 1) * segGap;
+    const segStartX = L.width / 2 - totalSegW / 2;
+    const activeIdx = phases.indexOf(state.phase);
 
     phases.forEach((phase, i) => {
-      const cx = dotsStartX + i * dotGap;
+      const sx = segStartX + i * (segW + segGap);
       const isActive = phase === state.phase;
-      const dot = new Graphics();
-      dot.circle(cx, centerY, isActive ? dotR + 1 : dotR);
-      dot.fill({ color: isActive ? COLORS.accentBlue : COLORS.textMuted, alpha: isActive ? 1 : 0.3 });
-      this.uiLayer.addChild(dot);
+      const isPast = i < activeIdx;
+
+      const seg = new Graphics();
+      seg.roundRect(sx, centerY - segH / 2, segW, segH, 3);
+
+      if (isActive) {
+        seg.fill({ color: COLORS.accentBlue, alpha: 0.8 });
+      } else if (isPast) {
+        seg.fill({ color: COLORS.accentBlue, alpha: 0.15 });
+      } else {
+        seg.fill({ color: 0x1a2535, alpha: 0.4 });
+      }
+      this.uiLayer.addChild(seg);
+
+      // Active segment glow
       if (isActive) {
         const glow = new Graphics();
-        glow.circle(cx, centerY, dotR + 4);
-        glow.stroke({ color: COLORS.accentBlue, width: 1, alpha: 0.3 });
+        glow.roundRect(sx - 1, centerY - segH / 2 - 1, segW + 2, segH + 2, 4);
+        glow.stroke({ color: COLORS.accentBlue, width: 1, alpha: 0.5 });
         this.uiLayer.addChild(glow);
+
+        // Triangle marker above
+        const tri = new Graphics();
+        tri.moveTo(sx + segW / 2 - 4, centerY - segH / 2 - 4);
+        tri.lineTo(sx + segW / 2 + 4, centerY - segH / 2 - 4);
+        tri.lineTo(sx + segW / 2, centerY - segH / 2 - 1);
+        tri.closePath();
+        tri.fill({ color: COLORS.accentBlue });
+        this.uiLayer.addChild(tri);
       }
+
+      // Label
+      const lbl = new Text({
+        text: phaseShortLabels[phase] ?? phase.substring(0, 3).toUpperCase(),
+        style: new TextStyle({
+          fontSize: 10,
+          fill: isActive ? 0xffffff : (isPast ? COLORS.accentBlue : COLORS.textMuted),
+          fontFamily: FONT,
+          fontWeight: isActive ? 'bold' : 'normal',
+          letterSpacing: 0.5,
+        }),
+      });
+      lbl.anchor.set(0.5, 0.5);
+      lbl.x = sx + segW / 2;
+      lbl.y = centerY;
+      lbl.alpha = isActive ? 1 : (isPast ? 0.6 : 0.4);
+      this.uiLayer.addChild(lbl);
     });
 
     const tmStr = ui.mode === 'aivai'
       ? `P1 TM:${state.players.player1.turnMarker}  P2 TM:${state.players.player2.turnMarker}`
       : `TM:${state.players[ui.humanPlayer].turnMarker}  OPP TM:${state.players[ui.humanPlayer === 'player1' ? 'player2' : 'player1'].turnMarker}`;
-    const tmTxt = new Text({ text: tmStr, style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif' }) });
+    const tmTxt = new Text({ text: tmStr, style: new TextStyle({ fontSize: 13, fill: COLORS.textMuted, fontFamily: FONT }) });
     tmTxt.anchor.set(0, 0.5);
     tmTxt.x = 16;
     tmTxt.y = centerY;
@@ -933,14 +2405,14 @@ export class GameRenderer {
     const brStr = ui.mode === 'aivai'
       ? `P1 BR:${state.players.player1.battleRewards.length}/10  P2 BR:${state.players.player2.battleRewards.length}/10`
       : `BR:${state.players[ui.humanPlayer].battleRewards.length}/10  OPP:${state.players[ui.humanPlayer === 'player1' ? 'player2' : 'player1'].battleRewards.length}/10`;
-    const brTxt = new Text({ text: brStr, style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif' }) });
+    const brTxt = new Text({ text: brStr, style: new TextStyle({ fontSize: 13, fill: COLORS.textMuted, fontFamily: FONT }) });
     brTxt.anchor.set(1, 0.5);
     brTxt.x = L.width - 16;
     brTxt.y = centerY;
     this.uiLayer.addChild(brTxt);
 
     if (ui.lastError) {
-      const errTxt = new Text({ text: ui.lastError, style: new TextStyle({ fontSize: 10, fill: COLORS.buttonDanger, fontFamily: 'Arial, sans-serif' }) });
+      const errTxt = new Text({ text: ui.lastError, style: new TextStyle({ fontSize: 13, fill: COLORS.buttonDanger, fontFamily: FONT }) });
       errTxt.anchor.set(0.5, 0.5);
       errTxt.x = L.width / 2;
       errTxt.y = centerY - 12;
@@ -970,9 +2442,19 @@ export class GameRenderer {
 
   private shouldShowBattle(state: GameState): boolean {
     const phase = state.phase;
-    // Don't show overlay during EOA — player needs hand/essence access for ability cards
-    const isBattlePhase = phase === 'battle-attack' || phase === 'battle-block' || phase === 'battle-showdown';
+    const isBattlePhase = phase === 'battle-attack' || phase === 'battle-block'
+      || phase === 'battle-eoa' || phase === 'battle-showdown';
     if (!isBattlePhase) return false;
+
+    // Hide battle overlay during ability/activate selection so player can interact with kingdom cards
+    const sm = this.currentUIState?.selectionMode.type;
+    if (sm === 'ability-user-select' || sm === 'ability-target-select' ||
+        sm === 'ability-essence-cost' || sm === 'activate-effect-select' ||
+        sm === 'activate-pick-effect' || sm === 'activate-target-select' ||
+        sm === 'activate-cost-select') {
+      return false;
+    }
+
     const attackingTeams = Object.values(state.teams).filter((t) => t.isAttacking);
     return attackingTeams.length > 0;
   }
@@ -983,9 +2465,269 @@ export class GameRenderer {
     this.overlayLayer.addChild(overlay);
   }
 
+  private renderDeckSearchOverlay(state: GameState, ui: UIState): void {
+    if (!this.dispatch || !state.pendingSearch) return;
+    const d = this.dispatch;
+    const hp = ui.humanPlayer;
+    const search = state.pendingSearch;
+
+    const overlay = new DeckSearchOverlay(
+      state,
+      search.owner,
+      search.criteria,
+      search.validCardIds,
+      this.layout,
+      (cardId: string | null) => {
+        d({
+          type: 'PERFORM_ACTION',
+          player: hp,
+          action: { type: 'search-select', cardInstanceId: cardId },
+        });
+      },
+      search.displayCardIds,
+      search.sourceCardName,
+    );
+    this.overlayLayer.addChild(overlay);
+  }
+
+  private renderEssencePickerOverlay(state: GameState, ui: UIState): void {
+    if (!this.dispatch) return;
+    const overlay = new EssencePickerOverlay(state, ui, this.layout, this.dispatch);
+    this.overlayLayer.addChild(overlay);
+  }
+
+  private renderTargetChoiceOverlay(state: GameState, ui: UIState): void {
+    if (!this.dispatch || !state.pendingTargetChoice) return;
+    const d = this.dispatch;
+    const hp = ui.humanPlayer;
+    const choice = state.pendingTargetChoice;
+    const L = this.layout;
+
+    const container = new Container();
+
+    // Backdrop
+    const backdrop = new Graphics();
+    backdrop.rect(0, 0, L.width, L.height);
+    backdrop.fill({ color: 0x000000, alpha: 0.7 });
+    backdrop.eventMode = 'static';
+    container.addChild(backdrop);
+
+    // Title
+    const title = new Text({
+      text: 'CHOOSE TARGET',
+      style: new TextStyle({ fontSize: 20, fill: COLORS.accentGold, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 3 }),
+    });
+    title.anchor.set(0.5, 0);
+    title.x = L.width / 2;
+    title.y = L.height * 0.15;
+    container.addChild(title);
+
+    // Description
+    const desc = new Text({
+      text: choice.description,
+      style: new TextStyle({ fontSize: 14, fill: COLORS.textBright, fontFamily: FONT, wordWrap: true, wordWrapWidth: L.width * 0.6, align: 'center' }),
+    });
+    desc.anchor.set(0.5, 0);
+    desc.x = L.width / 2;
+    desc.y = title.y + title.height + 10;
+    container.addChild(desc);
+
+    // Render valid target cards
+    const cardW = CARD_SIZES.md.width;
+    const cardH = CARD_SIZES.md.height;
+    const gap = 12;
+    const totalW = choice.validTargetIds.length * cardW + (choice.validTargetIds.length - 1) * gap;
+    let curX = L.width / 2 - totalW / 2;
+    const cardY = L.height / 2 - cardH / 2;
+
+    for (const targetId of choice.validTargetIds) {
+      let def: CardDef | undefined;
+      let stats: { lead: number; support: number } | undefined;
+      try {
+        def = getCardDefForInstance(state, targetId);
+        if (def.cardType === 'character') stats = getEffectiveStats(state, targetId);
+      } catch { /* skip */ }
+
+      const card = new CardSprite({
+        defId: state.cards[targetId]?.defId ?? '',
+        size: CARD_SIZES.md,
+        faceDown: false,
+        cardDef: def,
+        instance: state.cards[targetId],
+        effectiveStats: stats,
+        highlighted: true,
+        highlightColor: COLORS.accentGold,
+        interactive: true,
+        showName: true,
+      });
+      card.x = curX;
+      card.y = cardY;
+      card.on('pointerdown', () => {
+        d({
+          type: 'PERFORM_ACTION',
+          player: hp,
+          action: { type: 'resolve-target-choice', cardInstanceId: targetId },
+        });
+      });
+      container.addChild(card);
+      curX += cardW + gap;
+    }
+
+    // SKIP button for "you may" effects
+    if (choice.allowDecline) {
+      const btnW = 100;
+      const btnH = 34;
+      const btnBg = new Graphics();
+      const btnX = L.width / 2 - btnW / 2;
+      const btnY = cardY + cardH + 30;
+      btnBg.roundRect(btnX, btnY, btnW, btnH, 6);
+      btnBg.fill({ color: 0x374151, alpha: 0.9 });
+      btnBg.stroke({ color: COLORS.textMuted, width: 1, alpha: 0.3 });
+      btnBg.eventMode = 'static';
+      btnBg.cursor = 'pointer';
+      btnBg.on('pointerdown', () => {
+        d({
+          type: 'PERFORM_ACTION',
+          player: hp,
+          action: { type: 'resolve-target-choice', cardInstanceId: null },
+        });
+      });
+      container.addChild(btnBg);
+
+      const btnTxt = new Text({
+        text: 'SKIP',
+        style: new TextStyle({ fontSize: 14, fill: COLORS.textMuted, fontFamily: FONT, fontWeight: 'bold' }),
+      });
+      btnTxt.anchor.set(0.5, 0.5);
+      btnTxt.x = btnX + btnW / 2;
+      btnTxt.y = btnY + btnH / 2;
+      container.addChild(btnTxt);
+    }
+
+    this.overlayLayer.addChild(container);
+  }
+
+  private renderOptionalEffectOverlay(state: GameState, ui: UIState): void {
+    if (!this.dispatch || !state.pendingOptionalEffect) return;
+    const d = this.dispatch;
+    const hp = ui.humanPlayer;
+    const pending = state.pendingOptionalEffect;
+    const L = this.layout;
+
+    const container = new Container();
+
+    // Backdrop
+    const backdrop = new Graphics();
+    backdrop.rect(0, 0, L.width, L.height);
+    backdrop.fill({ color: 0x000000, alpha: 0.8 });
+    backdrop.eventMode = 'static';
+    container.addChild(backdrop);
+
+    // Card name title
+    const title = new Text({
+      text: pending.cardName.toUpperCase(),
+      style: new TextStyle({
+        fontSize: 22,
+        fill: COLORS.accentGold,
+        fontFamily: FONT,
+        fontWeight: 'bold',
+        letterSpacing: 3,
+      }),
+    });
+    title.anchor.set(0.5, 0);
+    title.x = L.width / 2;
+    title.y = L.height * 0.3;
+    container.addChild(title);
+
+    // Effect description
+    const desc = new Text({
+      text: pending.effectDescription,
+      style: new TextStyle({
+        fontSize: 16,
+        fill: COLORS.textBright,
+        fontFamily: FONT,
+        wordWrap: true,
+        wordWrapWidth: L.width * 0.6,
+        align: 'center',
+      }),
+    });
+    desc.anchor.set(0.5, 0);
+    desc.x = L.width / 2;
+    desc.y = title.y + title.height + 16;
+    container.addChild(desc);
+
+    // Buttons
+    const btnY = desc.y + desc.height + 30;
+    const btnW = 120;
+    const btnH = 40;
+    const gap = 20;
+
+    // ACTIVATE button (green)
+    const activateBtn = new Graphics();
+    activateBtn.roundRect(L.width / 2 - btnW - gap / 2, btnY, btnW, btnH, 6);
+    activateBtn.fill({ color: 0x22c55e, alpha: 0.9 });
+    activateBtn.eventMode = 'static';
+    activateBtn.cursor = 'pointer';
+    activateBtn.on('pointerdown', () => {
+      d({
+        type: 'PERFORM_ACTION',
+        player: hp,
+        action: { type: 'choose-optional-trigger', effectId: pending.effectId, activate: true },
+      });
+    });
+    container.addChild(activateBtn);
+
+    const activateText = new Text({
+      text: 'ACTIVATE',
+      style: new TextStyle({
+        fontSize: 14,
+        fill: 0xffffff,
+        fontFamily: FONT,
+        fontWeight: 'bold',
+        letterSpacing: 1,
+      }),
+    });
+    activateText.anchor.set(0.5, 0.5);
+    activateText.x = L.width / 2 - btnW / 2 - gap / 2;
+    activateText.y = btnY + btnH / 2;
+    container.addChild(activateText);
+
+    // DECLINE button (gray)
+    const declineBtn = new Graphics();
+    declineBtn.roundRect(L.width / 2 + gap / 2, btnY, btnW, btnH, 6);
+    declineBtn.fill({ color: 0x4b5563, alpha: 0.9 });
+    declineBtn.eventMode = 'static';
+    declineBtn.cursor = 'pointer';
+    declineBtn.on('pointerdown', () => {
+      d({
+        type: 'PERFORM_ACTION',
+        player: hp,
+        action: { type: 'choose-optional-trigger', effectId: pending.effectId, activate: false },
+      });
+    });
+    container.addChild(declineBtn);
+
+    const declineText = new Text({
+      text: 'DECLINE',
+      style: new TextStyle({
+        fontSize: 14,
+        fill: 0xffffff,
+        fontFamily: FONT,
+        fontWeight: 'bold',
+        letterSpacing: 1,
+      }),
+    });
+    declineText.anchor.set(0.5, 0.5);
+    declineText.x = L.width / 2 + gap / 2 + btnW / 2;
+    declineText.y = btnY + btnH / 2;
+    container.addChild(declineText);
+
+    this.overlayLayer.addChild(container);
+  }
+
   private checkCoinFlip(state: GameState, ui: UIState): void {
     if (this.coinFlipShown) return;
-    if (state.turnNumber === 1 && state.phase !== 'setup' && ui.gameStarted) {
+    if (state.turnNumber === 0 && state.phase !== 'setup' && ui.gameStarted) {
       this.coinFlipShown = true;
       const overlay = new CoinFlipOverlay(state, ui.mode, ui.humanPlayer, this.layout);
       this.effectsLayer.addChild(overlay);
@@ -998,62 +2740,138 @@ export class GameRenderer {
 
   private renderGameOver(state: GameState, ui: UIState): void {
     const L = this.layout;
+    const isWin = ui.mode === 'aivai' || state.winner === ui.humanPlayer;
+    const accentColor = isWin ? COLORS.accentGold : COLORS.buttonDanger;
 
     const backdrop = new Graphics();
     backdrop.rect(0, 0, L.width, L.height);
-    backdrop.fill({ color: 0x000000, alpha: 0.75 });
+    backdrop.fill({ color: 0x000000, alpha: 0.85 });
     backdrop.eventMode = 'static';
     this.overlayLayer.addChild(backdrop);
 
+    // Content container for animation
+    const content = new Container();
+    content.x = L.width / 2;
+    content.y = L.height / 2;
+
+    // Decorative lines
     const glowLine = new Graphics();
-    glowLine.moveTo(L.width * 0.2, L.height / 2 - 50);
-    glowLine.lineTo(L.width * 0.8, L.height / 2 - 50);
-    glowLine.stroke({ color: COLORS.accentGold, width: 2, alpha: 0.5 });
-    this.overlayLayer.addChild(glowLine);
+    glowLine.moveTo(-L.width * 0.3, -60);
+    glowLine.lineTo(L.width * 0.3, -60);
+    glowLine.stroke({ color: accentColor, width: 2, alpha: 0.5 });
+    content.addChild(glowLine);
+
+    const glowLine2 = new Graphics();
+    glowLine2.moveTo(-L.width * 0.3, 80);
+    glowLine2.lineTo(L.width * 0.3, 80);
+    glowLine2.stroke({ color: accentColor, width: 2, alpha: 0.5 });
+    content.addChild(glowLine2);
 
     const winnerLabel = ui.mode === 'aivai'
-      ? (state.winner === 'player1' ? 'PLAYER 1' : 'PLAYER 2')
-      : (state.winner === ui.humanPlayer ? 'YOU WIN' : 'DEFEAT');
+      ? (state.winner === 'player1' ? 'PLAYER 1 WINS' : 'PLAYER 2 WINS')
+      : (state.winner === ui.humanPlayer ? 'VICTORY' : 'DEFEAT');
 
     const title = new Text({
       text: winnerLabel,
-      style: new TextStyle({
-        fontSize: 36,
-        fill: state.winner === ui.humanPlayer || ui.mode === 'aivai' ? COLORS.accentGold : COLORS.buttonDanger,
-        fontFamily: 'Arial, sans-serif',
-        fontWeight: 'bold',
-        letterSpacing: 4,
-      }),
+      style: STYLES.gameOverTitle(isWin),
     });
     title.anchor.set(0.5, 0.5);
-    title.x = L.width / 2;
-    title.y = L.height / 2 - 20;
-    this.overlayLayer.addChild(title);
+    title.y = -20;
+    content.addChild(title);
 
     const reasonMap: Record<string, string> = { 'battle-rewards': 'Battle Rewards (10+)', 'deck-out': 'Deck Out', 'concede': 'Concession' };
     const reason = new Text({
       text: reasonMap[state.winReason ?? ''] ?? '',
-      style: new TextStyle({ fontSize: 14, fill: COLORS.text, fontFamily: 'Arial, sans-serif' }),
+      style: STYLES.gameOverReason,
     });
     reason.anchor.set(0.5, 0.5);
-    reason.x = L.width / 2;
-    reason.y = L.height / 2 + 20;
-    this.overlayLayer.addChild(reason);
+    reason.y = 20;
+    content.addChild(reason);
 
+    // Extended stats
+    const p1BR = state.players.player1.battleRewards.length;
+    const p2BR = state.players.player2.battleRewards.length;
+    const p1Deck = state.players.player1.deck.length;
+    const p2Deck = state.players.player2.deck.length;
+    const statsStr = `Turn ${state.turnNumber}  ·  P1 BR: ${p1BR}/10  ·  P2 BR: ${p2BR}/10  ·  P1 Deck: ${p1Deck}  ·  P2 Deck: ${p2Deck}`;
     const statsTxt = new Text({
-      text: `Turn ${state.turnNumber}  ·  P1 BR: ${state.players.player1.battleRewards.length}  ·  P2 BR: ${state.players.player2.battleRewards.length}`,
-      style: new TextStyle({ fontSize: 11, fill: COLORS.textMuted, fontFamily: 'Arial, sans-serif' }),
+      text: statsStr,
+      style: STYLES.gameOverStats,
     });
     statsTxt.anchor.set(0.5, 0.5);
-    statsTxt.x = L.width / 2;
-    statsTxt.y = L.height / 2 + 50;
-    this.overlayLayer.addChild(statsTxt);
+    statsTxt.y = 55;
+    content.addChild(statsTxt);
 
-    const glowLine2 = new Graphics();
-    glowLine2.moveTo(L.width * 0.2, L.height / 2 + 70);
-    glowLine2.lineTo(L.width * 0.8, L.height / 2 + 70);
-    glowLine2.stroke({ color: COLORS.accentGold, width: 2, alpha: 0.5 });
-    this.overlayLayer.addChild(glowLine2);
+    // Animate entrance
+    content.alpha = 0;
+    content.scale.set(0.8);
+    this.overlayLayer.addChild(content);
+
+    const tl = gsap.timeline();
+    tl.to(content, { alpha: 1, duration: 0.3, ease: 'power2.out' })
+      .to(content.scale, { x: 1, y: 1, duration: 0.4, ease: 'back.out(1.5)' }, '<');
+
+    // Particle effects
+    if (isWin) {
+      particleBurst(this.effectsLayer, L.width / 2, L.height / 2, COLORS.accentGold, 30);
+      setTimeout(() => particleBurst(this.effectsLayer, L.width / 2 - 80, L.height / 2, COLORS.accentGold, 15), 200);
+      setTimeout(() => particleBurst(this.effectsLayer, L.width / 2 + 80, L.height / 2, COLORS.accentGold, 15), 400);
+    } else {
+      particleBurst(this.effectsLayer, L.width / 2, L.height / 2, COLORS.buttonDanger, 20);
+    }
+  }
+
+  // ============================================================
+  // Card Preview
+  // ============================================================
+
+  private showCardPreview(defId: string, instance?: import('@/game/types').CardInstance, effectiveStats?: { lead: number; support: number }): void {
+    if (!this.currentGameState) return;
+    if (this.previewOverlay) {
+      this.closeCardPreview();
+      return;
+    }
+    let def: CardDef | undefined;
+    try {
+      def = getCardDefForInstance(this.currentGameState, instance?.instanceId ?? defId);
+    } catch {
+      return;
+    }
+
+    this.previewOverlay = new CardPreviewOverlay(def, instance, effectiveStats, this.layout, () => {
+      this.closeCardPreview();
+    });
+    this.overlayLayer.addChild(this.previewOverlay);
+  }
+
+  private closeCardPreview(): void {
+    if (this.previewOverlay) {
+      this.previewOverlay.dispose();
+      this.overlayLayer.removeChild(this.previewOverlay);
+      this.previewOverlay.destroy({ children: true });
+      this.previewOverlay = null;
+    }
+  }
+
+  private showPileViewer(title: string, cardIds: string[]): void {
+    if (!this.currentGameState) return;
+    if (this.pileViewerOverlay) {
+      this.closePileViewer();
+      return;
+    }
+    this.pileViewerOverlay = new PileViewerOverlay(title, cardIds, this.currentGameState, this.layout, () => {
+      this.closePileViewer();
+    });
+    this.overlayLayer.addChild(this.pileViewerOverlay);
+  }
+
+  private closePileViewer(): void {
+    if (this.pileViewerOverlay) {
+      this.pileViewerOverlay.dispose();
+      this.overlayLayer.removeChild(this.pileViewerOverlay);
+      this.pileViewerOverlay.destroy({ children: true });
+      this.pileViewerOverlay = null;
+    }
   }
 
   // ============================================================
@@ -1071,7 +2889,7 @@ export class GameRenderer {
     c.addChild(bg);
     const txt = new Text({
       text: label,
-      style: new TextStyle({ fontSize: 10, fill: COLORS.textBright, fontFamily: 'Arial, sans-serif', fontWeight: 'bold' }),
+      style: new TextStyle({ fontSize: 13, fill: COLORS.textBright, fontFamily: FONT, fontWeight: 'bold' }),
     });
     txt.anchor.set(0.5, 0.5);
     txt.x = w / 2;
@@ -1081,6 +2899,8 @@ export class GameRenderer {
   }
 
   destroy(): void {
-    this.app.destroy(true);
+    if (this.initialized) {
+      this.app.destroy(true);
+    }
   }
 }

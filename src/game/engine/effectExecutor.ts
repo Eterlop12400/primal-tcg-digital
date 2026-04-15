@@ -24,10 +24,14 @@ import {
   getCardsInZone,
   shuffleDeck,
   getEffectiveStats,
+  getTeamForCharacter,
+  teamHasCharacterWithAttribute,
+  isProtectedFromCharacterEffects,
 } from './utils';
+import type { EventCollector } from './EventCollector';
 
 // Master effect executor — routes to specific card logic
-export function executeEffect(state: GameState, entry: ChainEntry): void {
+export function executeEffect(state: GameState, entry: ChainEntry, collector?: EventCollector): void {
   const def = getCardDefForInstance(state, entry.sourceCardInstanceId);
   const effectKey = entry.effectId ?? `${def.id}-resolve`;
 
@@ -42,7 +46,7 @@ export function executeEffect(state: GameState, entry: ChainEntry): void {
       `${def.name} effect activates`,
       entry.sourceCardInstanceId
     );
-    handler(state, entry);
+    handler(state, entry, collector);
   } else {
     addLog(
       state,
@@ -58,14 +62,25 @@ export function executeEffect(state: GameState, entry: ChainEntry): void {
 // Card Effect Handlers — keyed by card def ID
 // ============================================================
 
-type EffectHandler = (state: GameState, entry: ChainEntry) => void;
+type EffectHandler = (state: GameState, entry: ChainEntry, collector?: EventCollector) => void;
 
 const effectHandlers: Record<string, EffectHandler> = {
   // --------------------------------------------------------
   // FIELD: F0005 — Slayer Guild's Hideout
-  // TRIGGER: Once/turn, Main or Battle Phase, in-play card discarded → draw 1
+  // TRIGGER: Once/turn, Main or Battle Phase, in-play card discarded → may draw 1
   // --------------------------------------------------------
   'F0005': (state, entry) => {
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'F0005-E1',
+        cardName: "Slayer Guild's Hideout",
+        effectDescription: 'You may draw 1 card.',
+        owner: entry.owner,
+      };
+      return;
+    }
     const fieldCard = getCard(state, entry.sourceCardInstanceId);
     drawCards(state, entry.owner, 1);
     fieldCard.usedEffects.push('F0005-E1');
@@ -74,16 +89,31 @@ const effectHandlers: Record<string, EffectHandler> = {
 
   // --------------------------------------------------------
   // C0077 — Vanessa
-  // TRIGGER: Sent to Attack → look top 5, add 1 Ability w/ {Weapon} req, discard rest
+  // TRIGGER: Sent to Attack → may look top 5, add 1 Ability w/ {Weapon} req, discard rest
   // --------------------------------------------------------
   'C0077': (state, entry) => {
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0077-E1',
+        cardName: 'Vanessa',
+        effectDescription: 'You may look at the top 5 cards of your deck. Add 1 Ability card with {Weapon} requirement to your hand, discard the rest.',
+        owner: entry.owner,
+      };
+      return;
+    }
     const player = entry.owner;
     const deck = state.players[player].deck;
     const topCards = deck.slice(0, Math.min(5, deck.length));
 
+    if (topCards.length === 0) {
+      addLog(state, player, 'effect', 'Vanessa — Deck is empty');
+      return;
+    }
+
     // Find ability cards with Weapon requirement
     const abilityWithWeapon: string[] = [];
-    const others: string[] = [];
 
     for (const cardId of topCards) {
       const def = getCardDefForInstance(state, cardId);
@@ -93,36 +123,19 @@ const effectHandlers: Record<string, EffectHandler> = {
         def.requirements.some((r) => r.type === 'attribute' && r.value === 'Weapon')
       ) {
         abilityWithWeapon.push(cardId);
-      } else {
-        others.push(cardId);
       }
     }
 
-    // AI/auto: pick first valid ability (player choice will be interactive later)
-    if (abilityWithWeapon.length > 0) {
-      const chosen = abilityWithWeapon[0];
-      // Remove from deck and add to hand
-      state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
-      const card = getCard(state, chosen);
-      card.zone = 'hand';
-      state.players[player].hand.push(chosen);
-
-      addLog(state, player, 'effect', `Vanessa found ${getCardDefForInstance(state, chosen).name}`);
-
-      // Discard the rest of the top 5
-      const toDiscard = [...abilityWithWeapon.slice(1), ...others];
-      for (const id of toDiscard) {
-        state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
-        moveCard(state, id, 'discard');
-      }
-    } else {
-      // No valid ability found, discard all
-      for (const id of topCards) {
-        state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
-        moveCard(state, id, 'discard');
-      }
-      addLog(state, player, 'effect', 'Vanessa found no valid Ability card');
-    }
+    // Set up interactive search for player to pick from the revealed cards
+    state.pendingSearch = {
+      effectId: 'C0077-E1',
+      owner: player,
+      criteria: 'Ability card with {Weapon} requirement',
+      validCardIds: abilityWithWeapon,
+      displayCardIds: topCards,
+      sourceCardName: 'Vanessa',
+      discardRest: true,
+    };
   },
 
   // --------------------------------------------------------
@@ -135,12 +148,17 @@ const effectHandlers: Record<string, EffectHandler> = {
     // Effect: Draw 2, then put 1 from hand to bottom of deck
     drawCards(state, player, 2);
 
-    // Auto-select worst card for AI (interactive for player later)
     const hand = state.players[player].hand;
     if (hand.length > 0) {
-      const cardToBottom = hand[hand.length - 1]; // placeholder logic
-      moveCardToBottomOfDeck(state, cardToBottom);
-      addLog(state, player, 'effect', 'Lucian — Drew 2, put 1 to deck bottom');
+      // Set up interactive choice for which card to put at deck bottom
+      state.pendingTargetChoice = {
+        effectId: 'C0078-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: 'Choose a card from your hand to place at the bottom of your deck',
+        validTargetIds: [...hand],
+      };
+      addLog(state, player, 'effect', 'Lucian — Drew 2, choose 1 to put at deck bottom');
     }
   },
 
@@ -222,6 +240,18 @@ const effectHandlers: Record<string, EffectHandler> = {
       return;
     }
 
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0081-E1',
+        cardName: 'Professor Sinister',
+        effectDescription: 'You may move the top card of your deck to your Essence area.',
+        owner: entry.owner,
+      };
+      return;
+    }
+
     const deck = state.players[player].deck;
     if (deck.length > 0) {
       const topCard = deck[0];
@@ -237,25 +267,37 @@ const effectHandlers: Record<string, EffectHandler> = {
   // (ONGOING handled separately in stat calculation)
   // --------------------------------------------------------
   'C0082': (state, entry) => {
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0082-E1',
+        cardName: 'Omtaba',
+        effectDescription: 'You may discard 1 Injured Character your opponent controls.',
+        owner: entry.owner,
+      };
+      return;
+    }
     const player = entry.owner;
     const opponent = getOpponent(player);
 
-    // Find injured opponent characters
+    // Find injured opponent characters (kingdom and battlefield)
     const opponentKingdom = getCardsInZone(state, opponent, 'kingdom');
-    const injuredChars = opponentKingdom.filter(
-      (c) => c.state === 'injured'
+    const opponentBattlefield = getCardsInZone(state, opponent, 'battlefield');
+    const injuredChars = [...opponentKingdom, ...opponentBattlefield].filter(
+      (c) => c.state === 'injured' &&
+        !isProtectedFromCharacterEffects(state, c.instanceId, player)
     );
 
     if (injuredChars.length > 0) {
-      // Auto: discard first injured character (player choice later)
-      const target = injuredChars[0];
-      moveCard(state, target.instanceId, 'discard');
-      addLog(
-        state,
-        player,
-        'effect',
-        `Omtaba — Discarded opponent's injured ${getCardDefForInstance(state, target.instanceId).name}`
-      );
+      // Let the player choose which injured character to discard
+      state.pendingTargetChoice = {
+        effectId: 'C0082-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: 'Choose an injured opponent character to discard',
+        validTargetIds: injuredChars.map((c) => c.instanceId),
+      };
     } else {
       addLog(state, player, 'effect', 'Omtaba — No injured opponent characters to discard');
     }
@@ -263,13 +305,25 @@ const effectHandlers: Record<string, EffectHandler> = {
 
   // --------------------------------------------------------
   // C0083 — Swordmaster Don
-  // TRIGGER: Put in play, if Field has Plasma → move 1 {Weapon} from DP to hand
+  // TRIGGER: Put in play, if Field has Plasma → may move 1 {Weapon} from DP to hand
   // --------------------------------------------------------
   'C0083': (state, entry) => {
     const player = entry.owner;
 
     if (!fieldHasSymbol(state, player, 'plasma')) {
       addLog(state, player, 'effect', 'Swordmaster Don — Field has no Plasma symbol');
+      return;
+    }
+
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0083-E1',
+        cardName: 'Swordmaster Don',
+        effectDescription: 'You may move 1 {Weapon} Character from your Discard Pile to your hand.',
+        owner: entry.owner,
+      };
       return;
     }
 
@@ -281,15 +335,14 @@ const effectHandlers: Record<string, EffectHandler> = {
     );
 
     if (weaponChars.length > 0) {
-      // Auto: pick first (player choice later)
-      const chosen = weaponChars[0];
-      moveCard(state, chosen.instanceId, 'hand');
-      addLog(
-        state,
-        player,
-        'effect',
-        `Swordmaster Don — Recovered ${getCardDefForInstance(state, chosen.instanceId).name} from DP`
-      );
+      // Let the player choose which {Weapon} to recover
+      state.pendingTargetChoice = {
+        effectId: 'C0083-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: 'Choose a {Weapon} character from your Discard Pile to add to your hand',
+        validTargetIds: weaponChars.map((c) => c.instanceId),
+      };
     } else {
       addLog(state, player, 'effect', 'Swordmaster Don — No {Weapon} characters in DP');
     }
@@ -310,19 +363,15 @@ const effectHandlers: Record<string, EffectHandler> = {
     );
 
     if (weaponChars.length > 0) {
-      // Auto: target first weapon character (player choice later)
-      // Prefer targeting someone other than Sinbad if possible
-      const target =
-        weaponChars.find((c) => c.instanceId !== entry.sourceCardInstanceId) ??
-        weaponChars[0];
-
-      target.counters.push({ type: 'plus-one' });
-      addLog(
-        state,
-        player,
-        'effect',
-        `Sinbad — Placed +1/+1 Counter on ${getCardDefForInstance(state, target.instanceId).name}`
-      );
+      // Always let the player choose (even 1 target — "you may" allows declining)
+      state.pendingTargetChoice = {
+        effectId: 'C0084-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: 'You may choose a {Weapon} character to place +1/+1 Counter on',
+        validTargetIds: weaponChars.map((c) => c.instanceId),
+        allowDecline: true,
+      };
     } else {
       addLog(state, player, 'effect', 'Sinbad — No {Weapon} characters to target');
     }
@@ -337,19 +386,27 @@ const effectHandlers: Record<string, EffectHandler> = {
     const player = entry.owner;
     const card = getCard(state, entry.sourceCardInstanceId);
 
-    // Cost already paid: 1 Weapon character moved from DP to deck bottom
+    // Cost: Move 1 {Weapon} Character from DP to bottom of deck
+    const discard = getCardsInZone(state, player, 'discard');
+    const weaponInDP = discard.filter(
+      (c) =>
+        getCardDefForInstance(state, c.instanceId).cardType === 'character' &&
+        characterHasAttribute(state, c.instanceId, 'Weapon')
+    );
 
-    if (fieldHasSymbol(state, player, 'necro')) {
-      card.statModifiers.push({
-        lead: 2,
-        support: 0,
-        source: 'C0085-Samanosuke',
-        duration: 'turn',
-      });
-      addLog(state, player, 'effect', 'Samanosuke — Gained +2/+0 this turn');
-    } else {
-      addLog(state, player, 'effect', 'Samanosuke — Field has no Necro symbol, no stat boost');
+    if (weaponInDP.length === 0) {
+      addLog(state, player, 'effect', 'Samanosuke — No {Weapon} character in DP to pay cost');
+      return;
     }
+
+    // Let the player choose which {Weapon} from DP to move to deck bottom
+    state.pendingTargetChoice = {
+      effectId: 'C0085-E1',
+      sourceCardId: entry.sourceCardInstanceId,
+      owner: player,
+      description: 'Choose a {Weapon} character from your Discard Pile to move to deck bottom',
+      validTargetIds: weaponInDP.map((c) => c.instanceId),
+    };
   },
 
   // --------------------------------------------------------
@@ -380,19 +437,14 @@ const effectHandlers: Record<string, EffectHandler> = {
     });
 
     if (validTargets.length > 0) {
-      // Auto: pick first valid (player choice later)
-      const chosen = validTargets[0];
-      state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
-      const card = getCard(state, chosen);
-      card.zone = 'hand';
-      state.players[player].hand.push(chosen);
-      shuffleDeck(state, player);
-      addLog(
-        state,
-        player,
-        'effect',
-        `Secret Meeting — Added ${getCardDefForInstance(state, chosen).name} to hand`
-      );
+      // Set pending search for interactive selection
+      state.pendingSearch = {
+        effectId: 'S0038',
+        owner: player,
+        criteria: 'Slayer or Mercenary Character',
+        validCardIds: validTargets,
+      };
+      addLog(state, player, 'effect', 'Secret Meeting — Search your deck for a Slayer or Mercenary Character');
     } else {
       shuffleDeck(state, player);
       addLog(state, player, 'effect', 'Secret Meeting — No valid targets found');
@@ -408,13 +460,14 @@ const effectHandlers: Record<string, EffectHandler> = {
     const player = entry.owner;
     const opponent = getOpponent(player);
 
-    // Award 1 additional Battle Reward
+    // Award 1 additional Battle Reward — cards go from opponent's deck to opponent's BR zone
+    // (when opponent's BR reaches 10, the current player wins)
     const opponentDeck = state.players[opponent].deck;
     if (opponentDeck.length > 0) {
       const cardId = opponentDeck.shift()!;
       const card = getCard(state, cardId);
       card.zone = 'battle-rewards';
-      state.players[player].battleRewards.push(cardId);
+      state.players[opponent].battleRewards.push(cardId);
 
       const sourceCard = getCard(state, entry.sourceCardInstanceId);
       sourceCard.usedEffects.push('S0039-E1');
@@ -428,7 +481,7 @@ const effectHandlers: Record<string, EffectHandler> = {
   // If Field is "Slayer Guild's Hideout" → reveal {Weapon} Char from hand,
   // and if you do, move to deck bottom, draw 3
   // --------------------------------------------------------
-  'S0040': (state, entry) => {
+  'S0040': (state, entry, collector) => {
     const player = entry.owner;
 
     if (!fieldHasName(state, player, "Slayer Guild's Hideout")) {
@@ -444,16 +497,14 @@ const effectHandlers: Record<string, EffectHandler> = {
     });
 
     if (weaponChars.length > 0) {
-      // "And if you do" — must reveal to get the draw
-      const chosen = weaponChars[0]; // Auto: first (player choice later)
-      moveCardToBottomOfDeck(state, chosen);
-      drawCards(state, player, 3);
-      addLog(
-        state,
-        player,
-        'effect',
-        `Bounty Board — Revealed ${getCardDefForInstance(state, chosen).name}, drew 3 cards`
-      );
+      // Let the player choose which {Weapon} character to reveal
+      state.pendingTargetChoice = {
+        effectId: 'S0040-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: 'Choose a {Weapon} character from your hand to reveal',
+        validTargetIds: weaponChars,
+      };
     } else {
       addLog(state, player, 'effect', 'Bounty Board — No {Weapon} Character in hand to reveal');
     }
@@ -487,13 +538,13 @@ const effectHandlers: Record<string, EffectHandler> = {
     // Draw 1
     drawCards(state, player, 1);
 
-    // Win 1 BR
+    // Win 1 BR — cards go from opponent's deck to opponent's BR zone
     const opponentDeck = state.players[opponent].deck;
     if (opponentDeck.length > 0) {
       const brCard = opponentDeck.shift()!;
       const brCardInstance = getCard(state, brCard);
       brCardInstance.zone = 'battle-rewards';
-      state.players[player].battleRewards.push(brCard);
+      state.players[opponent].battleRewards.push(brCard);
     }
 
     addLog(
@@ -508,23 +559,50 @@ const effectHandlers: Record<string, EffectHandler> = {
   // A0036 — Stake Gun
   // Flip coin X times, 1 dmg per Heads. Expert [{Slayer}]: discard X from opponent's deck
   // --------------------------------------------------------
-  'A0036': (state, entry) => {
+  'A0036': (state, entry, collector) => {
     const player = entry.owner;
     const opponent = getOpponent(player);
     const xValue = entry.xValue ?? 0;
+    const def = getCardDefForInstance(state, entry.sourceCardInstanceId);
 
-    if (!entry.targetIds || entry.targetIds.length === 0 || xValue === 0) {
-      addLog(state, player, 'effect', 'Stake Gun — No target or X=0');
+    if (!entry.targetIds || entry.targetIds.length === 0) {
+      addLog(state, player, 'effect', 'Stake Gun — No target');
       return;
     }
 
     const targetId = entry.targetIds[0];
 
+    // Check protection (Omtaba E2)
+    if (isProtectedFromCharacterEffects(state, targetId, player)) {
+      addLog(state, player, 'effect', 'Stake Gun — Target is protected from character effects');
+      return;
+    }
+
+    // X=0 is valid (e.g., to dodge Swift Strike), just skip coin flips
+    if (xValue === 0) {
+      addLog(state, player, 'effect', 'Stake Gun — X=0, no coins to flip');
+      return;
+    }
+
     // Flip coins
     let heads = 0;
+    const results: ('heads' | 'tails')[] = [];
     for (let i = 0; i < xValue; i++) {
-      if (Math.random() < 0.5) heads++;
+      const isHeads = Math.random() < 0.5;
+      if (isHeads) heads++;
+      results.push(isHeads ? 'heads' : 'tails');
     }
+
+    // Emit coin flip animation event
+    collector?.emit({
+      type: 'coin-flip',
+      player,
+      cardName: def.name,
+      defId: def.id,
+      flipCount: xValue,
+      results,
+      headsCount: heads,
+    });
 
     addLog(
       state,
@@ -545,23 +623,26 @@ const effectHandlers: Record<string, EffectHandler> = {
     }
 
     // Expert effect: if user is {Slayer}, may discard X from opponent's deck
-    if (entry.userId) {
+    if (entry.userId && xValue > 0) {
       if (characterHasAttribute(state, entry.userId, 'Slayer')) {
-        const deckCards = state.players[opponent].deck.splice(
-          0,
-          Math.min(xValue, state.players[opponent].deck.length)
-        );
-        for (const id of deckCards) {
-          const c = getCard(state, id);
-          c.zone = 'discard';
-          state.players[opponent].discard.push(id);
-        }
-        addLog(
-          state,
-          player,
-          'effect',
-          `Stake Gun Expert — Discarded ${deckCards.length} from opponent's deck`
-        );
+        // Add lingering effect for the expert prompt
+        const effectId = `stakegun_expert_${Date.now()}`;
+        state.lingeringEffects.push({
+          id: effectId,
+          source: entry.sourceCardInstanceId,
+          effectDescription: `Stake Gun Expert: You may discard the top ${xValue} card(s) of your opponent's deck.`,
+          duration: 'turn',
+          appliedTurn: state.turnNumber,
+          data: { player, opponent, xValue },
+        });
+        state.pendingOptionalEffect = {
+          lingeringEffectId: effectId,
+          sourceCardId: entry.sourceCardInstanceId,
+          effectId: 'A0036-expert',
+          cardName: 'Stake Gun',
+          effectDescription: `Expert: You may discard the top ${xValue} card(s) of your opponent's deck.`,
+          owner: player,
+        };
       }
     }
   },

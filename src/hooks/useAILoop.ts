@@ -101,6 +101,66 @@ export function useAILoop(options: UseAILoopOptions): void {
       return;
     }
 
+    // --- Handle pending search for AI ---
+    if (gameState.pendingSearch) {
+      const searchOwner = gameState.pendingSearch.owner;
+      const isAISearch = mode === 'aivai' || (mode === 'pvai' && searchOwner !== humanPlayer);
+      if (isAISearch) {
+        onAIThinkingChangeRef.current(true);
+        timeoutRef.current = setTimeout(() => {
+          // AI auto-picks first valid card
+          const chosen = gameState.pendingSearch?.validCardIds[0] ?? null;
+          onAIActionRef.current(searchOwner, { type: 'search-select', cardInstanceId: chosen });
+          onAIThinkingChangeRef.current(false);
+          timeoutRef.current = null;
+        }, AI_MOVE_DELAY_MS);
+        return;
+      }
+      // If it's a human search, don't proceed with AI actions — wait for overlay
+      if (searchOwner === humanPlayer) return;
+    }
+
+    // --- Handle pending optional effect for AI ---
+    if (gameState.pendingOptionalEffect) {
+      const optOwner = gameState.pendingOptionalEffect.owner;
+      const isAIOpt = mode === 'aivai' || (mode === 'pvai' && optOwner !== humanPlayer);
+      if (isAIOpt) {
+        onAIThinkingChangeRef.current(true);
+        timeoutRef.current = setTimeout(() => {
+          // AI always activates optional effects
+          onAIActionRef.current(optOwner, {
+            type: 'choose-optional-trigger',
+            effectId: gameState.pendingOptionalEffect?.effectId ?? '',
+            activate: true,
+          });
+          onAIThinkingChangeRef.current(false);
+          timeoutRef.current = null;
+        }, AI_MOVE_DELAY_MS);
+        return;
+      }
+      // If it's a human optional effect, don't proceed — wait for overlay
+      if (optOwner === humanPlayer) return;
+    }
+
+    // --- Handle pending target choice for AI ---
+    if (gameState.pendingTargetChoice) {
+      const choiceOwner = gameState.pendingTargetChoice.owner;
+      const isAIChoice = mode === 'aivai' || (mode === 'pvai' && choiceOwner !== humanPlayer);
+      if (isAIChoice) {
+        onAIThinkingChangeRef.current(true);
+        timeoutRef.current = setTimeout(() => {
+          // AI auto-picks first valid target
+          const chosen = gameState.pendingTargetChoice?.validTargetIds[0] ?? '';
+          onAIActionRef.current(choiceOwner, { type: 'resolve-target-choice', cardInstanceId: chosen });
+          onAIThinkingChangeRef.current(false);
+          timeoutRef.current = null;
+        }, AI_MOVE_DELAY_MS);
+        return;
+      }
+      // If it's a human choice, don't proceed with AI actions — wait for overlay
+      if (choiceOwner === humanPlayer) return;
+    }
+
     // --- Handle post-mulligan game actions ---
     if (mode === 'pvai') {
       // Only act if it's not the human's turn
