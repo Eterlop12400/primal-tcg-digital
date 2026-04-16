@@ -43,5 +43,7 @@ export {
   fieldHasSymbol,
   fieldHasName,
   characterHasAttribute,
+  hasOceanicAbyssInPlay,
+  oceanicAbyssVirtualCharCount,
   addLog,
 } from './utils';

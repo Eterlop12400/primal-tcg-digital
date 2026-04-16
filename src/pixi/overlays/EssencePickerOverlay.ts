@@ -13,7 +13,16 @@ import type { GameState, CardDef } from '@/game/types';
 import type { UIState, UIAction } from '@/hooks/useGameEngine';
 import { getCardDefForInstance } from '@/game/engine';
 
-/** Check if the current selection satisfies the specific symbol requirements */
+/** Get all symbols for a card (multi-symbol cards count for any of their symbols) */
+function getCardSymbols(state: GameState, id: string): string[] {
+  try {
+    const def = getCardDefForInstance(state, id);
+    return def.symbols ?? [];
+  } catch { return []; }
+}
+
+/** Check if the current selection satisfies the specific symbol requirements.
+ *  Multi-symbol cards (e.g. ['necro','plasma']) can satisfy either symbol cost. */
 function validateSymbolCosts(
   selectedIds: string[],
   state: GameState,
@@ -21,46 +30,43 @@ function validateSymbolCosts(
   cardSymbols?: string[],
   cardSymbolCount?: number,
 ): { satisfied: boolean; remaining: { symbol: string; count: number }[] } {
-  // Count symbols in selected cards
-  const symbolCounts: Record<string, number> = {};
-  for (const id of selectedIds) {
-    const inst = state.cards[id];
-    if (!inst) continue;
-    try {
-      const def = getCardDefForInstance(state, id);
-      const sym = def.symbols?.[0];
-      if (sym) {
-        symbolCounts[sym] = (symbolCounts[sym] || 0) + 1;
-      }
-    } catch { /* skip */ }
-  }
+  // Assignment-based approach: track which cards are still unassigned
+  const unassigned = new Set(selectedIds);
 
   const remaining: { symbol: string; count: number }[] = [];
 
-  // Check each specific cost first
+  // Assign cards to specific costs first (most constrained)
   if (specificCosts && specificCosts.length > 0) {
     for (const cost of specificCosts) {
-      const have = symbolCounts[cost.symbol] || 0;
-      const need = Math.max(0, cost.count - have);
+      let filled = 0;
+      for (const id of [...unassigned]) {
+        if (filled >= cost.count) break;
+        const syms = getCardSymbols(state, id);
+        if (syms.includes(cost.symbol)) {
+          unassigned.delete(id);
+          filled++;
+        }
+      }
+      const need = cost.count - filled;
       if (need > 0) {
         remaining.push({ symbol: cost.symbol, count: need });
       }
-      // Consume used symbols so they can't double-count
-      symbolCounts[cost.symbol] = Math.max(0, have - cost.count);
     }
   }
 
   // Check cardSymbol cost (N cards matching any of the ability card's symbols)
   if (cardSymbols && cardSymbolCount && cardSymbolCount > 0) {
-    let matchCount = 0;
-    for (const sym of cardSymbols) {
-      const available = symbolCounts[sym] || 0;
-      matchCount += available;
+    let filled = 0;
+    for (const id of [...unassigned]) {
+      if (filled >= cardSymbolCount) break;
+      const syms = getCardSymbols(state, id);
+      if (cardSymbols.some(s => syms.includes(s))) {
+        unassigned.delete(id);
+        filled++;
+      }
     }
-    if (matchCount < cardSymbolCount) {
-      // Show as "1 NECRO/PLAS" style requirement
-      const symbolNames = cardSymbols.map(s => s.toUpperCase().slice(0, 4)).join('/');
-      remaining.push({ symbol: `card:${cardSymbols.join(',')}`, count: cardSymbolCount - matchCount });
+    if (filled < cardSymbolCount) {
+      remaining.push({ symbol: `card:${cardSymbols.join(',')}`, count: cardSymbolCount - filled });
     }
   }
 
@@ -211,20 +217,17 @@ export class EssencePickerOverlay extends Container {
           symColor = COLORS.textMuted;
         }
 
-        // Count how many of this symbol are in selection
+        // Count how many of this symbol are in selection (check ALL symbols per card)
         let selectedOfSymbol = 0;
         for (const id of ui.selectedCardIds) {
-          try {
-            const def = getCardDefForInstance(state, id);
-            const cardSym = def.symbols?.[0] ?? 'neutral';
-            if (isCardSymbolCost && cardSymbols) {
-              if (cardSymbols.includes(cardSym)) selectedOfSymbol++;
-            } else if (cost.symbol === 'neutral') {
-              // Neutral — simplified counting
-            } else if (cardSym === cost.symbol) {
-              selectedOfSymbol++;
-            }
-          } catch { /* skip */ }
+          const syms = getCardSymbols(state, id);
+          if (isCardSymbolCost && cardSymbols) {
+            if (cardSymbols.some(s => syms.includes(s))) selectedOfSymbol++;
+          } else if (cost.symbol === 'neutral') {
+            // Neutral — simplified counting
+          } else if (syms.includes(cost.symbol)) {
+            selectedOfSymbol++;
+          }
         }
         // Cap at needed
         if (cost.symbol !== 'neutral') {

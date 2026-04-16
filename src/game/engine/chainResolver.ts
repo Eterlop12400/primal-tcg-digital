@@ -15,6 +15,8 @@ import {
   moveCard,
   addLog,
   getOpponent,
+  characterHasAttribute,
+  setupNextEssenceRedirectPrompt,
 } from './utils';
 import { executeEffect } from './effectExecutor';
 import type { EventCollector } from './EventCollector';
@@ -43,6 +45,14 @@ export function resolveChain(state: GameState, collector?: EventCollector): void
 
     entry.resolved = true;
     state.chain.pop();
+
+    // Check for Oceanic Abyss (S0042) discard-to-essence redirects
+    if (state.pendingEssenceRedirects?.length) {
+      if (setupNextEssenceRedirectPrompt(state)) {
+        state.isChainResolving = false;
+        return;
+      }
+    }
   }
 
   state.isChainResolving = false;
@@ -339,6 +349,39 @@ function checkPutInPlayTriggers(
         negated: false,
         owner,
       });
+    }
+  }
+
+  // Check OTHER characters in play for "put-in-play-sea-monster" triggers
+  // (e.g., Sea King Krakaan triggers when any Sea Monster enters play)
+  if (charDef.attributes.includes('Sea Monster')) {
+    const allInPlay = [
+      ...state.players[owner].kingdom,
+      ...state.players[owner].battlefield,
+    ];
+    for (const otherId of allInPlay) {
+      if (otherId === cardInstanceId) continue; // skip the card that just entered
+      const otherCard = state.cards[otherId];
+      if (!otherCard || otherCard.isNegated) continue;
+      try {
+        const otherDef = getCardDefForInstance(state, otherId);
+        if (otherDef.cardType !== 'character') continue;
+        const otherCharDef = otherDef as CharacterCardDef;
+        for (const eff of otherCharDef.effects) {
+          if (eff.type !== 'trigger' || eff.triggerCondition !== 'put-in-play-sea-monster') continue;
+          if (otherCard.state === 'injured' && !eff.isValid) continue;
+
+          state.pendingTriggers.push({
+            id: `trigger_${otherId}_${eff.id}_${cardInstanceId}`,
+            type: 'trigger-effect',
+            sourceCardInstanceId: otherId,
+            effectId: eff.id,
+            resolved: false,
+            negated: false,
+            owner,
+          });
+        }
+      } catch { /* skip */ }
     }
   }
 }

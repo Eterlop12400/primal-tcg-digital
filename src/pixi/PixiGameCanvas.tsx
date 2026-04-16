@@ -21,9 +21,11 @@ import { GameRenderer } from './GameRenderer';
 
 interface PixiGameCanvasProps {
   mode: GameMode;
+  p1Deck?: string;
+  p2Deck?: string;
 }
 
-export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
+export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
   const { uiState, dispatch, gameState, legalActions, isMyTurn } = useGameEngine();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -36,8 +38,8 @@ export function PixiGameCanvas({ mode }: PixiGameCanvasProps) {
   // Initialize game on mount
   // ============================================================
   useEffect(() => {
-    dispatch({ type: 'INIT_GAME', mode });
-  }, [mode, dispatch]);
+    dispatch({ type: 'INIT_GAME', mode, p1Deck, p2Deck });
+  }, [mode, p1Deck, p2Deck, dispatch]);
 
   // ============================================================
   // Initialize PixiJS renderer

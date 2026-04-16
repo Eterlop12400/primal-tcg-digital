@@ -8,8 +8,10 @@ import type { GameMode } from '@/hooks/useGameEngine';
 function GameContent() {
   const searchParams = useSearchParams();
   const mode = (searchParams.get('mode') as GameMode) ?? 'pvai';
+  const p1Deck = searchParams.get('p1deck') ?? undefined;
+  const p2Deck = searchParams.get('p2deck') ?? undefined;
 
-  return <PixiGameCanvas mode={mode} />;
+  return <PixiGameCanvas mode={mode} p1Deck={p1Deck} p2Deck={p2Deck} />;
 }
 
 function LoadingScreen() {

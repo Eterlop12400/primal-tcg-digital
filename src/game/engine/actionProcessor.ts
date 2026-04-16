@@ -25,6 +25,7 @@ import {
   characterHasAttribute,
   cardHasSymbol,
   fieldHasSymbol,
+  setupNextEssenceRedirectPrompt,
 } from './utils';
 import type { EventCollector } from './EventCollector';
 import {
@@ -182,6 +183,19 @@ function handleSummon(
   const charDef = def as CharacterCardDef;
   if (charDef.turnCost > state.players[player].turnMarker) {
     return { success: false, error: 'Turn Marker too low' };
+  }
+
+  // Check Unique characteristic
+  if (charDef.characteristics.includes('unique')) {
+    const kingdom = state.players[player].kingdom;
+    const battlefield = state.players[player].battlefield;
+    const hasInPlay = [...kingdom, ...battlefield].some((id) => {
+      const d = getCardDefForInstance(state, id);
+      return d.printNumber === charDef.printNumber;
+    });
+    if (hasInPlay) {
+      return { success: false, error: 'Unique — character with same print number already in play' };
+    }
   }
 
   // Pay hand cost
@@ -381,6 +395,12 @@ function handlePlayAbility(
         return { success: false, error: `User doesn't have required attribute: ${req.value}` };
       }
     }
+    if (req.type === 'turn-cost-min') {
+      const userDef = getCardDefForInstance(state, action.userId) as CharacterCardDef;
+      if (userDef.turnCost < parseInt(req.value, 10)) {
+        return { success: false, error: `User must have Turn Cost ${req.value} or higher` };
+      }
+    }
   }
 
   // Validate targets are on the battlefield and opposing the user
@@ -461,14 +481,16 @@ function handleActivateEffect(
   const card = getCard(state, action.cardInstanceId);
   const def = getCardDefForInstance(state, action.cardInstanceId);
 
-  if (def.cardType !== 'character' && def.cardType !== 'field') {
-    return { success: false, error: 'Only character and field cards have activate effects' };
+  if (def.cardType !== 'character' && def.cardType !== 'field' && def.cardType !== 'strategy') {
+    return { success: false, error: 'Card type does not have activate effects' };
   }
 
   // Find the effect on the card
   const effectList = def.cardType === 'character'
     ? (def as CharacterCardDef).effects
-    : (def as FieldCardDef).effects;
+    : def.cardType === 'field'
+    ? (def as FieldCardDef).effects
+    : (def as StrategyCardDef).effects;
   const effect = effectList.find((e) => e.id === action.effectId);
 
   if (!effect || effect.type !== 'activate') {
@@ -485,6 +507,22 @@ function handleActivateEffect(
     return { success: false, error: 'Effect already used this turn' };
   }
 
+  // Check name-turn scope (yellow activate — once per turn across all copies)
+  if (effect.activateScope === 'name-turn') {
+    const nameKey = def.printNumber + ':' + effect.id;
+    if (state.players[player].usedActivateNames.includes(nameKey)) {
+      return { success: false, error: 'This activate effect has already been used by another copy this turn' };
+    }
+  }
+
+  // Check name-game scope (pink activate — once per game across all copies)
+  if (effect.activateScope === 'name-game') {
+    const nameKey = def.printNumber + ':' + effect.id;
+    if (state.players[player].usedActivateNames.includes(nameKey)) {
+      return { success: false, error: 'This activate effect has already been used this game' };
+    }
+  }
+
   // Check timing
   const isTurnPlayer = state.currentTurn === player;
   if (effect.turnTiming === 'your-turn' && !isTurnPlayer) {
@@ -498,7 +536,33 @@ function handleActivateEffect(
   }
 
   // Pay costs — card-specific validation and execution
-  if (action.costCardIds && action.costCardIds.length > 0) {
+  const isExpelFromHand = effect.costDescription?.toLowerCase().includes('expel this card from your hand');
+  const isExpelFromEssence = effect.costDescription?.toLowerCase().includes('expel this card from your essence');
+  const isPutInPlayFromHand = effect.effectDescription?.toLowerCase().includes('from your hand in play');
+
+  if (isExpelFromEssence) {
+    // Activate-from-essence: card must be in essence, cost is expelling it
+    if (card.zone !== 'essence' || card.owner !== player) {
+      return { success: false, error: 'Card must be in your Essence area to activate this effect' };
+    }
+    // Expel the card (move to expel zone) — this IS the cost
+    moveCard(state, action.cardInstanceId, 'expel');
+    addLog(state, player, 'cost', `Expelled ${def.name} from Essence`);
+  } else if (isExpelFromHand) {
+    // Activate-from-hand: card must be in hand, cost is expelling it
+    if (card.zone !== 'hand' || card.owner !== player) {
+      return { success: false, error: 'Card must be in your hand to activate this effect' };
+    }
+    // Expel the card (move to expel zone) — this IS the cost
+    moveCard(state, action.cardInstanceId, 'expel');
+    addLog(state, player, 'cost', `Expelled ${def.name} from hand`);
+  } else if (isPutInPlayFromHand) {
+    // Put-in-play-from-hand: card must be in hand, no cost
+    if (card.zone !== 'hand' || card.owner !== player) {
+      return { success: false, error: 'Card must be in your hand to activate this effect' };
+    }
+    // Card stays in hand — effect executor will move it to kingdom
+  } else if (action.costCardIds && action.costCardIds.length > 0) {
     const costResult = payActivateCost(state, player, action.effectId, action.costCardIds);
     if (!costResult.success) {
       return { success: false, error: costResult.error };
@@ -510,6 +574,12 @@ function handleActivateEffect(
 
   // Mark effect as used
   card.usedEffects.push(effect.id);
+
+  // Track name-scoped activate usage at player level
+  if (effect.activateScope === 'name-turn' || effect.activateScope === 'name-game') {
+    const nameKey = def.printNumber + ':' + effect.id;
+    state.players[player].usedActivateNames.push(nameKey);
+  }
 
   // Add to chain
   const chainEntry: ChainEntry = {
@@ -749,6 +819,13 @@ function handleShowdownOrder(
     resolveShowdown(state, teamId);
   }
 
+  // Check for Oceanic Abyss (S0042) discard-to-essence redirects before cleanup
+  if (state.pendingEssenceRedirects?.length) {
+    if (setupNextEssenceRedirectPrompt(state)) {
+      return { success: true }; // pause — returnFromBattlefield + advanceToEndPhase deferred
+    }
+  }
+
   // Return all characters from battlefield to kingdom
   returnFromBattlefield(state);
 
@@ -827,7 +904,43 @@ function handleSearchSelect(
 
   const effectId = state.pendingSearch.effectId;
 
-  if (effectId === 'C0087-E1') {
+  if (effectId === 'C0088-E1') {
+    // Hydroon — put selected "Krakaan" into kingdom, then move Hydroon to Essence
+    state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
+    const card = getCard(state, chosen);
+    card.zone = 'kingdom';
+    card.state = 'healthy';
+    state.players[player].kingdom.push(chosen);
+
+    // Create a solo team for Krakaan
+    const teamId = generateId('team');
+    state.teams[teamId] = {
+      id: teamId,
+      owner: player,
+      characterIds: [chosen],
+      hasLead: true,
+      isAttacking: false,
+      isBlocking: false,
+    };
+    card.teamId = teamId;
+    card.battleRole = 'team-lead';
+
+    const def = getCardDefForInstance(state, chosen);
+    addLog(state, player, 'effect', `Hydroon — ${def.name} enters the Kingdom`);
+
+    // Move Hydroon to Essence ("and if you do")
+    const hydroonId = state.pendingSearch?.sourceCardInstanceId;
+    if (hydroonId) {
+      const hydroonCard = state.cards[hydroonId];
+      if (hydroonCard && (hydroonCard.zone === 'kingdom' || hydroonCard.zone === 'battlefield')) {
+        moveCard(state, hydroonId, 'essence');
+        addLog(state, player, 'effect', 'Hydroon — Moved to Essence area');
+      }
+    }
+
+    const { shuffleDeck } = require('./utils');
+    shuffleDeck(state, player);
+  } else if (effectId === 'C0087-E1') {
     // Rococo — put selected card into kingdom with +1/+1 counter
     state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
     const card = getCard(state, chosen);
@@ -856,6 +969,54 @@ function handleSearchSelect(
 
     const { shuffleDeck } = require('./utils');
     shuffleDeck(state, player);
+  } else if (effectId === 'S0044-E1-hand') {
+    // Unknown Pathway — chosen card goes to hand
+    state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
+    const card = getCard(state, chosen);
+    card.zone = 'hand';
+    state.players[player].hand.push(chosen);
+
+    const def = getCardDefForInstance(state, chosen);
+    addLog(state, player, 'effect', `Unknown Pathway — ${def.name} moved to hand`);
+
+    // Remaining displayed cards
+    const remaining = (displayCardIds ?? []).filter((id) => id !== chosen);
+
+    if (remaining.length === 0) {
+      // No more cards to distribute
+    } else if (remaining.length === 1) {
+      // Only 1 remaining — auto-send to essence
+      state.players[player].deck = state.players[player].deck.filter((id) => id !== remaining[0]);
+      moveCard(state, remaining[0], 'essence');
+      const remDef = getCardDefForInstance(state, remaining[0]);
+      addLog(state, player, 'effect', `Unknown Pathway — ${remDef.name} moved to Essence`);
+    } else {
+      // 2 remaining — pick 1 for essence, last auto-discards
+      state.pendingSearch = {
+        effectId: 'S0044-E1-essence',
+        owner: player,
+        criteria: 'Choose 1 card for your Essence (the other goes to Discard)',
+        validCardIds: [...remaining],
+        displayCardIds: [...remaining],
+        sourceCardName: 'Unknown Pathway',
+      };
+    }
+  } else if (effectId === 'S0044-E1-essence') {
+    // Unknown Pathway — chosen card goes to essence
+    state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
+    moveCard(state, chosen, 'essence');
+
+    const def = getCardDefForInstance(state, chosen);
+    addLog(state, player, 'effect', `Unknown Pathway �� ${def.name} moved to Essence`);
+
+    // Last remaining card auto-discards
+    const remaining = (displayCardIds ?? []).filter((id) => id !== chosen);
+    for (const id of remaining) {
+      state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
+      moveCard(state, id, 'discard');
+      const remDef = getCardDefForInstance(state, id);
+      addLog(state, player, 'effect', `Unknown Pathway — ${remDef.name} moved to Discard`);
+    }
   } else {
     // Default: move chosen card from deck to hand
     state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
@@ -1054,6 +1215,194 @@ function handleResolveTargetChoice(
       addLog(state, player, 'effect', `Micromon Beach — Moved ${def.name} from DP to Essence`);
       break;
     }
+    case 'C0089-E1': {
+      // Carnodile — move chosen opponent character to bottom of owner's deck
+      const def = getCardDefForInstance(state, chosen);
+      moveCardToBottomOfDeck(state, chosen);
+      addLog(state, player, 'effect', `Carnodile — Moved ${def.name} to the bottom of their deck`);
+      break;
+    }
+    case 'C0075-E1': {
+      // Aquaconda — discard chosen card from opponent's Essence
+      moveCard(state, chosen, 'discard');
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Aquaconda — Discarded ${def.name} from opponent's Essence`);
+      break;
+    }
+    case 'S0044-E2': {
+      // Unknown Pathway — remove 1 counter from chosen card
+      const target = getCard(state, chosen);
+      if (target.counters.length > 0) {
+        const removed = target.counters.shift()!;
+        const def = getCardDefForInstance(state, chosen);
+        const counterName = removed.type === 'plus-one' ? '+1/+1' : removed.type === 'minus-one' ? '-1/-1' : removed.name ?? removed.type;
+        addLog(state, player, 'effect', `Unknown Pathway — Removed ${counterName} counter from ${def.name}`);
+      }
+      break;
+    }
+    case 'S0037-E1': {
+      // Dangerous Waters — put chosen Sea Monster from essence into play
+      moveCard(state, chosen, 'kingdom');
+      const card = getCard(state, chosen);
+      card.state = 'healthy';
+
+      // Create a solo team
+      const teamId = generateId('team');
+      state.teams[teamId] = {
+        id: teamId,
+        owner: player,
+        characterIds: [chosen],
+        hasLead: true,
+        isAttacking: false,
+        isBlocking: false,
+      };
+      card.teamId = teamId;
+
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Dangerous Waters — Put ${def.name} in play from Essence`);
+
+      // Add lingering effect for end-of-turn cleanup
+      state.lingeringEffects.push({
+        id: `dangerous_waters_${chosen}`,
+        source: chosen,
+        effectDescription: 'At end of turn, if Turn Marker ≤ 4, discard this character.',
+        duration: 'until-end-of-turn',
+        appliedTurn: state.turnNumber,
+        data: { targetId: chosen, owner: player },
+      });
+
+      // Check put-in-play triggers (and Sea Monster triggers for Krakaan)
+      const charDef = def as CharacterCardDef;
+      // Check the card's own put-in-play triggers (card just entered healthy)
+      for (const effect of charDef.effects) {
+        if (effect.type === 'trigger' && effect.triggerCondition === 'put-in-play') {
+          state.pendingTriggers.push({
+            id: `trigger_${chosen}_${effect.id}`,
+            type: 'trigger-effect',
+            sourceCardInstanceId: chosen,
+            effectId: effect.id,
+            resolved: false,
+            negated: false,
+            owner: player,
+          });
+        }
+      }
+      // Check other chars for put-in-play-sea-monster triggers
+      if (charDef.attributes.includes('Sea Monster')) {
+        const allInPlay = [
+          ...state.players[player].kingdom,
+          ...state.players[player].battlefield,
+        ];
+        for (const otherId of allInPlay) {
+          if (otherId === chosen) continue;
+          const otherCard = state.cards[otherId];
+          if (!otherCard || otherCard.isNegated) continue;
+          try {
+            const otherDef = getCardDefForInstance(state, otherId);
+            if (otherDef.cardType !== 'character') continue;
+            const otherCharDef = otherDef as CharacterCardDef;
+            for (const eff of otherCharDef.effects) {
+              if (eff.type !== 'trigger' || eff.triggerCondition !== 'put-in-play-sea-monster') continue;
+              if (otherCard.state === 'injured' && !eff.isValid) continue;
+              state.pendingTriggers.push({
+                id: `trigger_${otherId}_${eff.id}_${chosen}`,
+                type: 'trigger-effect',
+                sourceCardInstanceId: otherId,
+                effectId: eff.id,
+                resolved: false,
+                negated: false,
+                owner: player,
+              });
+            }
+          } catch { /* skip */ }
+        }
+      }
+      break;
+    }
+    case 'A0035-E1-pick1': {
+      // Aquabatics — discard first chosen card from opponent's Essence
+      moveCard(state, chosen, 'discard');
+      const def = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Aquabatics — Discarded ${def.name} from opponent's Essence (1/2)`);
+
+      // Check if opponent has more essence to discard
+      const opponent1 = getOpponent(player);
+      const remainingEssence = [...state.players[opponent1].essence];
+      if (remainingEssence.length > 0) {
+        // Set up second pick
+        state.pendingTargetChoice = {
+          effectId: 'A0035-E1-pick2',
+          sourceCardId: state.pendingTargetChoice!.sourceCardId,
+          owner: player,
+          description: "Choose a card from your opponent's Essence to discard (2 of 2)",
+          validTargetIds: remainingEssence,
+        };
+        return { success: true };
+      }
+
+      // No more to discard — check BR condition
+      if (state.players[player].essence.length > state.players[opponent1].essence.length) {
+        const loserDeck = state.players[opponent1].deck;
+        if (loserDeck.length > 0) {
+          const brCardId = loserDeck.shift()!;
+          state.cards[brCardId].zone = 'battle-rewards';
+          state.players[opponent1].battleRewards.push(brCardId);
+          addLog(state, player, 'effect', 'Aquabatics — You win 1 Battle Reward!');
+        }
+      } else {
+        addLog(state, player, 'effect', 'Aquabatics — Essence not greater, no Battle Reward');
+      }
+      break;
+    }
+    case 'A0035-E1-pick2': {
+      // Aquabatics — discard second chosen card from opponent's Essence
+      moveCard(state, chosen, 'discard');
+      const def = getCardDefForInstance(state, chosen);
+      const opponent2 = getOpponent(player);
+      addLog(state, player, 'effect', `Aquabatics — Discarded ${def.name} from opponent's Essence (2/2)`);
+
+      // Check BR condition: your essence > opponent's essence
+      if (state.players[player].essence.length > state.players[opponent2].essence.length) {
+        const loserDeck = state.players[opponent2].deck;
+        if (loserDeck.length > 0) {
+          const brCardId = loserDeck.shift()!;
+          state.cards[brCardId].zone = 'battle-rewards';
+          state.players[opponent2].battleRewards.push(brCardId);
+          addLog(state, player, 'effect', 'Aquabatics — You win 1 Battle Reward!');
+        }
+      } else {
+        addLog(state, player, 'effect', 'Aquabatics — Essence not greater, no Battle Reward');
+      }
+      break;
+    }
+    case 'C0091-E1-pick1': {
+      // Sea Queen Argelia — discard first chosen card from opponent's Essence
+      moveCard(state, chosen, 'discard');
+      const def91a = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Sea Queen Argelia — Discarded ${def91a.name} from opponent's Essence (1/2)`);
+
+      // Check if opponent has more essence to discard for pick 2
+      const opponent91 = getOpponent(player);
+      const remainingEssence91 = [...state.players[opponent91].essence];
+      if (remainingEssence91.length > 0) {
+        state.pendingTargetChoice = {
+          effectId: 'C0091-E1-pick2',
+          sourceCardId: state.pendingTargetChoice!.sourceCardId,
+          owner: player,
+          description: "Choose a card from your opponent's Essence to discard (2 of 2)",
+          validTargetIds: remainingEssence91,
+        };
+        return { success: true };
+      }
+      break;
+    }
+    case 'C0091-E1-pick2': {
+      // Sea Queen Argelia — discard second chosen card from opponent's Essence
+      moveCard(state, chosen, 'discard');
+      const def91b = getCardDefForInstance(state, chosen);
+      addLog(state, player, 'effect', `Sea Queen Argelia — Discarded ${def91b.name} from opponent's Essence (2/2)`);
+      break;
+    }
     default:
       return { success: false, error: `Unknown pending target effect: ${effectId}` };
   }
@@ -1142,9 +1491,33 @@ function handleChooseOptionalTrigger(
           }
           addLog(state, effectPlayer, 'effect', `Stake Gun Expert — Discarded ${toDiscard.length} from opponent's deck`);
         }
+      } else if (lingeringEffectId.startsWith('oceanic_abyss_redirect_')) {
+        // Oceanic Abyss (S0042) — redirect character from discard to essence
+        const redirectCardId = effect?.data?.redirectCardId as string | undefined;
+        if (redirectCardId) {
+          const redirectCard = state.cards[redirectCardId];
+          if (redirectCard && redirectCard.zone === 'discard') {
+            moveCard(state, redirectCardId, 'essence');
+            const redirectDef = getCardDefForInstance(state, redirectCardId);
+            addLog(state, player, 'effect', `Oceanic Abyss — ${redirectDef.name} moved to Essence instead of Discard Pile`);
+            // Remove any showdown-discard triggers for this character (it wasn't truly discarded)
+            state.pendingTriggers = state.pendingTriggers.filter(
+              (t) => t.sourceCardInstanceId !== redirectCardId
+            );
+          }
+        }
       }
     } else {
-      addLog(state, player, 'effect-declined', 'Declined optional effect');
+      // Declined
+      if (lingeringEffectId.startsWith('oceanic_abyss_redirect_')) {
+        const redirectCardId = effect?.data?.redirectCardId as string | undefined;
+        if (redirectCardId) {
+          const redirectDef = getCardDefForInstance(state, redirectCardId);
+          addLog(state, player, 'effect-declined', `Oceanic Abyss — ${redirectDef.name} stays in Discard Pile`);
+        }
+      } else {
+        addLog(state, player, 'effect-declined', 'Declined optional effect');
+      }
     }
 
     // Remove the lingering effect regardless of choice
@@ -1186,6 +1559,25 @@ function handleChooseOptionalTrigger(
         };
       }
       // Otherwise, showdown phase continues normally
+    } else if (lingeringEffectId.startsWith('oceanic_abyss_redirect_')) {
+      // Check for more redirects in the queue
+      if (state.pendingEssenceRedirects?.length) {
+        setupNextEssenceRedirectPrompt(state);
+      } else {
+        // All redirects processed — continue paused flow
+        state.pendingEssenceRedirects = undefined;
+        if (state.phase === 'battle-showdown') {
+          // Was paused during handleShowdownOrder — finish showdown cleanup
+          returnFromBattlefield(state);
+          advanceToEndPhase(state);
+        } else if (state.phase === 'end') {
+          // Was paused during advanceToEndPhase (e.g., Dangerous Waters) — re-run
+          advanceToEndPhase(state);
+        } else if (state.chain.length > 0) {
+          // Was paused during chain resolution — continue resolving
+          resolveChain(state, collector);
+        }
+      }
     }
   }
 

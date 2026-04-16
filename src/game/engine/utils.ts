@@ -173,6 +173,16 @@ export function moveCard(
       }
     }
   }
+
+  // Oceanic Abyss (S0042) — character discarded from play → queue for essence redirect prompt
+  if (toZone === 'discard' && inPlayZones.includes(fromZone) && card.state !== undefined) {
+    // card.state !== undefined means it's a character card
+    const owner = card.owner;
+    if (hasOceanicAbyssInPlay(state, owner)) {
+      if (!state.pendingEssenceRedirects) state.pendingEssenceRedirects = [];
+      state.pendingEssenceRedirects.push(instanceId);
+    }
+  }
 }
 
 function removeFromZone(
@@ -341,6 +351,9 @@ export function getEffectiveStats(
     for (const effect of charDef.effects) {
       if (effect.type !== 'ongoing') continue;
 
+      // Skip ongoing effects that are not Valid when character is injured
+      if (card.state === 'injured' && !effect.isValid) continue;
+
       // Check if card is in a team
       const team = getTeamForCharacter(state, instanceId);
       if (!team) continue;
@@ -357,6 +370,48 @@ export function getEffectiveStats(
           support += 1;
         }
       }
+
+      // C0090 — Megalino: +3/+0 if controlling 3+ [Sea Monster] characters
+      if (effect.id === 'C0090-E2') {
+        const ownerKingdom = state.players[card.owner].kingdom;
+        const ownerBattlefield = state.players[card.owner].battlefield;
+        let seaMonsterCount = 0;
+        for (const id of [...ownerKingdom, ...ownerBattlefield]) {
+          try {
+            const cDef = getCardDef(state.cards[id]?.defId);
+            if (cDef.cardType === 'character' && (cDef as CharacterCardDef).attributes.includes('Sea Monster')) {
+              seaMonsterCount++;
+            }
+          } catch { /* skip */ }
+        }
+        // Oceanic Abyss E2 — virtual Sea Monster character
+        seaMonsterCount += oceanicAbyssVirtualCharCount(state, card.owner, { attribute: 'Sea Monster' });
+        if (seaMonsterCount >= 3) {
+          lead += 3;
+        }
+      }
+    }
+  }
+
+  // External ongoing buffs from other characters
+  // C0091 — Sea Queen Argelia: Characters named "Krakaan" get +6/+0
+  if (cardMatchesName(charDef, 'Krakaan')) {
+    const ownerKingdom = state.players[card.owner].kingdom;
+    const ownerBattlefield = state.players[card.owner].battlefield;
+    for (const otherId of [...ownerKingdom, ...ownerBattlefield]) {
+      if (otherId === instanceId) continue;
+      const otherCard = state.cards[otherId];
+      if (!otherCard || otherCard.isNegated) continue;
+      try {
+        const otherDef = getCardDef(otherCard.defId);
+        if (otherDef.id !== 'C0091') continue;
+        const otherCharDef = otherDef as CharacterCardDef;
+        const argeliaEffect = otherCharDef.effects.find(e => e.id === 'C0091-E2');
+        if (!argeliaEffect) continue;
+        // Skip if Argelia is injured and effect is not Valid
+        if (otherCard.state === 'injured' && !argeliaEffect.isValid) continue;
+        lead += 6;
+      } catch { /* skip */ }
     }
   }
 
@@ -449,7 +504,85 @@ export function fieldHasName(
   const fieldId = state.players[player].fieldCard;
   if (!fieldId) return false;
   const def = getCardDefForInstance(state, fieldId);
-  return def.name === name;
+  return cardMatchesName(def, name);
+}
+
+/** Check if a card definition matches a given name (checks both name and names[]) */
+export function cardMatchesName(def: { name: string; names?: string[] }, name: string): boolean {
+  if (def.name === name) return true;
+  if (def.names && def.names.includes(name)) return true;
+  return false;
+}
+
+// --- Oceanic Abyss (S0042) Helpers ---
+
+/** Check if a player has S0042 Oceanic Abyss (permanent, not negated) in play */
+export function hasOceanicAbyssInPlay(state: GameState, player: PlayerId): boolean {
+  const kingdom = state.players[player].kingdom;
+  for (const id of kingdom) {
+    const card = state.cards[id];
+    if (!card || card.isNegated) continue;
+    if (card.defId === 'S0042') return true;
+  }
+  return false;
+}
+
+/**
+ * Oceanic Abyss E2 — virtual character count.
+ * Returns 1 if player has S0042 in play and the virtual character matches the filter criteria.
+ * Virtual character is: Water + Terra symbols, [Sea Monster] attribute, MICROMON characteristic.
+ */
+export function oceanicAbyssVirtualCharCount(
+  state: GameState,
+  player: PlayerId,
+  opts?: { attribute?: string; characteristic?: string; symbol?: Symbol }
+): number {
+  if (!hasOceanicAbyssInPlay(state, player)) return 0;
+  if (opts?.attribute && opts.attribute !== 'Sea Monster') return 0;
+  if (opts?.characteristic && opts.characteristic !== 'micromon') return 0;
+  if (opts?.symbol && opts.symbol !== 'water' && opts.symbol !== 'terra') return 0;
+  return 1;
+}
+
+/**
+ * Setup the next essence redirect prompt from the pending queue.
+ * Pops the first valid card from pendingEssenceRedirects, creates a lingering effect,
+ * and sets pendingOptionalEffect for the player.
+ */
+export function setupNextEssenceRedirectPrompt(state: GameState): boolean {
+  while (state.pendingEssenceRedirects && state.pendingEssenceRedirects.length > 0) {
+    const cardId = state.pendingEssenceRedirects.shift()!;
+    const card = state.cards[cardId];
+    // Skip if card is no longer in discard (already moved by another effect)
+    if (!card || card.zone !== 'discard') continue;
+
+    const def = getCardDefForInstance(state, cardId);
+    const lingeringId = `oceanic_abyss_redirect_${cardId}`;
+
+    state.lingeringEffects.push({
+      id: lingeringId,
+      source: cardId,
+      effectDescription: `Move ${def.name} to Essence instead of Discard Pile?`,
+      duration: 'turn',
+      appliedTurn: state.turnNumber,
+      data: { redirectCardId: cardId },
+    });
+
+    state.pendingOptionalEffect = {
+      lingeringEffectId: lingeringId,
+      sourceCardId: cardId,
+      effectId: 'S0042-E1',
+      cardName: 'Oceanic Abyss',
+      effectDescription: `Move ${def.name} to your Essence area instead of the Discard Pile?`,
+      owner: card.owner,
+    };
+
+    return true; // prompt set up
+  }
+
+  // Queue exhausted
+  state.pendingEssenceRedirects = undefined;
+  return false;
 }
 
 // --- Character Attribute Check ---
@@ -518,6 +651,45 @@ export function isProtectedFromCharacterEffects(
   if (!team) return false;
 
   return teamHasCharacterWithAttribute(state, team, 'Slayer', targetId);
+}
+
+// --- Dewzilla Camouflage Check ---
+// C0076 Dewzilla ONGOING: If field is "Micromon Beach", Sea Monster characters
+// in your Essence area gain CAMOUFLAGE (can't be targeted/discarded by opponent).
+
+export function hasEssenceCamouflage(
+  state: GameState,
+  essenceCardId: string,
+): boolean {
+  const card = state.cards[essenceCardId];
+  if (!card || card.zone !== 'essence') return false;
+
+  const def = getCardDefForInstance(state, essenceCardId);
+  if (def.cardType !== 'character') return false;
+
+  const charDef = def as CharacterCardDef;
+  if (!charDef.attributes.includes('Sea Monster')) return false;
+
+  // Check if the card's owner has a non-negated Dewzilla (C0076) in kingdom/battlefield
+  const owner = card.owner;
+  const allInPlay = [
+    ...state.players[owner].kingdom,
+    ...state.players[owner].battlefield,
+  ];
+
+  const hasDewzilla = allInPlay.some((id) => {
+    const c = state.cards[id];
+    if (!c || c.isNegated) return false;
+    try {
+      const d = getCardDefForInstance(state, id);
+      return d.id === 'C0076';
+    } catch { return false; }
+  });
+
+  if (!hasDewzilla) return false;
+
+  // Check if field card is "Micromon Beach"
+  return fieldHasName(state, owner, 'Micromon Beach');
 }
 
 // --- Logging ---

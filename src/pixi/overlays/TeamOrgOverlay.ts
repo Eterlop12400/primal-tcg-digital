@@ -59,9 +59,14 @@ export class TeamOrgOverlay extends Container {
 
     // Per rules 5.4 step 1: all kingdom characters not in a team get their own solo team
     for (const id of pState.kingdom) {
-      if (!teamedIds.has(id)) {
-        this.teams.push({ leadId: id, supportIds: [] });
-      }
+      if (teamedIds.has(id)) continue;
+      const card = state.cards[id];
+      if (!card || card.state === undefined) continue; // skip non-characters (permanent strategies)
+      try {
+        const cDef = getCardDefForInstance(state, id);
+        if (cDef.cardType !== 'character') continue;
+      } catch { continue; }
+      this.teams.push({ leadId: id, supportIds: [] });
     }
 
     // ---- Backdrop with deep overlay ----
@@ -413,9 +418,14 @@ export class TeamOrgOverlay extends Container {
           t.supportIds.forEach((id) => aiTeamedIds.add(id));
         });
         for (const id of state.players[player].kingdom) {
-          if (!aiTeamedIds.has(id)) {
-            this.teams.push({ leadId: id, supportIds: [] });
-          }
+          if (aiTeamedIds.has(id)) continue;
+          const c = state.cards[id];
+          if (!c || c.state === undefined) continue;
+          try {
+            const cDef = getCardDefForInstance(state, id);
+            if (cDef.cardType !== 'character') continue;
+          } catch { continue; }
+          this.teams.push({ leadId: id, supportIds: [] });
         }
         this.activeTeamIdx = null;
         rebuild();

@@ -31,9 +31,77 @@ import {
   fieldHasSymbol,
   fieldHasName,
   cardHasSymbol,
+  oceanicAbyssVirtualCharCount,
 } from '../engine/utils';
-import { getCardDef } from '../cards';
+
 import { getLegalActions } from '../engine/gameLoop';
+
+// ============================================================
+// Helper Functions — Board Evaluation & Utilities
+// ============================================================
+
+function getGamePhase(state: GameState): 'early' | 'mid' | 'late' {
+  const maxTM = Math.max(state.players.player1.turnMarker, state.players.player2.turnMarker);
+  if (maxTM <= 2) return 'early';
+  if (maxTM <= 5) return 'mid';
+  return 'late';
+}
+
+function cardValue(state: GameState, cardId: string): number {
+  const def = getCardDefForInstance(state, cardId);
+  if (def.cardType === 'character') {
+    const cd = def as CharacterCardDef;
+    return cd.healthyStats.lead * 2 + cd.healthyStats.support + cd.turnCost * 0.5 + cd.effects.length * 1.5;
+  }
+  if (def.cardType === 'strategy') {
+    return 5 + (def as StrategyCardDef).effects.length;
+  }
+  if (def.cardType === 'ability') {
+    return 4 + (def as AbilityCardDef).effects.length;
+  }
+  return 3;
+}
+
+function evaluateBoard(state: GameState, player: PlayerId): number {
+  const ps = state.players[player];
+  const opponent = getOpponent(player);
+  const ops = state.players[opponent];
+  let score = 0;
+
+  // Character stats on board (kingdom + battlefield)
+  const myChars = [...ps.kingdom, ...ps.battlefield];
+  for (const id of myChars) {
+    const card = state.cards[id];
+    if (!card || card.state === undefined) continue; // not a character
+    const stats = getEffectiveStats(state, id);
+    const statScore = stats.lead * 2 + stats.support;
+    score += card.state === 'injured' ? statScore * 0.6 : statScore;
+  }
+
+  // Essence count
+  score += ps.essence.length * 0.8;
+
+  // Hand size (diminishing returns above 5)
+  score += Math.min(ps.hand.length, 5) * 0.5 + Math.max(0, ps.hand.length - 5) * 0.2;
+
+  // Battle Reward differential (opponent BRs is good for us — we're winning)
+  score += ops.battleRewards.length * 3.0;
+  score -= ps.battleRewards.length * 3.0;
+
+  // Turn marker advantage
+  score += (ps.turnMarker - ops.turnMarker) * 0.5;
+
+  // Deck-out danger
+  if (ps.deck.length <= 5) score -= (6 - ps.deck.length) * 1.5;
+
+  // Permanent strategies in play
+  for (const id of ps.kingdom) {
+    const def = getCardDefForInstance(state, id);
+    if (def.cardType === 'strategy') score += 2;
+  }
+
+  return score;
+}
 
 export function getAIAction(state: GameState, player: PlayerId): PlayerAction {
   const phase = state.phase;
@@ -75,50 +143,50 @@ export function getAIAction(state: GameState, player: PlayerId): PlayerAction {
 
 function decideMulligan(state: GameState, player: PlayerId): PlayerAction {
   const hand = state.players[player].hand;
+
+  // Score each card for opening hand quality
+  const scored = hand.map((cardId) => {
+    const def = getCardDefForInstance(state, cardId);
+    let score = 3; // default
+
+    if (def.cardType === 'character') {
+      const cd = def as CharacterCardDef;
+      if (cd.turnCost === 0) score = 8;
+      else if (cd.turnCost <= 2) score = 5;
+      else if (cd.turnCost <= 3) score = 3;
+      else score = 1;
+      // Bonus for put-in-play triggers
+      if (cd.effects.some((e) => e.type === 'trigger' && e.triggerCondition?.includes('put-in-play'))) score += 1;
+    } else if (def.cardType === 'strategy') {
+      const sd = def as StrategyCardDef;
+      score = sd.turnCost <= 2 ? 4 : 2;
+    } else if (def.cardType === 'ability') {
+      score = 2;
+    }
+    return { id: cardId, score };
+  });
+
+  // Check if we have any 0-cost characters
+  const hasZeroCost = scored.some((s) => {
+    const def = getCardDefForInstance(state, s.id);
+    return def.cardType === 'character' && (def as CharacterCardDef).turnCost === 0;
+  });
+
+  scored.sort((a, b) => a.score - b.score);
+
   const cardsToReturn: string[] = [];
 
-  // Count how many 0-cost characters we have (early game plays)
-  let zeroCostCount = 0;
-  let highCostCount = 0;
-
-  for (const cardId of hand) {
-    const def = getCardDefForInstance(state, cardId);
-    if (def.cardType === 'character') {
-      const charDef = def as CharacterCardDef;
-      if (charDef.turnCost === 0) zeroCostCount++;
-      if (charDef.turnCost >= 4) highCostCount++;
+  if (!hasZeroCost) {
+    // No early plays — return up to 3 lowest scored cards
+    for (const s of scored) {
+      if (cardsToReturn.length >= 3) break;
+      if (s.score <= 3) cardsToReturn.push(s.id);
     }
-  }
-
-  // If we have no 0-cost characters, mulligan the most expensive cards
-  if (zeroCostCount === 0) {
-    // Return up to 3 high-cost cards
-    let returned = 0;
-    for (const cardId of hand) {
-      if (returned >= 3) break;
-      const def = getCardDefForInstance(state, cardId);
-      if (def.cardType === 'character') {
-        const charDef = def as CharacterCardDef;
-        if (charDef.turnCost >= 4) {
-          cardsToReturn.push(cardId);
-          returned++;
-        }
-      }
-    }
-  }
-  // If hand is all high cost, return some
-  else if (highCostCount >= 4) {
-    let returned = 0;
-    for (const cardId of hand) {
-      if (returned >= 2) break;
-      const def = getCardDefForInstance(state, cardId);
-      if (def.cardType === 'character') {
-        const charDef = def as CharacterCardDef;
-        if (charDef.turnCost >= 4) {
-          cardsToReturn.push(cardId);
-          returned++;
-        }
-      }
+  } else {
+    // Have early plays — return high-cost clunkers (score ≤ 2, up to 2)
+    const highCost = scored.filter((s) => s.score <= 2);
+    if (highCost.length >= 3) {
+      cardsToReturn.push(highCost[0].id, highCost[1].id);
     }
   }
 
@@ -183,6 +251,19 @@ function chooseSummon(
 ): PlayerAction | null {
   const playerState = state.players[player];
   const hand = playerState.hand;
+  const phase = getGamePhase(state);
+
+  // Gather kingdom character attributes for synergy scoring
+  const kingdomAttrs: string[] = [];
+  const kingdomChars: string[] = [];
+  for (const id of playerState.kingdom) {
+    const d = getCardDefForInstance(state, id);
+    if (d.cardType === 'character') {
+      const cd = d as CharacterCardDef;
+      kingdomAttrs.push(...cd.attributes, ...cd.characteristics);
+      kingdomChars.push(id);
+    }
+  }
 
   // Find all summonable characters, pick the best one
   const summonable: { id: string; score: number }[] = [];
@@ -194,6 +275,15 @@ function chooseSummon(
     const charDef = def as CharacterCardDef;
     if (charDef.turnCost > playerState.turnMarker) continue;
 
+    // Check Unique characteristic
+    if (charDef.characteristics.includes('unique')) {
+      const inPlay = [...playerState.kingdom, ...playerState.battlefield].some((id) => {
+        const d = getCardDefForInstance(state, id);
+        return d.printNumber === charDef.printNumber;
+      });
+      if (inPlay) continue;
+    }
+
     // Check hand cost affordability
     if (charDef.handCost > 0) {
       const matchingInHand = hand.filter((id) => {
@@ -204,9 +294,36 @@ function chooseSummon(
       if (matchingInHand.length < charDef.handCost) continue;
     }
 
-    // Score: prefer higher stats, consider turn cost value
+    // Base: stats
     const stats = charDef.healthyStats;
-    const score = stats.lead * 2 + stats.support + charDef.effects.length * 2;
+    let score = stats.lead * 2 + stats.support;
+
+    // Effect type weighting
+    for (const eff of charDef.effects) {
+      if (eff.type === 'trigger' && eff.triggerCondition?.includes('put-in-play')) score += 3;
+      else if (eff.type === 'ongoing') score += 2;
+      else if (eff.type === 'activate') score += 2.5;
+      else score += 1;
+    }
+
+    // Kingdom synergy: shared attributes/characteristics
+    const myTraits = [...charDef.attributes, ...charDef.characteristics];
+    for (const trait of myTraits) {
+      const matches = kingdomAttrs.filter((a) => a === trait).length;
+      score += Math.min(matches, 3) * 0.5;
+    }
+
+    // Phase adjustments
+    if (phase === 'early') {
+      if (charDef.turnCost === 0) score += 2;
+      if (charDef.turnCost >= 4) score -= 2;
+    } else if (phase === 'late') {
+      if (charDef.turnCost >= 3) score += 1.5;
+    }
+
+    // Hand cost penalty
+    score -= charDef.handCost * 1.5;
+
     summonable.push({ id: cardId, score });
   }
 
@@ -264,8 +381,58 @@ function chooseActivateEffect(
       if (effect.turnTiming === 'opponent-turn') continue;
       if (card.state === 'injured' && !effect.isValid) continue;
       if (effect.oncePerTurn && card.usedEffects.includes(effect.id)) continue;
+      // Check name-scoped activate restrictions
+      if (effect.activateScope === 'name-turn' || effect.activateScope === 'name-game') {
+        const nameKey = def.printNumber + ':' + effect.id;
+        if (state.players[player].usedActivateNames.includes(nameKey)) continue;
+      }
 
       // Card-specific cost checks
+      if (def.id === 'C0088') {
+        // Hydroon: needs field "Micromon Beach" + Krakaan in deck
+        if (!fieldHasName(state, player, 'Micromon Beach')) continue;
+        const hasKrakaan = state.players[player].deck.some((id) => {
+          try {
+            const d = getCardDefForInstance(state, id);
+            if (d.cardType !== 'character') return false;
+            return d.name === 'Sea King Krakaan' || (d.names && d.names.includes('Krakaan'));
+          } catch { return false; }
+        });
+        if (!hasKrakaan) continue;
+
+        return {
+          type: 'activate-effect',
+          cardInstanceId: card.instanceId,
+          effectId: effect.id,
+        };
+      }
+
+      if (def.id === 'C0075') {
+        // Aquaconda: needs 3+ other MICROMON + field is Micromon Beach + opponent has essence
+        const opponent = getOpponent(player);
+        if (state.players[opponent].essence.length === 0) continue;
+        if (!fieldHasName(state, player, 'Micromon Beach')) continue;
+        const allInPlay = [
+          ...getCardsInZone(state, player, 'kingdom'),
+          ...getCardsInZone(state, player, 'battlefield'),
+        ];
+        let otherMicromon = allInPlay.filter((c) => {
+          if (c.instanceId === card.instanceId) return false;
+          const d = getCardDefForInstance(state, c.instanceId);
+          if (d.cardType !== 'character') return false;
+          return (d as CharacterCardDef).characteristics.includes('micromon');
+        }).length;
+        // Oceanic Abyss E2 — virtual MICROMON character
+        otherMicromon += oceanicAbyssVirtualCharCount(state, player, { characteristic: 'micromon' });
+        if (otherMicromon < 3) continue;
+
+        return {
+          type: 'activate-effect',
+          cardInstanceId: card.instanceId,
+          effectId: effect.id,
+        };
+      }
+
       if (def.id === 'C0078') {
         // Lucian: needs a Weapon character in hand to discard
         const weaponInHand = state.players[player].hand.filter((id) => {
@@ -299,6 +466,71 @@ function chooseActivateEffect(
     }
   }
 
+  // Check hand cards for activate-from-hand effects (e.g., C0074 Spike, C0090 Megalino)
+  const handCards = state.players[player].hand.map((id) => state.cards[id]).filter(Boolean);
+  for (const card of handCards) {
+    const def = getCardDefForInstance(state, card.instanceId);
+    if (def.cardType !== 'character') continue;
+
+    const charDef = def as CharacterCardDef;
+    for (const effect of charDef.effects) {
+      if (effect.type !== 'activate') continue;
+      if (effect.timing !== 'main' && effect.timing !== 'both') continue;
+      const isExpelFromHand = effect.costDescription?.toLowerCase().includes('expel this card from your hand');
+      const isPutInPlayFromHand = effect.effectDescription?.toLowerCase().includes('from your hand in play');
+      if (!isExpelFromHand && !isPutInPlayFromHand) continue;
+      if (effect.oncePerTurn && card.usedEffects.includes(effect.id)) continue;
+      // Check name-scoped activate restrictions
+      if (effect.activateScope === 'name-turn' || effect.activateScope === 'name-game') {
+        const nameKey = def.printNumber + ':' + effect.id;
+        if (state.players[player].usedActivateNames.includes(nameKey)) continue;
+      }
+
+      if (def.id === 'C0074') {
+        // Spike: needs 3+ MICROMON characters in kingdom/battlefield
+        const allInPlay = [
+          ...getCardsInZone(state, player, 'kingdom'),
+          ...getCardsInZone(state, player, 'battlefield'),
+        ];
+        let micromonCount = allInPlay.filter((c) => {
+          const d = getCardDefForInstance(state, c.instanceId);
+          if (d.cardType !== 'character') return false;
+          return (d as CharacterCardDef).characteristics.includes('micromon');
+        }).length;
+        // Oceanic Abyss E2 — virtual MICROMON character
+        micromonCount += oceanicAbyssVirtualCharCount(state, player, { characteristic: 'micromon' });
+
+        if (micromonCount >= 3) {
+          return {
+            type: 'activate-effect',
+            cardInstanceId: card.instanceId,
+            effectId: effect.id,
+          };
+        }
+      }
+
+      if (def.id === 'C0090') {
+        // Megalino: needs a character named "Krakaan" in kingdom/battlefield
+        const allInPlay = [
+          ...getCardsInZone(state, player, 'kingdom'),
+          ...getCardsInZone(state, player, 'battlefield'),
+        ];
+        const hasKrakaan = allInPlay.some((c) => {
+          const d = getCardDefForInstance(state, c.instanceId);
+          return d.name === 'Sea King Krakaan' || (d.names && d.names.includes('Krakaan'));
+        });
+
+        if (hasKrakaan) {
+          return {
+            type: 'activate-effect',
+            cardInstanceId: card.instanceId,
+            effectId: effect.id,
+          };
+        }
+      }
+    }
+  }
+
   // Check player's field card for activate effects
   const fieldCardId = state.players[player].fieldCard;
   if (fieldCardId) {
@@ -319,11 +551,13 @@ function chooseActivateEffect(
               ...getCardsInZone(state, player, 'kingdom'),
               ...getCardsInZone(state, player, 'battlefield'),
             ];
-            const terraWaterCount = allInPlay.filter((c) => {
+            let terraWaterCount = allInPlay.filter((c) => {
               const d = getCardDefForInstance(state, c.instanceId);
               if (d.cardType !== 'character') return false;
               return d.symbols.includes('terra') || d.symbols.includes('water');
             }).length;
+            // Oceanic Abyss E2 — virtual Water+Terra character
+            terraWaterCount += oceanicAbyssVirtualCharCount(state, player);
 
             if (terraWaterCount < 2) continue;
 
@@ -345,6 +579,70 @@ function chooseActivateEffect(
               effectSubChoice: choice,
             };
           }
+        }
+      }
+    }
+  }
+
+  // Check essence cards for activate-from-essence effects (e.g., S0044 Unknown Pathway)
+  const essenceCards = state.players[player].essence.map((id) => state.cards[id]).filter(Boolean);
+  for (const card of essenceCards) {
+    const def = getCardDefForInstance(state, card.instanceId);
+    if (def.cardType !== 'strategy') continue;
+
+    const stratDef = def as StrategyCardDef;
+    for (const effect of stratDef.effects) {
+      if (effect.type !== 'activate') continue;
+      const isExpelFromEssence = effect.costDescription?.toLowerCase().includes('expel this card from your essence');
+      if (!isExpelFromEssence) continue;
+      if (effect.timing === 'main' && state.phase !== 'main') continue;
+      if (effect.oncePerTurn && card.usedEffects.includes(effect.id)) continue;
+      // Check name-scoped activate restrictions
+      if (effect.activateScope === 'name-turn' || effect.activateScope === 'name-game') {
+        const nameKey = def.printNumber + ':' + effect.id;
+        if (state.players[player].usedActivateNames.includes(nameKey)) continue;
+      }
+
+      // Check turn timing
+      const isTurnPlayer = state.currentTurn === player;
+      if (effect.turnTiming === 'your-turn' && !isTurnPlayer) continue;
+      if (effect.turnTiming === 'opponent-turn' && isTurnPlayer) continue;
+
+      if (def.id === 'S0044') {
+        // S0044-E2: Remove 1 counter — prefer removing opponent's plus-one counters
+        const opponent = getOpponent(player);
+        const opKingdom = state.players[opponent].kingdom;
+        const opBattlefield = state.players[opponent].battlefield;
+        let bestTarget: string | null = null;
+
+        // First priority: opponent cards with permanent or plus-one counters
+        for (const id of [...opKingdom, ...opBattlefield]) {
+          const c = state.cards[id];
+          if (c && c.counters.length > 0) {
+            bestTarget = id;
+            break;
+          }
+        }
+
+        if (!bestTarget) {
+          // No opponent targets — check own cards for minus-one counters to remove
+          const myKingdom = state.players[player].kingdom;
+          const myBattlefield = state.players[player].battlefield;
+          for (const id of [...myKingdom, ...myBattlefield]) {
+            const c = state.cards[id];
+            if (c && c.counters.some((ct) => ct.type === 'minus-one')) {
+              bestTarget = id;
+              break;
+            }
+          }
+        }
+
+        if (bestTarget) {
+          return {
+            type: 'activate-effect',
+            cardInstanceId: card.instanceId,
+            effectId: effect.id,
+          };
         }
       }
     }
@@ -390,23 +688,63 @@ function chooseStrategy(
       if (inPlay) continue;
     }
 
-    // Card-specific priority
+    // Dynamic game-state-aware priority scoring
+    const phase = getGamePhase(state);
+    const opponentState = state.players[getOpponent(player)];
+    const kingdomCharCount = playerState.kingdom.filter((id) => {
+      const d = getCardDefForInstance(state, id);
+      return d.cardType === 'character';
+    }).length;
     let priority = 5;
-    if (def.id === 'S0038') priority = 8;  // Search is high value
-    if (def.id === 'S0039') priority = 7;  // Reaped Fear is good long-term
-    if (def.id === 'S0040') priority = 9;  // Draw 3 is excellent
-    if (def.id === 'S0041') {
-      // Hard Decision: only good if we have expendable characters
+
+    if (def.id === 'S0040') {
+      // Bounty Board: high value when hand is small
+      priority = playerState.hand.length <= 4 ? 10 : 7;
+    } else if (def.id === 'S0038') {
+      // Secret Meeting: great when kingdom is empty
+      priority = kingdomCharCount <= 2 ? 9 : 6;
+    } else if (def.id === 'S0039') {
+      // Reaped Fear: good early, less valuable late
+      priority = phase === 'early' ? 8 : phase === 'mid' ? 6 : 4;
+      const opChars = [...opponentState.kingdom, ...opponentState.battlefield].filter((id) => {
+        const d = getCardDefForInstance(state, id);
+        return d.cardType === 'character';
+      }).length;
+      if (opChars <= 1) priority -= 2;
+    } else if (def.id === 'S0041') {
+      // Hard Decision: good if opponent near winning + we have expendable chars
       const cheapChars = playerState.kingdom.filter((id) => {
         const d = getCardDefForInstance(state, id);
         if (d.cardType !== 'character') return false;
         return (d as CharacterCardDef).turnCost === 0;
       });
-      if (cheapChars.length > 2) {
+      if (opponentState.battleRewards.length >= 8 && cheapChars.length > 0) {
+        priority = 9;
+      } else if (cheapChars.length > 2) {
         priority = 6;
       } else {
         priority = 2;
       }
+    } else if (def.id === 'S0043') {
+      // Heavy Storm: good when opponent has essence
+      const opEss = opponentState.essence.length;
+      priority = opEss >= 3 ? 7 : opEss >= 1 ? 5 : 2;
+    } else if (def.id === 'S0042') {
+      // Oceanic Abyss: strong early/mid, less late
+      priority = phase === 'late' ? 5 : 8;
+    } else if (def.id === 'S0044') {
+      // Unknown Pathway: only play if field has terra and deck has 3+ cards
+      if (!fieldHasSymbol(state, player, 'terra')) continue;
+      if (state.players[player].deck.length < 3) continue;
+      priority = playerState.hand.length <= 4 ? 8 : 6;
+    } else if (def.id === 'S0037') {
+      // Dangerous Waters: good if Sea Monster in essence
+      const hasSeaMonster = playerState.essence.some((id) => {
+        const d = getCardDefForInstance(state, id);
+        if (d.cardType !== 'character') return false;
+        return (d as CharacterCardDef).characteristics.includes('sea monster');
+      });
+      priority = hasSeaMonster ? 7 : 1;
     }
 
     playable.push({ id: cardId, priority });
@@ -456,39 +794,55 @@ function chooseCharge(
   state: GameState,
   player: PlayerId
 ): PlayerAction | null {
-  const hand = state.players[player].hand;
-  const essenceCount = state.players[player].essence.length;
+  const ps = state.players[player];
+  const hand = ps.hand;
 
-  // Only charge if we have enough cards and need essence for abilities later
-  if (hand.length <= 3) return null; // Keep cards in hand
-  if (essenceCount >= 6) return null; // Enough essence already
+  if (hand.length <= 3) return null;
+  if (ps.essence.length >= 6) return null;
 
-  // Charge duplicate low-cost characters or cards we have 3+ of in hand
-  const cardCounts: Record<string, string[]> = {};
+  // Count copies of each card in hand for duplicate scoring
+  const cardCounts: Record<string, number> = {};
   for (const id of hand) {
     const def = getCardDefForInstance(state, id);
-    if (!cardCounts[def.id]) cardCounts[def.id] = [];
-    cardCounts[def.id].push(id);
+    cardCounts[def.id] = (cardCounts[def.id] || 0) + 1;
   }
 
-  // Find duplicates to charge
-  const toCharge: string[] = [];
-  for (const [defId, ids] of Object.entries(cardCounts)) {
-    if (ids.length >= 2) {
-      // Keep 1, charge extras
-      const def = getCardDef(defId);
-      if (def.cardType === 'character') {
-        const charDef = def as CharacterCardDef;
-        // Don't charge our only high-value characters
-        if (charDef.turnCost <= 2 || ids.length >= 3) {
-          toCharge.push(ids[ids.length - 1]); // charge one copy
-        }
+  // Score every hand card
+  const scored = hand.map((id) => {
+    let value = cardValue(state, id);
+    const def = getCardDefForInstance(state, id);
+
+    // Playability: turn cost too high → less valuable in hand
+    if (def.cardType === 'character') {
+      const cd = def as CharacterCardDef;
+      if (cd.turnCost > ps.turnMarker + 2) value *= 0.5;
+      // Unique already in play → worthless
+      if (cd.characteristics.includes('unique')) {
+        const inPlay = [...ps.kingdom, ...ps.battlefield].some((kid) => {
+          const kd = getCardDefForInstance(state, kid);
+          return kd.printNumber === cd.printNumber;
+        });
+        if (inPlay) value = 0;
       }
     }
-  }
 
-  if (toCharge.length > 0) {
-    return { type: 'charge-essence', cardInstanceIds: [toCharge[0]] };
+    // Duplicate discount
+    const copies = cardCounts[def.id] || 1;
+    if (copies >= 3) value *= 0.4;
+    else if (copies >= 2) value *= 0.6;
+
+    // Abilities without essence to pay → less useful
+    if (def.cardType === 'ability' && ps.essence.length < 2) value *= 0.7;
+
+    return { id, value };
+  });
+
+  scored.sort((a, b) => a.value - b.value);
+
+  // Charge the lowest-value card if it's low enough or hand is big
+  const lowest = scored[0];
+  if (lowest.value < 4 || hand.length > 5) {
+    return { type: 'charge-essence', cardInstanceIds: [lowest.id] };
   }
 
   return null;
@@ -506,23 +860,53 @@ function decideOrganization(state: GameState, player: PlayerId): PlayerAction {
 
   if (existingTeams.length > 0) {
     // Teams already organized — choose battle or end
-    // First turn of the game must skip to End Phase
     if (state.turnNumber === 0) {
       return { type: 'choose-battle-or-end', choice: 'end' };
     }
 
-    // Choose battle if we have teams with characters
-    // (can't use calculateTeamPower here since chars are in kingdom, not battlefield)
     const hasCharacters = existingTeams.some((t) =>
       t.characterIds.some((id) => {
         const card = getCard(state, id);
         return card && (card.zone === 'kingdom' || card.zone === 'battlefield');
       })
     );
-    if (hasCharacters) {
+    if (!hasCharacters) {
+      return { type: 'choose-battle-or-end', choice: 'end' };
+    }
+
+    // Compare our total team power vs opponent's
+    const opponent = getOpponent(player);
+    const opponentTeams = Object.values(state.teams).filter((t) => t.owner === opponent);
+
+    let ourPower = 0;
+    let opPower = 0;
+    let ourMaxTeam = 0;
+    for (const t of existingTeams) {
+      const p = estimateTeamPower(state, t);
+      ourPower += p;
+      if (p > ourMaxTeam) ourMaxTeam = p;
+    }
+    for (const t of opponentTeams) {
+      opPower += estimateTeamPower(state, t);
+    }
+
+    // Always battle if opponent is near winning (BR ≥ 8)
+    const opponentBR = state.players[player].battleRewards.length; // our BR pile = opponent's earned
+    if (opponentBR >= 8) {
       return { type: 'choose-battle-or-end', choice: 'battle' };
     }
-    return { type: 'choose-battle-or-end', choice: 'end' };
+
+    // Always battle if we have more teams than opponent can block (overflow = free BRs)
+    if (existingTeams.length > opponentTeams.length + 1) {
+      return { type: 'choose-battle-or-end', choice: 'battle' };
+    }
+
+    // Skip battle if significantly weaker and no strong team
+    if (ourPower < opPower * 0.6 && ourMaxTeam < 5) {
+      return { type: 'choose-battle-or-end', choice: 'end' };
+    }
+
+    return { type: 'choose-battle-or-end', choice: 'battle' };
   }
 
   const kingdom = getCardsInZone(state, player, 'kingdom').filter(
@@ -550,57 +934,80 @@ function buildTeams(
   player: PlayerId,
   characters: CardInstance[]
 ): string[][] {
-  // Sort by lead value (highest lead = team lead candidates)
+  if (characters.length <= 3) {
+    // Small board: one team, best lead first
+    const sorted = [...characters].sort((a, b) => {
+      const aStats = getEffectiveStats(state, a.instanceId);
+      const bStats = getEffectiveStats(state, b.instanceId);
+      return bStats.lead - aStats.lead;
+    });
+    return [sorted.map((c) => c.instanceId)];
+  }
+
+  // Sort by lead value to pick leaders
   const sorted = [...characters].sort((a, b) => {
     const aStats = getEffectiveStats(state, a.instanceId);
     const bStats = getEffectiveStats(state, b.instanceId);
     return bStats.lead - aStats.lead;
   });
 
-  const teams: string[][] = [];
-  const assigned = new Set<string>();
+  // Pick top N as leaders (3 teams if 6+ chars, 2 if 4-5)
+  const numTeams = characters.length >= 6 ? 3 : 2;
+  const leaders = sorted.slice(0, numTeams);
+  const remaining = sorted.slice(numTeams);
 
-  // Build up to 3 teams
-  for (const char of sorted) {
-    if (assigned.has(char.instanceId)) continue;
-    if (teams.length >= 3) break;
+  const teams: string[][] = leaders.map((l) => [l.instanceId]);
+  const assigned = new Set<string>(leaders.map((l) => l.instanceId));
 
-    const team: string[] = [char.instanceId];
-    assigned.add(char.instanceId);
+  // Assign supports by synergy score with leader
+  for (const support of remaining) {
+    if (assigned.has(support.instanceId)) continue;
 
-    // Find good support members (high support value)
-    const supports = sorted
-      .filter((c) => !assigned.has(c.instanceId))
-      .sort((a, b) => {
-        const aStats = getEffectiveStats(state, a.instanceId);
-        const bStats = getEffectiveStats(state, b.instanceId);
-        // Prefer high support value
-        let aScore = aStats.support;
-        let bScore = bStats.support;
+    const sDef = getCardDefForInstance(state, support.instanceId);
+    const sStats = getEffectiveStats(state, support.instanceId);
+    const sCharDef = sDef.cardType === 'character' ? (sDef as CharacterCardDef) : null;
 
-        // Bonus for Rosita synergy (Mercenary/Slayer teamups)
-        if (getCardDefForInstance(state, a.instanceId).id === 'C0086') aScore += 3;
-        if (getCardDefForInstance(state, b.instanceId).id === 'C0086') bScore += 3;
+    let bestTeamIdx = 0;
+    let bestScore = -Infinity;
 
-        return bScore - aScore;
-      });
+    for (let i = 0; i < teams.length; i++) {
+      if (teams[i].length >= 3) continue;
 
-    // Add up to 2 supports
-    for (const support of supports) {
-      if (team.length >= 3) break;
-      team.push(support.instanceId);
-      assigned.add(support.instanceId);
+      const leadId = teams[i][0];
+      const leadDef = getCardDefForInstance(state, leadId);
+      const leadCharDef = leadDef.cardType === 'character' ? (leadDef as CharacterCardDef) : null;
+
+      let synergy = sStats.support;
+
+      // Shared attributes/characteristics bonus
+      if (sCharDef && leadCharDef) {
+        const sTraits = [...sCharDef.attributes, ...sCharDef.characteristics];
+        const lTraits = [...leadCharDef.attributes, ...leadCharDef.characteristics];
+        for (const trait of sTraits) {
+          if (lTraits.includes(trait)) synergy += 1.5;
+        }
+
+        // Rosita C0086 bonus when teamed with Mercenary/Slayer
+        if (sDef.id === 'C0086') {
+          if (leadCharDef.attributes.includes('Mercenary') || leadCharDef.attributes.includes('Slayer')) synergy += 3;
+        }
+        if (leadDef.id === 'C0086') {
+          if (sCharDef.attributes.includes('Mercenary') || sCharDef.attributes.includes('Slayer')) synergy += 3;
+        }
+
+        // Omtaba C0082 bonus when teamed with Slayer
+        if (sDef.id === 'C0082' && leadCharDef.attributes.includes('Slayer')) synergy += 2;
+        if (leadDef.id === 'C0082' && sCharDef.attributes.includes('Slayer')) synergy += 2;
+      }
+
+      if (synergy > bestScore) {
+        bestScore = synergy;
+        bestTeamIdx = i;
+      }
     }
 
-    teams.push(team);
-  }
-
-  // Any remaining characters go in their own teams
-  for (const char of sorted) {
-    if (!assigned.has(char.instanceId)) {
-      teams.push([char.instanceId]);
-      assigned.add(char.instanceId);
-    }
+    teams[bestTeamIdx].push(support.instanceId);
+    assigned.add(support.instanceId);
   }
 
   return teams;
@@ -619,31 +1026,78 @@ function decideAttackers(state: GameState, player: PlayerId): PlayerAction {
     return { type: 'select-attackers', teamIds: [] };
   }
 
-  // Estimate team power (chars are in kingdom, not battlefield yet)
-  const teamPowers = playerTeams.map((t) => ({
-    team: t,
-    power: estimateTeamPower(state, t),
-  }));
+  const opponent = getOpponent(player);
+  const opTeams = Object.values(state.teams).filter((t) => t.owner === opponent);
+  const phase = getGamePhase(state);
 
-  // Send teams with power > 0 to attack (up to 3)
-  const attacking = teamPowers
-    .filter((tp) => tp.power > 0)
-    .sort((a, b) => b.power - a.power)
-    .slice(0, 3)
-    .map((tp) => tp.team.id);
+  // Score each team for attacking
+  const teamScores = playerTeams.map((t) => {
+    const power = estimateTeamPower(state, t);
+    let attackValue = power;
 
-  return { type: 'select-attackers', teamIds: attacking };
+    // Injured character risk
+    for (const cid of t.characterIds) {
+      const card = state.cards[cid];
+      if (card?.state === 'injured') attackValue -= 1;
+    }
+
+    // Sent-to-attack trigger bonus
+    for (const cid of t.characterIds) {
+      const def = getCardDefForInstance(state, cid);
+      if (def.cardType !== 'character') continue;
+      const charDef = def as CharacterCardDef;
+      if (charDef.effects.some((e) => e.type === 'trigger' && e.triggerCondition?.includes('sent-to-attack'))) {
+        attackValue += 1.5;
+      }
+    }
+
+    return { team: t, power, attackValue };
+  }).filter((tp) => tp.power > 0);
+
+  teamScores.sort((a, b) => b.attackValue - a.attackValue);
+
+  // Overflow strategy: if we have more teams than opponent can block, send extras for free BRs
+  const opBlockerCount = opTeams.length;
+  let maxToSend = Math.min(teamScores.length, 3);
+
+  // If we can overflow, send at least opBlockerCount + 1
+  if (teamScores.length > opBlockerCount) {
+    maxToSend = Math.min(teamScores.length, 3);
+  }
+
+  // Evaluate: compare our weakest potential attacker vs opponent's strongest blocker
+  const opBestPower = opTeams.length > 0
+    ? Math.max(...opTeams.map((t) => estimateTeamPower(state, t)))
+    : 0;
+
+  const selected: string[] = [];
+  for (const ts of teamScores) {
+    if (selected.length >= maxToSend) break;
+
+    // Skip weak teams that would lose unless we're overflowing
+    if (ts.power < opBestPower && selected.length >= opBlockerCount) {
+      // This would be an overflow team — free BR if unblocked, okay to send
+      selected.push(ts.team.id);
+    } else if (ts.power >= opBestPower * 0.7 || selected.length < opBlockerCount) {
+      selected.push(ts.team.id);
+    }
+  }
+
+  // Late game: always send at least one team
+  if (selected.length === 0 && phase === 'late' && teamScores.length > 0) {
+    selected.push(teamScores[0].team.id);
+  }
+
+  return { type: 'select-attackers', teamIds: selected };
 }
 
 function decideBlockers(state: GameState, player: PlayerId): PlayerAction {
   const opponent = getOpponent(player);
 
-  // Find attacking teams (these are on the battlefield now)
   const attackingTeams = Object.values(state.teams).filter(
     (t) => t.owner === opponent && t.isAttacking
   );
 
-  // Find our available teams (still in kingdom)
   const ourTeams = Object.values(state.teams).filter(
     (t) => t.owner === player && !t.isAttacking && !t.isBlocking
   );
@@ -652,36 +1106,128 @@ function decideBlockers(state: GameState, player: PlayerId): PlayerAction {
     return { type: 'select-blockers', assignments: [] };
   }
 
+  // Score the damage of an unblocked attacker
+  function unblockedDamage(attacker: Team): number {
+    const power = calculateTeamPower(state, attacker);
+    // Outstanding BR if power >= 5 → counts as extra bad
+    return power >= 5 ? 6 : 3;
+  }
+
+  // Score for a blocker-vs-attacker matchup (lower = better for us)
+  function matchupDamage(blocker: Team, attacker: Team): number {
+    const bPower = estimateTeamPower(state, blocker);
+    const aPower = calculateTeamPower(state, attacker);
+    if (bPower > aPower) return 0;       // we win
+    if (bPower === aPower) return 1;     // stalemate
+    // we lose — how bad?
+    return aPower >= 5 ? 4 : 2;
+  }
+
+  // Brute-force: for each attacker, try each blocker or "unblocked"
+  // Max combinations: (blockers+1)^attackers — typically ≤ 64
+  const attackerCount = attackingTeams.length;
+  const blockerCount = ourTeams.length;
+
+  // Generate all possible assignment combos
+  // For each attacker: assign blocker index 0..blockerCount-1, or -1 for unblocked
+  const options = blockerCount + 1; // +1 for "no blocker"
+  const totalCombos = Math.pow(options, attackerCount);
+
+  // Cap at reasonable number to prevent lag
+  if (totalCombos > 256) {
+    // Fall back to greedy for large boards
+    return greedyBlock(state, attackingTeams, ourTeams);
+  }
+
+  let bestAssignment: number[] = new Array(attackerCount).fill(-1);
+  let bestDamage = Infinity;
+
+  for (let combo = 0; combo < totalCombos; combo++) {
+    const assignment: number[] = [];
+    let temp = combo;
+    const usedBlockers = new Set<number>();
+    let valid = true;
+
+    for (let a = 0; a < attackerCount; a++) {
+      const blockerIdx = (temp % options) - 1; // -1 = unblocked, 0..n = blocker index
+      temp = Math.floor(temp / options);
+
+      if (blockerIdx >= 0) {
+        if (blockerIdx >= blockerCount || usedBlockers.has(blockerIdx)) {
+          valid = false;
+          break;
+        }
+        usedBlockers.add(blockerIdx);
+      }
+      assignment.push(blockerIdx);
+    }
+
+    if (!valid) continue;
+
+    // Score this assignment
+    let totalDamage = 0;
+    for (let a = 0; a < attackerCount; a++) {
+      if (assignment[a] === -1) {
+        totalDamage += unblockedDamage(attackingTeams[a]);
+      } else {
+        totalDamage += matchupDamage(ourTeams[assignment[a]], attackingTeams[a]);
+      }
+    }
+
+    if (totalDamage < bestDamage) {
+      bestDamage = totalDamage;
+      bestAssignment = assignment;
+    }
+  }
+
+  const assignments: { blockingTeamId: string; attackingTeamId: string }[] = [];
+  for (let a = 0; a < attackerCount; a++) {
+    if (bestAssignment[a] >= 0) {
+      assignments.push({
+        blockingTeamId: ourTeams[bestAssignment[a]].id,
+        attackingTeamId: attackingTeams[a].id,
+      });
+    }
+  }
+
+  return { type: 'select-blockers', assignments };
+}
+
+function greedyBlock(
+  state: GameState,
+  attackingTeams: Team[],
+  ourTeams: Team[]
+): PlayerAction {
   const assignments: { blockingTeamId: string; attackingTeamId: string }[] = [];
   const availableBlockers = [...ourTeams];
 
-  for (const attacker of attackingTeams) {
-    if (availableBlockers.length === 0) break;
+  // Sort attackers by power descending — block strongest first
+  const sortedAttackers = [...attackingTeams].sort(
+    (a, b) => calculateTeamPower(state, b) - calculateTeamPower(state, a)
+  );
 
-    // Attackers are on battlefield so calculateTeamPower works
+  for (const attacker of sortedAttackers) {
+    if (availableBlockers.length === 0) break;
     const attackPower = calculateTeamPower(state, attacker);
 
-    // Find best blocker (use estimate since blockers are in kingdom)
+    // Find cheapest blocker that can win or stalemate
     let bestBlocker: { team: Team; power: number } | null = null;
-
     for (const blocker of availableBlockers) {
       const blockPower = estimateTeamPower(state, blocker);
-
-      // Block if we can win or stalemate
       if (blockPower >= attackPower && (!bestBlocker || blockPower < bestBlocker.power)) {
         bestBlocker = { team: blocker, power: blockPower };
       }
     }
 
-    // Also consider blocking to prevent Outstanding Battle Reward (power >= 5)
+    // Sacrificial block for outstanding BR threats
     if (!bestBlocker && attackPower >= 5) {
-      const sacrificial = availableBlockers[0];
-      if (sacrificial) {
-        bestBlocker = {
-          team: sacrificial,
-          power: estimateTeamPower(state, sacrificial),
-        };
+      // Pick weakest blocker as sacrifice
+      let weakest: { team: Team; power: number } | null = null;
+      for (const blocker of availableBlockers) {
+        const p = estimateTeamPower(state, blocker);
+        if (!weakest || p < weakest.power) weakest = { team: blocker, power: p };
       }
+      bestBlocker = weakest;
     }
 
     if (bestBlocker) {
@@ -740,76 +1286,157 @@ function chooseAbility(
   const hand = state.players[player].hand;
   const battlefield = getCardsInZone(state, player, 'battlefield');
   const opponent = getOpponent(player);
-  const opponentBattlefield = getCardsInZone(state, opponent, 'battlefield');
 
-  // Find playable abilities
+  // Collect all valid ability plays with scores
+  interface AbilityCandidate {
+    cardId: string;
+    userId: string;
+    targetIds?: string[];
+    essenceCardIds: string[];
+    xValue?: number;
+    score: number;
+  }
+  const candidates: AbilityCandidate[] = [];
+
   for (const cardId of hand) {
     const def = getCardDefForInstance(state, cardId);
     if (def.cardType !== 'ability') continue;
 
     const abilityDef = def as AbilityCardDef;
 
-    // Find a valid user on our battlefield
-    const validUser = battlefield.find((c) => {
-      if (c.state === 'injured') return false; // most abilities aren't Valid
+    // Find ALL valid users on our battlefield (not just the first)
+    const validUsers = battlefield.filter((c) => {
+      if (c.state === 'injured') return false;
       const cDef = getCardDefForInstance(state, c.instanceId) as CharacterCardDef;
       return abilityDef.requirements.every((req) => {
         if (req.type === 'attribute') return cDef.attributes.includes(req.value);
+        if (req.type === 'turn-cost-min') return cDef.turnCost >= parseInt(req.value, 10);
         return true;
       });
     });
 
-    if (!validUser) continue;
+    if (validUsers.length === 0) continue;
 
     // Check essence cost
-    const essence = state.players[player].essence;
     const canPayEssence = checkEssenceCost(state, player, abilityDef);
     if (!canPayEssence.canPay) continue;
 
-    // Find target (opposing characters)
-    let targetIds: string[] | undefined;
-    if (abilityDef.targetDescription?.includes('opposing')) {
-      // Find the user's team and its opposing team
-      const userTeam = Object.values(state.teams).find((t) => t.characterIds.includes(validUser.instanceId));
-      if (!userTeam) continue;
-
-      // Find the opposing team
-      let opposingTeam: typeof userTeam | undefined;
-      if (userTeam.isAttacking && userTeam.blockedByTeamId) {
-        opposingTeam = state.teams[userTeam.blockedByTeamId];
-      } else if (userTeam.isBlocking && userTeam.blockingTeamId) {
-        opposingTeam = state.teams[userTeam.blockingTeamId];
-      }
-      if (!opposingTeam) continue;
-
-      // Only target characters from the opposing team that are on the battlefield
-      const opposingChars = opposingTeam.characterIds.filter(
-        (id) => state.cards[id]?.zone === 'battlefield'
-      );
-      if (opposingChars.length === 0) continue;
-
-      // Target the strongest opposing character
-      const sorted = [...opposingChars].sort((a, b) => {
-        const aStats = getEffectiveStats(state, a);
-        const bStats = getEffectiveStats(state, b);
-        return bStats.lead - aStats.lead;
-      });
-      targetIds = [sorted[0]];
+    // Card-specific pre-play checks
+    if (def.id === 'A0035') {
+      if (state.players[opponent].essence.length === 0) continue;
     }
 
-    return {
-      type: 'play-ability',
-      cardInstanceId: cardId,
-      userId: validUser.instanceId,
-      targetIds,
-      essenceCostCardIds: canPayEssence.cardIds,
-      xValue: abilityDef.essenceCost.x
+    // Try each valid user
+    for (const validUser of validUsers) {
+      // Find target (opposing characters)
+      let targetIds: string[] | undefined;
+      if (abilityDef.targetDescription?.includes('opposing')) {
+        const userTeam = Object.values(state.teams).find((t) => t.characterIds.includes(validUser.instanceId));
+        if (!userTeam) continue;
+
+        let opposingTeam: typeof userTeam | undefined;
+        if (userTeam.isAttacking && userTeam.blockedByTeamId) {
+          opposingTeam = state.teams[userTeam.blockedByTeamId];
+        } else if (userTeam.isBlocking && userTeam.blockingTeamId) {
+          opposingTeam = state.teams[userTeam.blockingTeamId];
+        }
+        if (!opposingTeam) continue;
+
+        const opposingChars = opposingTeam.characterIds.filter(
+          (id) => state.cards[id]?.zone === 'battlefield'
+        );
+        if (opposingChars.length === 0) continue;
+
+        // Target the strongest opposing character
+        const sorted = [...opposingChars].sort((a, b) => {
+          const aStats = getEffectiveStats(state, a);
+          const bStats = getEffectiveStats(state, b);
+          return bStats.lead - aStats.lead;
+        });
+        targetIds = [sorted[0]];
+      }
+
+      // Card-specific post-target checks
+      if (def.id === 'A0039' && targetIds && targetIds.length > 0) {
+        const userStats = getEffectiveStats(state, validUser.instanceId);
+        const targetStats = getEffectiveStats(state, targetIds[0]);
+        if (targetStats.lead >= userStats.lead) continue;
+      }
+
+      // Score this ability play by estimated impact
+      let score = 0;
+      const userStats = getEffectiveStats(state, validUser.instanceId);
+
+      if (def.id === 'A0039') {
+        // Torrential Sludge — removal
+        score = 7;
+        if (targetIds && targetIds.length > 0) {
+          const tStats = getEffectiveStats(state, targetIds[0]);
+          score += tStats.lead * 0.5; // better against strong targets
+        }
+      } else if (def.id === 'A0040') {
+        // Micromon Rage — stat doubling
+        score = userStats.lead * 1.5;
+      } else if (def.id === 'A0035') {
+        // Aquabatics — essence disruption
+        score = 3;
+        // Extra value if their essence loss could swing the BR race
+        const opBR = state.players[player].battleRewards.length; // opponent's earned BRs (on our side)
+        if (opBR >= 6) score += 3;
+      } else if (def.id === 'A0038') {
+        // Swift Strike — pre-showdown damage vs injured target
+        if (targetIds && targetIds.length > 0) {
+          const target = state.cards[targetIds[0]];
+          score = target?.state === 'injured' ? 8 : 5;
+        } else {
+          score = 5;
+        }
+      } else if (def.id === 'A0037') {
+        // Deflection — defensive buff
+        score = 6;
+        // Extra if user is team lead
+        const userTeam = Object.values(state.teams).find((t) => t.characterIds[0] === validUser.instanceId);
+        if (userTeam && userTeam.hasLead) score += 2;
+      } else if (def.id === 'A0036') {
+        // Stake Gun — variable damage
+        score = 4 + canPayEssence.cardIds.length * 0.5;
+      } else {
+        // Generic ability
+        score = 4 + abilityDef.effects.length;
+      }
+
+      // Penalize by essence cost (opportunity cost of spending essence)
+      score -= canPayEssence.cardIds.length * 0.3;
+
+      const xValue = abilityDef.essenceCost.x
         ? Math.max(0, canPayEssence.cardIds.length - abilityDef.essenceCost.specific.reduce((s, c) => s + c.count, 0) - abilityDef.essenceCost.neutral - (abilityDef.essenceCost.cardSymbol ?? 0))
-        : undefined,
-    };
+        : undefined;
+
+      candidates.push({
+        cardId,
+        userId: validUser.instanceId,
+        targetIds,
+        essenceCardIds: canPayEssence.cardIds,
+        xValue,
+        score,
+      });
+    }
   }
 
-  return null;
+  if (candidates.length === 0) return null;
+
+  // Pick the highest-scored ability
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+
+  return {
+    type: 'play-ability',
+    cardInstanceId: best.cardId,
+    userId: best.userId,
+    targetIds: best.targetIds,
+    essenceCostCardIds: best.essenceCardIds,
+    xValue: best.xValue,
+  };
 }
 
 function checkEssenceCost(
@@ -883,21 +1510,44 @@ function decideShowdownOrder(state: GameState, player: PlayerId): PlayerAction {
 // ============================================================
 
 function decideEndPhase(state: GameState, player: PlayerId): PlayerAction {
-  const hand = state.players[player].hand;
+  const ps = state.players[player];
+  const hand = ps.hand;
+  const phase = getGamePhase(state);
 
   if (hand.length > 7) {
-    // Discard lowest value cards
     const scored = hand.map((id) => {
+      let value = cardValue(state, id);
       const def = getCardDefForInstance(state, id);
-      let value = 5; // default
+
+      // Playability penalty: turn cost too far out
       if (def.cardType === 'character') {
         const cd = def as CharacterCardDef;
-        value = cd.healthyStats.lead + cd.healthyStats.support + cd.turnCost;
-      } else if (def.cardType === 'strategy') {
-        value = 6;
-      } else if (def.cardType === 'ability') {
-        value = 4;
+        if (cd.turnCost > ps.turnMarker + 2) value *= 0.5;
+        // Unique already in play → discard it
+        if (cd.characteristics.includes('unique')) {
+          const inPlay = [...ps.kingdom, ...ps.battlefield].some((kid) => {
+            const kd = getCardDefForInstance(state, kid);
+            return kd.printNumber === cd.printNumber;
+          });
+          if (inPlay) value = 0;
+        }
       }
+
+      // Abilities without essence to pay
+      if (def.cardType === 'ability' && ps.essence.length < 2) value *= 0.5;
+
+      // Strategy too expensive
+      if (def.cardType === 'strategy') {
+        const sd = def as StrategyCardDef;
+        if (sd.turnCost > ps.turnMarker + 1) value *= 0.6;
+      }
+
+      // Late game: high-impact cards are more valuable
+      if (phase === 'late' && def.cardType === 'character') {
+        const cd = def as CharacterCardDef;
+        if (cd.healthyStats.lead >= 4) value += 2;
+      }
+
       return { id, value };
     });
 

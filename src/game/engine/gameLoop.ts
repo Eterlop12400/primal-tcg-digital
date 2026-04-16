@@ -25,6 +25,8 @@ import {
   getCardsInZone,
   characterHasAttribute,
   isProtectedFromCharacterEffects,
+  fieldHasName,
+  setupNextEssenceRedirectPrompt,
 } from './utils';
 import { resolveChain, flushPendingTriggers } from './chainResolver';
 
@@ -279,6 +281,62 @@ export function advanceToEndPhase(state: GameState): void {
     }
   }
 
+  // S0037 Dangerous Waters — end-of-turn: if Turn Marker ≤ 4 and target still in play, discard it
+  const dangerousWatersEffects = state.lingeringEffects.filter(
+    (e) => e.id.startsWith('dangerous_waters_')
+  );
+  for (const effect of dangerousWatersEffects) {
+    const targetId = effect.data?.targetId as string | undefined;
+    const effectOwner = effect.data?.owner as PlayerId | undefined;
+    if (targetId && effectOwner) {
+      const targetCard = state.cards[targetId];
+      if (targetCard && (targetCard.zone === 'kingdom' || targetCard.zone === 'battlefield')) {
+        if (state.players[effectOwner].turnMarker <= 4) {
+          const def = getCardDefForInstance(state, targetId);
+          moveCard(state, targetId, 'discard');
+          addLog(state, effectOwner, 'effect', `Dangerous Waters — Discarded ${def.name} (Turn Marker ≤ 4)`);
+        }
+      }
+    }
+  }
+
+  // Check for Oceanic Abyss (S0042) redirects from Dangerous Waters or other end-of-turn discards
+  if (state.pendingEssenceRedirects?.length) {
+    if (setupNextEssenceRedirectPrompt(state)) {
+      return; // Pause — will re-call advanceToEndPhase after redirects processed
+    }
+  }
+
+  // A0040 Micromon Rage — end-of-turn: deal 1 Damage to the user
+  const micromonRageEffects = state.lingeringEffects.filter(
+    (e) => e.id.startsWith('micromon_rage_')
+  );
+  for (const effect of micromonRageEffects) {
+    const targetId = effect.data?.targetId as string | undefined;
+    const effectOwner = effect.data?.owner as PlayerId | undefined;
+    if (targetId && effectOwner) {
+      const targetCard = state.cards[targetId];
+      if (targetCard && (targetCard.zone === 'kingdom' || targetCard.zone === 'battlefield')) {
+        const def = getCardDefForInstance(state, targetId);
+        const result = dealDamage(state, targetId, 1);
+        if (result.discarded) {
+          addLog(state, effectOwner, 'effect', `Micromon Rage — ${def.name} was discarded from the damage`);
+        } else if (result.injured) {
+          addLog(state, effectOwner, 'effect', `Micromon Rage — ${def.name} was injured`);
+        } else {
+          addLog(state, effectOwner, 'effect', `Micromon Rage — Dealt 1 damage to ${def.name}`);
+        }
+      }
+    }
+  }
+
+  // Check for Oceanic Abyss redirects from Micromon Rage discards
+  if (state.pendingEssenceRedirects?.length) {
+    if (setupNextEssenceRedirectPrompt(state)) {
+      return; // Pause — will re-call advanceToEndPhase after redirects processed
+    }
+  }
+
   // Clear "until end of turn" effects and lingering effects
   state.lingeringEffects = state.lingeringEffects.filter(
     (e) => e.duration !== 'until-end-of-turn' && e.duration !== 'turn'
@@ -322,6 +380,7 @@ export function finishEndPhase(state: GameState): void {
   state.players[player].hasSummonedThisTurn = false;
   state.players[player].hasPlayedStrategyThisTurn = false;
   state.players[player].hasUsedRushThisTurn = false;
+  state.players[player].usedActivateNames = [];
 
   // Switch turns
   const nextPlayer = opponent;
@@ -661,29 +720,51 @@ function applyShowdownDamage(
 
   const discardedIds: string[] = [];
 
+  // C0074 Spike the Impaler — ONGOING: +1 showdown damage to opposing team leader
+  // if winning team has Spike and owner's field is "Micromon Beach"
+  let spikeBonus = 0;
+  if (winningTeam) {
+    for (const charId of winningTeam.characterIds) {
+      if (!state.cards[charId] || state.cards[charId].zone !== 'battlefield') continue;
+      try {
+        const cDef = getCardDefForInstance(state, charId);
+        if (cDef.id === 'C0074' && !state.cards[charId].isNegated) {
+          if (fieldHasName(state, winningTeam.owner, 'Micromon Beach')) {
+            spikeBonus++;
+          }
+        }
+      } catch { /* skip */ }
+    }
+    if (spikeBonus > 0) {
+      addLog(state, winningTeam.owner, 'effect', `Spike the Impaler — +${spikeBonus} Showdown Damage to opposing Team Leader`);
+    }
+  }
+
   if (result === 'stalemate' || result === 'victory') {
-    // 1 damage to team lead only
+    // 1 damage to team lead only (+ Spike bonus)
     if (losingTeam.hasLead && charsOnField.includes(losingTeam.characterIds[0])) {
       const leadId = losingTeam.characterIds[0];
-      const dmgResult = dealDamage(state, leadId, 1);
+      const baseDamage = 1 + spikeBonus;
+      const dmgResult = dealDamage(state, leadId, baseDamage);
       addLog(
         state,
         losingTeam.owner,
         'showdown-damage',
-        `${getCardDefForInstance(state, leadId).name} takes 1 damage`
+        `${getCardDefForInstance(state, leadId).name} takes ${baseDamage} damage`
       );
       if (dmgResult.discarded) discardedIds.push(leadId);
     }
   } else if (result === 'outstanding-victory') {
-    // 2 damage to team lead
+    // 2 damage to team lead (+ Spike bonus)
     if (losingTeam.hasLead && charsOnField.includes(losingTeam.characterIds[0])) {
       const leadId = losingTeam.characterIds[0];
-      const dmgResult = dealDamage(state, leadId, 2);
+      const baseDamage = 2 + spikeBonus;
+      const dmgResult = dealDamage(state, leadId, baseDamage);
       addLog(
         state,
         losingTeam.owner,
         'showdown-damage',
-        `${getCardDefForInstance(state, leadId).name} takes 2 damage`
+        `${getCardDefForInstance(state, leadId).name} takes ${baseDamage} damage`
       );
       if (dmgResult.discarded) discardedIds.push(leadId);
     }
@@ -731,6 +812,34 @@ function applyShowdownDamage(
           owner: winningPlayer,
         });
       }
+    }
+  }
+
+  // Check "deals-showdown-damage" triggers on the winning/dealing team
+  // (e.g., C0091 Sea Queen Argelia triggers when her team deals showdown damage)
+  if (winningTeam) {
+    for (const charId of winningTeam.characterIds) {
+      const charCard = state.cards[charId];
+      if (!charCard || charCard.zone !== 'battlefield' || charCard.isNegated) continue;
+      try {
+        const cDef = getCardDefForInstance(state, charId);
+        if (cDef.cardType !== 'character') continue;
+        const charDef = cDef as CharacterCardDef;
+        for (const effect of charDef.effects) {
+          if (effect.type === 'trigger' && effect.triggerCondition === 'deals-showdown-damage') {
+            if (charCard.state === 'injured' && !effect.isValid) continue;
+            state.pendingTriggers.push({
+              id: `trigger_${charId}_${effect.id}`,
+              type: 'trigger-effect',
+              sourceCardInstanceId: charId,
+              effectId: effect.id,
+              resolved: false,
+              negated: false,
+              owner: charCard.owner,
+            });
+          }
+        }
+      } catch { /* skip */ }
     }
   }
 

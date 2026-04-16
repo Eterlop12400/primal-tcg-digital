@@ -11,6 +11,7 @@ import {
   EventCollector,
   getCardDefForInstance,
 } from '@/game/engine';
+import { getDeckConfig } from '@/game/engine/gameSetup';
 import type { AnimationEvent } from '@/game/engine/animationEvents';
 import { getActingPlayer, isHumanTurn } from '@/lib/gameHelpers';
 import { SPEED_PRESETS } from '@/lib/constants';
@@ -44,7 +45,13 @@ export type SelectionMode =
   | { type: 'activate-target-select'; cardId: string; effectId: string; needed: number }
   | { type: 'activate-cost-select'; cardId: string; effectId: string; targetIds: string[]; needed: number; costSource: 'hand' | 'discard' | 'essence'; costDescription?: string }
   // Field card activate effect picker (e.g., Micromon Beach)
-  | { type: 'field-activate-pick'; cardId: string; effectId: string; effects: { index: number; threshold: string; desc: string; available: boolean }[] };
+  | { type: 'field-activate-pick'; cardId: string; effectId: string; effects: { index: number; threshold: string; desc: string; available: boolean }[] }
+  // Card action menu (e.g., Summon vs Activate from hand)
+  | { type: 'card-action-menu'; cardId: string; zone: 'hand' | 'kingdom'; actions: { label: string; description: string; action: 'summon' | 'activate' | 'play-strategy' | 'charge'; effectId?: string }[] }
+  // Strategy target selection (e.g., Hard Decision — pick a character to sacrifice)
+  | { type: 'strategy-target-select'; strategyCardId: string; handCostCardIds: string[]; validTargetIds: string[] }
+  // Essence activation overlay (e.g., Unknown Pathway activate from essence)
+  | { type: 'essence-activate-select'; validCardIds: string[] };
 
 export interface UIState {
   gameState: GameState | null;
@@ -69,7 +76,7 @@ export interface UIState {
 // ============================================================
 
 export type UIAction =
-  | { type: 'INIT_GAME'; mode: GameMode }
+  | { type: 'INIT_GAME'; mode: GameMode; p1Deck?: string; p2Deck?: string }
   | { type: 'SUBMIT_MULLIGAN'; player: PlayerId; cardIds: string[] }
   | { type: 'PERFORM_ACTION'; player: PlayerId; action: PlayerAction }
   | { type: 'SET_SELECTION_MODE'; mode: SelectionMode }
@@ -112,7 +119,7 @@ const initialUIState: UIState = {
 function uiReducer(state: UIState, action: UIAction): UIState {
   switch (action.type) {
     case 'INIT_GAME': {
-      const gameState = createNewGame();
+      const gameState = createNewGame(getDeckConfig(action.p1Deck), getDeckConfig(action.p2Deck));
       const defaultPreset: SpeedPreset = action.mode === 'aivai' ? 'slow' : 'normal';
       const defaultNarration = action.mode === 'aivai';
       return {

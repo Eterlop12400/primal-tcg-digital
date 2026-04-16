@@ -90,6 +90,15 @@ export function canSummonCard(
   // Turn cost must be affordable
   if (charDef.turnCost > playerState.turnMarker) return false;
 
+  // Check Unique characteristic
+  if (charDef.characteristics.includes('unique')) {
+    const hasInPlay = [...playerState.kingdom, ...playerState.battlefield].some((id) => {
+      const d = getCardDefForInstance(state, id);
+      return d.printNumber === charDef.printNumber;
+    });
+    if (hasInPlay) return false;
+  }
+
   // Check hand cost affordability
   if (charDef.handCost > 0) {
     const matchingInHand = playerState.hand.filter((id) => {

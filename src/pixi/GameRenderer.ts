@@ -29,6 +29,9 @@ import { PileViewerOverlay } from './overlays/PileViewerOverlay';
 import { DeckSearchOverlay } from './overlays/DeckSearchOverlay';
 import { EssencePickerOverlay } from './overlays/EssencePickerOverlay';
 import { FieldActivateOverlay } from './overlays/FieldActivateOverlay';
+import { CardActionMenuOverlay } from './overlays/CardActionMenuOverlay';
+import { EssenceActivateOverlay } from './overlays/EssenceActivateOverlay';
+import type { CardAction } from './overlays/CardActionMenuOverlay';
 import { showCardCloseUp } from './effects/CardCloseUp';
 import { showEffectCallout } from './effects/Animations';
 import gsap from 'gsap';
@@ -65,6 +68,8 @@ import {
   getEffectiveStats,
   getLegalActions,
   characterHasAttribute,
+  oceanicAbyssVirtualCharCount,
+  fieldHasSymbol,
 } from '@/game/engine';
 import {
   getActingPlayer,
@@ -302,6 +307,16 @@ export class GameRenderer {
     // Field activate picker overlay (e.g., Micromon Beach)
     if (uiState.selectionMode.type === 'field-activate-pick' && this.dispatch) {
       this.renderFieldActivateOverlay(gameState, uiState);
+    }
+
+    // Card action menu overlay (e.g., Summon vs Activate)
+    if (uiState.selectionMode.type === 'card-action-menu' && this.dispatch) {
+      this.renderCardActionMenu(gameState, uiState);
+    }
+
+    // Essence activate overlay (e.g., Unknown Pathway activate from essence)
+    if (uiState.selectionMode.type === 'essence-activate-select' && this.dispatch) {
+      this.renderEssenceActivateOverlay(gameState, uiState);
     }
 
     // Coin flip overlay (fires once, self-destroys via GSAP)
@@ -800,7 +815,48 @@ export class GameRenderer {
           this.boardLayer.addChild(txt);
         }
 
-        // Clickable area for pile viewer (right-click for full detail)
+        // Check if this is the human player's essence with activatable cards
+        const isHumanEssence = this.currentUIState && player === this.currentUIState.humanPlayer;
+        const activatableEssenceCards = isHumanEssence && this.currentUIState
+          ? this.getActivatableEssenceCards(state, this.currentUIState)
+          : [];
+        const hasActivatable = activatableEssenceCards.length > 0
+          && this.currentUIState?.selectionMode.type === 'none';
+
+        // Glowing border for activatable essence
+        if (hasActivatable) {
+          const glowBorder = new Graphics();
+          glowBorder.roundRect(panelX - 2, cardY - 2, panelW + 4, panelH + 4, 8);
+          glowBorder.stroke({ color: 0xd4a843, width: 2.5, alpha: 0.9 });
+          this.boardLayer.addChild(glowBorder);
+
+          // "ACTIVATE" badge below essence panel
+          const badgeW = 62;
+          const badgeH = 16;
+          const badgeX = panelX + (panelW - badgeW) / 2;
+          const badgeY = cardY + panelH + 2;
+          const badgeBg = new Graphics();
+          badgeBg.roundRect(badgeX, badgeY, badgeW, badgeH, 3);
+          badgeBg.fill({ color: 0xd4a843, alpha: 0.3 });
+          this.boardLayer.addChild(badgeBg);
+
+          const badgeTxt = new Text({
+            text: 'ACTIVATE',
+            style: new TextStyle({
+              fontSize: 9,
+              fill: 0xd4a843,
+              fontFamily: FONT,
+              fontWeight: 'bold',
+              letterSpacing: 1,
+            }),
+          });
+          badgeTxt.anchor.set(0.5, 0.5);
+          badgeTxt.x = badgeX + badgeW / 2;
+          badgeTxt.y = badgeY + badgeH / 2;
+          this.boardLayer.addChild(badgeTxt);
+        }
+
+        // Clickable area for pile viewer (right-click) and essence activate (left-click)
         const hitArea = new Graphics();
         hitArea.roundRect(panelX, cardY, panelW, panelH, 6);
         hitArea.fill({ color: 0x000000, alpha: 0.001 });
@@ -810,6 +866,15 @@ export class GameRenderer {
           if (e.button === 2) {
             e.preventDefault?.();
             this.showPileViewer('ESSENCE', pile.allIds!);
+          } else if (hasActivatable && this.dispatch && this.currentUIState) {
+            // Left-click opens essence activate overlay
+            this.dispatch({
+              type: 'SET_SELECTION_MODE',
+              mode: {
+                type: 'essence-activate-select',
+                validCardIds: activatableEssenceCards.map((c) => c.instanceId),
+              },
+            });
           }
         });
         this.boardLayer.addChild(hitArea);
@@ -1138,14 +1203,17 @@ export class GameRenderer {
         const isInjured = inst.state === 'injured';
         const smType = this.currentUIState?.selectionMode.type;
         const isTargetMode = !!(this.currentUIState &&
-          (smType === 'ability-target-select' || smType === 'activate-target-select'));
+          (smType === 'ability-target-select' || smType === 'activate-target-select' || smType === 'strategy-target-select'));
         const isUserSelectMode = !!(this.currentUIState && smType === 'ability-user-select');
         const isKingdomSelected = this.currentUIState?.selectedCardIds.includes(cid) ?? false;
 
         // Determine if this card should be highlighted as a valid target
         let isKingdomHighlighted = false;
         if ((isTargetMode || isUserSelectMode) && (inst.zone === 'battlefield' || inst.zone === 'kingdom')) {
-          if (isTargetMode && smType === 'ability-target-select') {
+          if (isTargetMode && smType === 'strategy-target-select') {
+            const sm3 = this.currentUIState!.selectionMode as { type: 'strategy-target-select'; validTargetIds: string[] };
+            isKingdomHighlighted = sm3.validTargetIds.includes(cid);
+          } else if (isTargetMode && smType === 'ability-target-select') {
             // Check if ability requires opposing targets — only highlight valid opposing chars
             const sm2 = this.currentUIState!.selectionMode as { type: 'ability-target-select'; abilityCardId: string; userId: string; needed: number };
             try {
@@ -1339,6 +1407,7 @@ export class GameRenderer {
         'activate-pick-effect': 'Select which effect to activate',
         'activate-target-select': `Select ${(ui.selectionMode as { needed: number }).needed} target(s)`,
         'activate-cost-select': (ui.selectionMode as { costDescription?: string }).costDescription || `Select ${(ui.selectionMode as { needed: number }).needed} card(s) to pay cost`,
+        'strategy-target-select': 'Select a character to target',
       };
       const hint = hints[ui.selectionMode.type];
       if (hint) {
@@ -1464,6 +1533,11 @@ export class GameRenderer {
           const stratDef = def as StrategyCardDef;
           if (stratDef.handCost > 0) {
             dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'hand-cost', forCardId: instanceId, needed: stratDef.handCost } });
+          } else if (this.strategyNeedsTarget(state, hp, def.id)) {
+            const validTargets = this.getStrategyValidTargets(state, hp, def.id);
+            if (validTargets.length > 0) {
+              dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'strategy-target-select', strategyCardId: instanceId, handCostCardIds: [], validTargetIds: validTargets } });
+            }
           } else {
             dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'play-strategy', cardInstanceId: instanceId } });
           }
@@ -1488,7 +1562,16 @@ export class GameRenderer {
           if (forDef.cardType === 'character') {
             dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'summon', cardInstanceId: sm.forCardId, handCostCardIds: newSelected } });
           } else if (forDef.cardType === 'strategy') {
-            dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'play-strategy', cardInstanceId: sm.forCardId, handCostCardIds: newSelected } });
+            if (this.strategyNeedsTarget(state, hp, forDef.id)) {
+              const validTargets = this.getStrategyValidTargets(state, hp, forDef.id);
+              if (validTargets.length > 0) {
+                dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'strategy-target-select', strategyCardId: sm.forCardId, handCostCardIds: newSelected, validTargetIds: validTargets } });
+              } else {
+                dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'play-strategy', cardInstanceId: sm.forCardId, handCostCardIds: newSelected } });
+              }
+            } else {
+              dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'play-strategy', cardInstanceId: sm.forCardId, handCostCardIds: newSelected } });
+            }
           }
         }
         break;
@@ -1586,17 +1669,52 @@ export class GameRenderer {
 
         if (!isMainPhase) break;
 
-        // Direct summon — character cards
+        // Direct summon — character cards (check for activate-from-hand too)
         if (def?.cardType === 'character') {
-          if (canSummonCard(state, hp, instanceId)) {
-            const charDef = def as CharacterCardDef;
+          const charDef = def as CharacterCardDef;
+          const canSummon = canSummonCard(state, hp, instanceId);
+
+          // Check for activate-from-hand effects
+          const activateFromHandEffects = charDef.effects.filter((e) => {
+            if (e.type !== 'activate') return false;
+            if (e.timing !== 'main') return false;
+            const isExpelFromHand = e.costDescription?.toLowerCase().includes('expel this card from your hand');
+            const isPutInPlayFromHand = e.effectDescription?.toLowerCase().includes('from your hand in play');
+            if (!isExpelFromHand && !isPutInPlayFromHand) return false;
+            // Check name-turn scope (yellow activate — blocked if any copy already used this turn)
+            if (e.activateScope === 'name-turn') {
+              const nameKey = charDef.printNumber + ':' + e.id;
+              if (state.players[hp].usedActivateNames.includes(nameKey)) return false;
+            }
+            if (e.activateScope === 'name-game') {
+              const nameKey = charDef.printNumber + ':' + e.id;
+              if (state.players[hp].usedActivateNames.includes(nameKey)) return false;
+            }
+            return true;
+          });
+
+          if (activateFromHandEffects.length > 0 && canSummon) {
+            // Multiple options — show action menu
+            const actions: { label: string; description: string; action: 'summon' | 'activate'; effectId?: string }[] = [
+              { label: 'SUMMON', description: `TC${charDef.turnCost} HC${charDef.handCost}`, action: 'summon' },
+            ];
+            for (const eff of activateFromHandEffects) {
+              actions.push({ label: 'ACTIVATE', description: eff.effectDescription.slice(0, 40) + '...', action: 'activate', effectId: eff.id });
+            }
+            dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'card-action-menu', cardId: instanceId, zone: 'hand', actions } });
+          } else if (activateFromHandEffects.length > 0 && !canSummon) {
+            // Can only activate from hand, not summon
+            const eff = activateFromHandEffects[0];
+            this.handleActivateFromHand(state, hp, instanceId, eff.id, dispatch);
+          } else if (canSummon) {
+            // Normal summon only
             if (charDef.handCost > 0) {
               dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'hand-cost', forCardId: instanceId, needed: charDef.handCost } });
             } else {
               dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'summon', cardInstanceId: instanceId } });
             }
           }
-          // Character cards never fall through to charge — click does nothing if can't summon
+          // Character cards never fall through to charge — click does nothing if can't summon/activate
           break;
         }
 
@@ -1606,6 +1724,11 @@ export class GameRenderer {
             const stratDef = def as StrategyCardDef;
             if (stratDef.handCost > 0) {
               dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'hand-cost', forCardId: instanceId, needed: stratDef.handCost } });
+            } else if (this.strategyNeedsTarget(state, hp, def.id)) {
+              const validTargets = this.getStrategyValidTargets(state, hp, def.id);
+              if (validTargets.length > 0) {
+                dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'strategy-target-select', strategyCardId: instanceId, handCostCardIds: [], validTargetIds: validTargets } });
+              }
             } else {
               dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'play-strategy', cardInstanceId: instanceId } });
             }
@@ -1666,32 +1789,40 @@ export class GameRenderer {
 
               // Also check specific symbol requirements
               if (abilityDef.essenceCost.specific.length > 0 || (abilityDef.essenceCost.cardSymbol ?? 0) > 0) {
-                const symbolCounts: Record<string, number> = {};
+                // Build list of all symbols each essence card has (multi-symbol cards count for any)
+                const essenceSymbols: string[][] = [];
                 for (const eid of state.players[hp].essence) {
                   try {
                     const eDef = getCardDefForInstance(state, eid);
-                    const sym = eDef.symbols?.[0];
-                    if (sym) symbolCounts[sym] = (symbolCounts[sym] || 0) + 1;
-                  } catch { /* skip */ }
+                    essenceSymbols.push(eDef.symbols ?? []);
+                  } catch { essenceSymbols.push([]); }
                 }
-                // Check specific symbol costs
-                const canPaySymbols = abilityDef.essenceCost.specific.every(
-                  (c) => (symbolCounts[c.symbol] || 0) >= c.count
-                );
-                if (!canPaySymbols) return false;
+                // Assignment-based check: greedily assign cards to specific costs
+                const assigned = new Set<number>();
+                for (const c of abilityDef.essenceCost.specific) {
+                  let filled = 0;
+                  for (let ei = 0; ei < essenceSymbols.length; ei++) {
+                    if (filled >= c.count) break;
+                    if (assigned.has(ei)) continue;
+                    if (essenceSymbols[ei].includes(c.symbol)) {
+                      assigned.add(ei);
+                      filled++;
+                    }
+                  }
+                  if (filled < c.count) return false;
+                }
                 // Check cardSymbol costs (any of the ability's symbols)
                 if (abilityDef.essenceCost.cardSymbol && abilityDef.essenceCost.cardSymbol > 0) {
-                  // Consume specific costs first
-                  const remaining = { ...symbolCounts };
-                  for (const c of abilityDef.essenceCost.specific) {
-                    remaining[c.symbol] = Math.max(0, (remaining[c.symbol] || 0) - c.count);
+                  let filled = 0;
+                  for (let ei = 0; ei < essenceSymbols.length; ei++) {
+                    if (filled >= abilityDef.essenceCost.cardSymbol) break;
+                    if (assigned.has(ei)) continue;
+                    if (abilityDef.symbols.some(s => essenceSymbols[ei].includes(s))) {
+                      assigned.add(ei);
+                      filled++;
+                    }
                   }
-                  // Check remaining essence has enough matching card symbols
-                  let cardSymbolMatch = 0;
-                  for (const sym of abilityDef.symbols) {
-                    cardSymbolMatch += remaining[sym] || 0;
-                  }
-                  if (cardSymbolMatch < abilityDef.essenceCost.cardSymbol) return false;
+                  if (filled < abilityDef.essenceCost.cardSymbol) return false;
                 }
               }
             }
@@ -1756,6 +1887,29 @@ export class GameRenderer {
   }
 
   // ============================================================
+  // Strategy Target Helpers
+  // ============================================================
+
+  private strategyNeedsTarget(state: GameState, player: PlayerId, cardDefId: string): boolean {
+    return cardDefId === 'S0041'; // Hard Decision — target 1 Character you control
+  }
+
+  private getStrategyValidTargets(state: GameState, player: PlayerId, cardDefId: string): string[] {
+    if (cardDefId === 'S0041') {
+      // Hard Decision: any character you control in kingdom or battlefield
+      return [...state.players[player].kingdom, ...state.players[player].battlefield].filter((id) => {
+        const card = state.cards[id];
+        if (!card || card.state === undefined) return false; // not a character
+        try {
+          const def = getCardDefForInstance(state, id);
+          return def.cardType === 'character';
+        } catch { return false; }
+      });
+    }
+    return [];
+  }
+
+  // ============================================================
   // Field Card Activate Logic
   // ============================================================
 
@@ -1771,6 +1925,8 @@ export class GameRenderer {
         if (def.symbols.includes('terra') || def.symbols.includes('water')) count++;
       } catch { /* skip */ }
     }
+    // Oceanic Abyss E2 — virtual Water+Terra character
+    count += oceanicAbyssVirtualCharCount(state, player);
     return count;
   }
 
@@ -1846,6 +2002,153 @@ export class GameRenderer {
     this.overlayLayer.addChild(overlay);
   }
 
+  /** Handle activate-from-hand action (e.g., Spike the Impaler expel + search) */
+  private handleActivateFromHand(state: GameState, hp: PlayerId, instanceId: string, effectId: string, dispatch: (action: UIAction) => void): void {
+    dispatch({
+      type: 'PERFORM_ACTION',
+      player: hp,
+      action: {
+        type: 'activate-effect',
+        cardInstanceId: instanceId,
+        effectId,
+      },
+    });
+  }
+
+  /** Render the card action menu overlay (Summon vs Activate etc.) */
+  private renderCardActionMenu(state: GameState, ui: UIState): void {
+    const sm = ui.selectionMode;
+    if (sm.type !== 'card-action-menu' || !this.dispatch) return;
+
+    const pos = this.cardPositions.get(sm.cardId);
+    if (!pos) return;
+
+    const dispatch = this.dispatch;
+    const hp = ui.humanPlayer;
+    const cardId = sm.cardId;
+
+    const overlay = new CardActionMenuOverlay(
+      this.layout,
+      pos.x,
+      pos.y,
+      pos.w,
+      pos.h,
+      sm.actions,
+      (action: CardAction) => {
+        dispatch({ type: 'CLEAR_SELECTION' });
+        if (action.action === 'summon') {
+          // Re-do the summon flow
+          try {
+            const def = getCardDefForInstance(state, cardId);
+            if (def.cardType === 'character') {
+              const charDef = def as CharacterCardDef;
+              if (charDef.handCost > 0) {
+                dispatch({ type: 'SET_SELECTION_MODE', mode: { type: 'hand-cost', forCardId: cardId, needed: charDef.handCost } });
+              } else {
+                dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'summon', cardInstanceId: cardId } });
+              }
+            }
+          } catch { /* skip */ }
+        } else if (action.action === 'activate' && action.effectId) {
+          this.handleActivateFromHand(state, hp, cardId, action.effectId, dispatch);
+        } else if (action.action === 'charge') {
+          dispatch({ type: 'PERFORM_ACTION', player: hp, action: { type: 'charge-essence', cardInstanceIds: [cardId] } });
+        }
+      },
+      () => {
+        dispatch({ type: 'CLEAR_SELECTION' });
+      },
+    );
+    this.overlayLayer.addChild(overlay);
+  }
+
+  /** Check if any strategy card in player's essence zone has an activatable effect */
+  private getActivatableEssenceCards(state: GameState, ui: UIState): { instanceId: string; defId: string; name: string; effectId: string; effectDescription: string }[] {
+    const hp = ui.humanPlayer;
+    const result: { instanceId: string; defId: string; name: string; effectId: string; effectDescription: string }[] = [];
+
+    const essence = state.players[hp].essence;
+    for (const id of essence) {
+      const card = state.cards[id];
+      if (!card || card.zone !== 'essence') continue;
+
+      let def;
+      try { def = getCardDefForInstance(state, id); } catch { continue; }
+      if (def.cardType !== 'strategy') continue;
+
+      const stratDef = def as StrategyCardDef;
+      for (const effect of stratDef.effects) {
+        if (effect.type !== 'activate') continue;
+        const isExpelFromEssence = effect.costDescription?.toLowerCase().includes('expel this card from your essence');
+        if (!isExpelFromEssence) continue;
+
+        // Check timing
+        if (effect.timing === 'main' && state.phase !== 'main') continue;
+        if (effect.timing === 'eoa' && state.phase !== 'battle-eoa') continue;
+
+        // Check turn timing
+        const isTurnPlayer = state.currentTurn === hp;
+        if (effect.turnTiming === 'your-turn' && !isTurnPlayer) continue;
+        if (effect.turnTiming === 'opponent-turn' && isTurnPlayer) continue;
+
+        // Check once per turn
+        if (effect.oncePerTurn && card.usedEffects.includes(effect.id)) continue;
+
+        // Check name-scoped activate restrictions
+        if (effect.activateScope === 'name-turn' || effect.activateScope === 'name-game') {
+          const nameKey = def.printNumber + ':' + effect.id;
+          if (state.players[hp].usedActivateNames.includes(nameKey)) continue;
+        }
+
+        // Card-specific checks
+        if (def.id === 'S0044' && effect.id === 'S0044-E2') {
+          // Only valid if any card on the field has counters
+          let hasCounters = false;
+          for (const p of ['player1', 'player2'] as PlayerId[]) {
+            const allInPlay = [...state.players[p].kingdom, ...state.players[p].battlefield];
+            for (const cid of allInPlay) {
+              const c = state.cards[cid];
+              if (c && c.counters.length > 0) { hasCounters = true; break; }
+            }
+            if (hasCounters) break;
+          }
+          if (!hasCounters) continue;
+        }
+
+        result.push({
+          instanceId: id,
+          defId: def.id,
+          name: def.name,
+          effectId: effect.id,
+          effectDescription: effect.effectDescription,
+        });
+      }
+    }
+
+    return result;
+  }
+
+  /** Render the essence activate overlay */
+  private renderEssenceActivateOverlay(state: GameState, ui: UIState): void {
+    const sm = ui.selectionMode;
+    if (sm.type !== 'essence-activate-select' || !this.dispatch) return;
+
+    const activatable = this.getActivatableEssenceCards(state, ui);
+    if (activatable.length === 0) {
+      this.dispatch({ type: 'CLEAR_SELECTION' });
+      return;
+    }
+
+    const overlay = new EssenceActivateOverlay(
+      this.layout,
+      state,
+      activatable,
+      this.dispatch,
+      ui.humanPlayer,
+    );
+    this.overlayLayer.addChild(overlay);
+  }
+
   // ============================================================
   // Kingdom/Battlefield Card Click Logic (for ability/activate flows)
   // ============================================================
@@ -1878,6 +2181,9 @@ export class GameRenderer {
         for (const req of abilityDef.requirements) {
           if (req.type === 'attribute') {
             if (!charDef.attributes.includes(req.value)) return;
+          }
+          if (req.type === 'turn-cost-min') {
+            if (charDef.turnCost < parseInt(req.value, 10)) return;
           }
         }
 
@@ -2155,6 +2461,25 @@ export class GameRenderer {
         }
         break;
       }
+
+      case 'strategy-target-select': {
+        // Click a character in our kingdom to sacrifice (e.g., Hard Decision)
+        if (inst.owner !== hp) return;
+        if (inst.zone !== 'kingdom' && inst.zone !== 'battlefield') return;
+        if (!sm.validTargetIds.includes(instanceId)) return;
+
+        dispatch({
+          type: 'PERFORM_ACTION',
+          player: hp,
+          action: {
+            type: 'play-strategy',
+            cardInstanceId: sm.strategyCardId,
+            handCostCardIds: sm.handCostCardIds.length > 0 ? sm.handCostCardIds : undefined,
+            targetIds: [instanceId],
+          },
+        });
+        break;
+      }
     }
   }
 
@@ -2254,7 +2579,7 @@ export class GameRenderer {
       sm.type === 'ability-target-select' || sm.type === 'ability-essence-cost' ||
       sm.type === 'activate-effect-select' || sm.type === 'activate-pick-effect' ||
       sm.type === 'activate-target-select' || sm.type === 'activate-cost-select' ||
-      sm.type === 'field-activate-pick'
+      sm.type === 'field-activate-pick' || sm.type === 'card-action-menu'
     ) {
       buttons.push({ label: 'CANCEL', color: 0x374151, onClick: () => d({ type: 'CLEAR_SELECTION' }) });
     } else if (sm.type === 'select-attackers') {

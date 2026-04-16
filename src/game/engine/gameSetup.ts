@@ -9,6 +9,7 @@ import {
   CardInstance,
 } from '../types';
 import { STARTER_DECK_1_LIST } from '../cards/starter-deck-1';
+import { STARTER_DECK_2_LIST } from '../cards/starter-deck-2';
 import { getCardDef } from '../cards';
 import {
   createCardInstance,
@@ -22,6 +23,25 @@ import {
 export interface DeckConfig {
   fieldCardId?: string;
   mainDeck: { cardId: string; count: number }[];
+}
+
+export interface DeckOption {
+  id: string;
+  name: string;
+  theme: string;
+  fieldCardId: string;
+  mainDeck: { cardId: string; count: number }[];
+}
+
+export const DECK_OPTIONS: DeckOption[] = [
+  { id: 'deck1', name: 'Slayer Guild', theme: 'Necro / Plasma', fieldCardId: 'F0005', mainDeck: STARTER_DECK_1_LIST },
+  { id: 'deck2', name: 'Sea Invasion', theme: 'Water / Terra', fieldCardId: 'F0006', mainDeck: STARTER_DECK_2_LIST },
+];
+
+export function getDeckConfig(deckId?: string): DeckConfig {
+  const option = DECK_OPTIONS.find((d) => d.id === deckId);
+  if (option) return { fieldCardId: option.fieldCardId, mainDeck: option.mainDeck };
+  return { fieldCardId: 'F0005', mainDeck: STARTER_DECK_1_LIST };
 }
 
 function createPlayerState(
@@ -43,6 +63,7 @@ function createPlayerState(
     discard: [],
     expel: [],
     battleRewards: [],
+    usedActivateNames: [],
   };
 
   // Create field card instance

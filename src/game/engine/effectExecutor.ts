@@ -27,6 +27,10 @@ import {
   getTeamForCharacter,
   teamHasCharacterWithAttribute,
   isProtectedFromCharacterEffects,
+  hasEssenceCamouflage,
+  cardMatchesName,
+  generateId,
+  oceanicAbyssVirtualCharCount,
 } from './utils';
 import type { EventCollector } from './EventCollector';
 
@@ -687,6 +691,15 @@ const effectHandlers: Record<string, EffectHandler> = {
   },
 
   // --------------------------------------------------------
+  // S0042 — Oceanic Abyss (Permanent, Unique)
+  // Ongoing effects only (E1: discard redirect handled by moveCard/actionProcessor,
+  // E2: virtual character handled by utility function). No effect on play.
+  // --------------------------------------------------------
+  'S0042': () => {
+    // No effect on play — this is a permanent with ongoing effects only.
+  },
+
+  // --------------------------------------------------------
   // S0043 — Heavy Storm
   // Discard 2 cards from opponent's Essence area, then draw 1 card
   // --------------------------------------------------------
@@ -695,6 +708,7 @@ const effectHandlers: Record<string, EffectHandler> = {
     const opponent = getOpponent(player);
 
     // Discard up to 2 from opponent's essence
+    // Note: CAMOUFLAGE does NOT protect from discard — it only allows summoning from essence
     const opponentEssence = [...state.players[opponent].essence];
     const toDiscard = opponentEssence.slice(0, Math.min(2, opponentEssence.length));
     for (const id of toDiscard) {
@@ -930,5 +944,704 @@ const effectHandlers: Record<string, EffectHandler> = {
         addLog(state, player, 'effect', 'Micromon Beach — No valid sub-effect choice');
         break;
     }
+  },
+
+  // --------------------------------------------------------
+  // C0089 — Carnodile
+  // TRIGGER [Put In Play]: If Field is "Micromon Beach" + 3+ other Sea Monsters,
+  //   you may target 1 opponent Character with TC ≤ 3 → bottom of owner's deck.
+  // --------------------------------------------------------
+  'C0089': (state, entry) => {
+    if (entry.effectId !== 'C0089-E1') return;
+
+    const player = entry.owner;
+    const opponent = getOpponent(player);
+
+    // "you may" — optional prompt
+    if (!entry.optionalApproved) {
+      // Pre-check conditions before even asking
+      if (!fieldHasName(state, player, 'Micromon Beach')) return; // silently skip
+      const allInPlay = [
+        ...state.players[player].kingdom,
+        ...state.players[player].battlefield,
+      ];
+      let seaMonsterCount = 0;
+      for (const id of allInPlay) {
+        if (id === entry.sourceCardInstanceId) continue; // "other"
+        try {
+          const d = getCardDefForInstance(state, id);
+          if (d.cardType === 'character' && (d as CharacterCardDef).attributes.includes('Sea Monster')) seaMonsterCount++;
+        } catch { /* skip */ }
+      }
+      if (seaMonsterCount < 3) return; // silently skip
+
+      // Check if opponent has valid targets (TC ≤ 3 characters)
+      const opChars = [
+        ...state.players[opponent].kingdom,
+        ...state.players[opponent].battlefield,
+      ];
+      const validTargets = opChars.filter((id) => {
+        try {
+          const d = getCardDefForInstance(state, id);
+          if (d.cardType !== 'character') return false;
+          return (d as CharacterCardDef).turnCost <= 3;
+        } catch { return false; }
+      });
+      if (validTargets.length === 0) return; // no valid targets
+
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0089-E1',
+        cardName: 'Carnodile',
+        effectDescription: 'You may target 1 opponent Character with Turn Cost 3 or less and move it to the bottom of their deck.',
+        owner: player,
+      };
+      return;
+    }
+
+    // Approved — validate conditions again and set up target choice
+    if (!fieldHasName(state, player, 'Micromon Beach')) {
+      addLog(state, player, 'effect', 'Carnodile — Field is not "Micromon Beach". Effect fizzles.');
+      return;
+    }
+
+    const allInPlay = [
+      ...state.players[player].kingdom,
+      ...state.players[player].battlefield,
+    ];
+    let seaMonsterCount = 0;
+    for (const id of allInPlay) {
+      if (id === entry.sourceCardInstanceId) continue;
+      try {
+        const d = getCardDefForInstance(state, id);
+        if (d.cardType === 'character' && (d as CharacterCardDef).attributes.includes('Sea Monster')) seaMonsterCount++;
+      } catch { /* skip */ }
+    }
+    // Oceanic Abyss E2 — virtual Sea Monster character
+    seaMonsterCount += oceanicAbyssVirtualCharCount(state, player, { attribute: 'Sea Monster' });
+    if (seaMonsterCount < 3) {
+      addLog(state, player, 'effect', `Carnodile — Only ${seaMonsterCount} other Sea Monsters, need 3+. Effect fizzles.`);
+      return;
+    }
+
+    // Find valid opponent targets (TC ≤ 3)
+    const opChars = [
+      ...state.players[opponent].kingdom,
+      ...state.players[opponent].battlefield,
+    ];
+    const validTargets = opChars.filter((id) => {
+      try {
+        const d = getCardDefForInstance(state, id);
+        if (d.cardType !== 'character') return false;
+        return (d as CharacterCardDef).turnCost <= 3;
+      } catch { return false; }
+    });
+
+    if (validTargets.length === 0) {
+      addLog(state, player, 'effect', 'Carnodile — No valid opponent targets (TC ≤ 3). Effect fizzles.');
+      return;
+    }
+
+    state.pendingTargetChoice = {
+      effectId: 'C0089-E1',
+      sourceCardId: entry.sourceCardInstanceId,
+      owner: player,
+      description: 'Choose 1 opponent Character with Turn Cost 3 or less to move to the bottom of their deck',
+      validTargetIds: validTargets,
+    };
+    addLog(state, player, 'effect', 'Carnodile — Choose an opponent Character to bounce');
+  },
+
+  // --------------------------------------------------------
+  // C0088 — Hydroon
+  // ACTIVATE: If Field is "Micromon Beach", search deck for "Krakaan" → put in play,
+  //   then move Hydroon to Essence.
+  // --------------------------------------------------------
+  'C0088': (state, entry) => {
+    if (entry.effectId !== 'C0088-E1') return;
+
+    const player = entry.owner;
+
+    // Validate: Field card is "Micromon Beach"
+    if (!fieldHasName(state, player, 'Micromon Beach')) {
+      addLog(state, player, 'effect', 'Hydroon — Field card is not "Micromon Beach". Effect fizzles.');
+      return;
+    }
+
+    // Search deck for a Character with name "Krakaan"
+    const deck = state.players[player].deck;
+    const validTargets = deck.filter((id) => {
+      try {
+        const cDef = getCardDefForInstance(state, id);
+        if (cDef.cardType !== 'character') return false;
+        return cardMatchesName(cDef, 'Krakaan');
+      } catch { return false; }
+    });
+
+    if (validTargets.length > 0) {
+      state.pendingSearch = {
+        effectId: 'C0088-E1',
+        owner: player,
+        criteria: 'Character with the name "Krakaan"',
+        validCardIds: validTargets,
+        sourceCardName: 'Hydroon',
+        sourceCardInstanceId: entry.sourceCardInstanceId,
+      };
+      addLog(state, player, 'effect', 'Hydroon — Search your deck for a Character named "Krakaan"');
+    } else {
+      shuffleDeck(state, player);
+      addLog(state, player, 'effect', 'Hydroon — No "Krakaan" found in deck');
+    }
+  },
+
+  // --------------------------------------------------------
+  // C0092 — Sea King Krakaan
+  // TRIGGER: When you put in play a Character with [Sea Monster],
+  //   you may move the top card of your deck to your Essence area.
+  // --------------------------------------------------------
+  'C0092': (state, entry) => {
+    if (entry.effectId !== 'C0092-E2') return;
+
+    // "you may" — use optional effect prompt
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        sourceCardId: entry.sourceCardInstanceId,
+        effectId: 'C0092-E2',
+        cardName: 'Sea King Krakaan',
+        effectDescription: 'You may move the top card of your deck to your Essence area.',
+        owner: entry.owner,
+      };
+      return;
+    }
+
+    const player = entry.owner;
+    const deck = state.players[player].deck;
+    if (deck.length > 0) {
+      const topCardId = deck[0];
+      moveCard(state, topCardId, 'essence');
+      const def = getCardDefForInstance(state, topCardId);
+      addLog(state, player, 'effect', `Sea King Krakaan — Moved ${def.name} from deck to Essence`);
+    } else {
+      addLog(state, player, 'effect', 'Sea King Krakaan — Deck is empty');
+    }
+  },
+
+  // --------------------------------------------------------
+  // C0075 — Aquaconda
+  // ACTIVATE: If 3+ other MICROMON characters + Field is "Micromon Beach" → discard 1 from opponent Essence
+  // --------------------------------------------------------
+  'C0075': (state, entry) => {
+    if (entry.effectId !== 'C0075-E1') return;
+
+    const player = entry.owner;
+    const opponent = getOpponent(player);
+
+    // Validate: 3+ OTHER MICROMON characters (not counting Aquaconda itself)
+    const kingdom = state.players[player].kingdom;
+    const battlefield = state.players[player].battlefield;
+    let micromonCount = 0;
+    for (const id of [...kingdom, ...battlefield]) {
+      if (id === entry.sourceCardInstanceId) continue; // "other"
+      try {
+        const cDef = getCardDefForInstance(state, id);
+        if (cDef.cardType !== 'character') continue;
+        if ((cDef as CharacterCardDef).characteristics.includes('micromon')) micromonCount++;
+      } catch { /* skip */ }
+    }
+    // Oceanic Abyss E2 — virtual MICROMON character
+    micromonCount += oceanicAbyssVirtualCharCount(state, player, { characteristic: 'micromon' });
+
+    if (micromonCount < 3) {
+      addLog(state, player, 'effect', `Aquaconda — Only ${micromonCount} other MICROMON character(s), need 3+. Effect fizzles.`);
+      return;
+    }
+
+    // Validate: Field card is "Micromon Beach"
+    if (!fieldHasName(state, player, 'Micromon Beach')) {
+      addLog(state, player, 'effect', 'Aquaconda — Field card is not "Micromon Beach". Effect fizzles.');
+      return;
+    }
+
+    // Validate: Opponent has essence to discard
+    const opEssence = [...state.players[opponent].essence];
+    if (opEssence.length === 0) {
+      addLog(state, player, 'effect', "Aquaconda — Opponent has no Essence to discard. Effect fizzles.");
+      return;
+    }
+
+    // Choose 1 from opponent's Essence to discard
+    if (opEssence.length > 0) {
+      state.pendingTargetChoice = {
+        effectId: 'C0075-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: "Choose 1 card from your opponent's Essence to discard",
+        validTargetIds: opEssence,
+      };
+      addLog(state, player, 'effect', "Aquaconda — Choose a card from opponent's Essence to discard");
+    } else {
+      addLog(state, player, 'effect', "Aquaconda — Opponent has no Essence to discard");
+    }
+  },
+
+  // --------------------------------------------------------
+  // C0074 — Spike the Impaler
+  // ACTIVATE: Expel from hand → if 3+ MICROMON characters, search deck for 1 MICROMON Character → hand
+  // --------------------------------------------------------
+  'C0074': (state, entry) => {
+    if (entry.effectId !== 'C0074-E2') return;
+
+    const player = entry.owner;
+
+    // Count MICROMON characters controlled (kingdom + battlefield)
+    const kingdom = state.players[player].kingdom;
+    const battlefield = state.players[player].battlefield;
+    let micromonCount = 0;
+    for (const id of [...kingdom, ...battlefield]) {
+      try {
+        const cDef = getCardDefForInstance(state, id);
+        if (cDef.cardType !== 'character') continue;
+        if ((cDef as CharacterCardDef).characteristics.includes('micromon')) micromonCount++;
+      } catch { /* skip */ }
+    }
+    // Oceanic Abyss E2 — virtual MICROMON character
+    micromonCount += oceanicAbyssVirtualCharCount(state, player, { characteristic: 'micromon' });
+
+    if (micromonCount < 3) {
+      addLog(state, player, 'effect', `Spike the Impaler — Only ${micromonCount} MICROMON character(s), need 3+. Effect fizzles.`);
+      return;
+    }
+
+    // Search deck for MICROMON characters
+    const deck = state.players[player].deck;
+    const validTargets = deck.filter((id) => {
+      try {
+        const cDef = getCardDefForInstance(state, id);
+        if (cDef.cardType !== 'character') return false;
+        return (cDef as CharacterCardDef).characteristics.includes('micromon');
+      } catch { return false; }
+    });
+
+    if (validTargets.length > 0) {
+      state.pendingSearch = {
+        effectId: 'C0074-E2',
+        owner: player,
+        criteria: 'MICROMON Character',
+        validCardIds: validTargets,
+        sourceCardName: 'Spike the Impaler',
+      };
+      addLog(state, player, 'effect', 'Spike the Impaler — Search your deck for a MICROMON Character');
+    } else {
+      shuffleDeck(state, player);
+      addLog(state, player, 'effect', 'Spike the Impaler — No MICROMON characters found in deck');
+    }
+  },
+
+  // --------------------------------------------------------
+  // S0037 — Dangerous Waters
+  // Target 1 Sea Monster (TC ≤ 2) in your Essence → put in play
+  // End of turn: if still in play and Turn Marker ≤ 4, discard it
+  // --------------------------------------------------------
+  'S0037': (state, entry) => {
+    const player = entry.owner;
+
+    // Check field has terra or water symbol
+    if (!fieldHasSymbol(state, player, 'terra') && !fieldHasSymbol(state, player, 'water')) {
+      addLog(state, player, 'effect', 'Dangerous Waters — Field card has no Terra or Water symbol. Effect fizzles.');
+      return;
+    }
+
+    // Find valid targets: Sea Monster characters with TC ≤ 2 in essence
+    const essence = state.players[player].essence;
+    const validTargets = essence.filter((id) => {
+      try {
+        const def = getCardDefForInstance(state, id);
+        if (def.cardType !== 'character') return false;
+        const charDef = def as CharacterCardDef;
+        if (!charDef.attributes.includes('Sea Monster')) return false;
+        if (charDef.turnCost > 2) return false;
+        return true;
+      } catch { return false; }
+    });
+
+    if (validTargets.length === 0) {
+      addLog(state, player, 'effect', 'Dangerous Waters — No valid Sea Monster (TC ≤ 2) in Essence. Effect fizzles.');
+      return;
+    }
+
+    // Set up target choice
+    state.pendingTargetChoice = {
+      effectId: 'S0037-E1',
+      sourceCardId: entry.sourceCardInstanceId,
+      owner: player,
+      description: 'Choose a Sea Monster Character (TC ≤ 2) from your Essence to put in play',
+      validTargetIds: validTargets,
+    };
+    addLog(state, player, 'effect', 'Dangerous Waters — Choose a Sea Monster from your Essence');
+  },
+
+  // --------------------------------------------------------
+  // C0091 — Sea Queen Argelia
+  // TRIGGER: When deals showdown damage, may discard 2 from opponent's Essence
+  // --------------------------------------------------------
+  'C0091': (state, entry) => {
+    if (entry.effectId !== 'C0091-E1') return;
+
+    const player = entry.owner;
+    const opponent = getOpponent(player);
+
+    // Check opponent has essence to discard
+    const opEssence = [...state.players[opponent].essence];
+
+    if (opEssence.length === 0) {
+      addLog(state, player, 'effect', "Sea Queen Argelia — Opponent has no Essence. Effect skipped.");
+      return;
+    }
+
+    // Optional "may" effect — Category A
+    if (!entry.optionalApproved) {
+      state.pendingOptionalEffect = {
+        chainEntryId: entry.id,
+        effectId: 'C0091-E1',
+        sourceCardId: entry.sourceCardInstanceId,
+        cardName: 'Sea Queen Argelia',
+        effectDescription: "Discard 2 cards from your opponent's Essence area?",
+        owner: player,
+      };
+      return;
+    }
+
+    // Approved — let player choose which cards to discard from opponent's essence
+    if (opEssence.length === 1) {
+      // Only 1 card — auto-discard it
+      moveCard(state, opEssence[0], 'discard');
+      const cardName = getCardDefForInstance(state, opEssence[0]).name;
+      addLog(state, player, 'effect', `Sea Queen Argelia — Discarded ${cardName} from opponent's Essence`);
+    } else {
+      // 2+ cards — let player choose
+      state.pendingTargetChoice = {
+        effectId: 'C0091-E1-pick1',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: "Choose a card from your opponent's Essence to discard (1 of 2)",
+        validTargetIds: opEssence,
+      };
+    }
+  },
+
+  // --------------------------------------------------------
+  // S0044 — Unknown Pathway
+  // E1 (on play): If Field has Terra, look at top 3 deck cards → 1 hand, 1 essence, 1 discard
+  // E2 (activate from essence): Remove 1 counter from any card on the field
+  // --------------------------------------------------------
+  'S0044': (state, entry) => {
+    const player = entry.owner;
+
+    // E2: Activate from essence — counter removal
+    if (entry.effectId === 'S0044-E2') {
+      // Find all cards in kingdom+battlefield (both players) that have counters
+      const cardsWithCounters: string[] = [];
+      for (const p of ['player1', 'player2'] as PlayerId[]) {
+        const allInPlay = [
+          ...state.players[p].kingdom,
+          ...state.players[p].battlefield,
+        ];
+        for (const id of allInPlay) {
+          const card = state.cards[id];
+          if (card && card.counters.length > 0) {
+            cardsWithCounters.push(id);
+          }
+        }
+      }
+
+      if (cardsWithCounters.length === 0) {
+        addLog(state, player, 'effect', 'Unknown Pathway — No cards with counters on the field');
+        return;
+      }
+
+      state.pendingTargetChoice = {
+        effectId: 'S0044-E2',
+        sourceCardId: entry.sourceCardInstanceId,
+        owner: player,
+        description: 'Choose a card to remove 1 counter from',
+        validTargetIds: cardsWithCounters,
+      };
+      addLog(state, player, 'effect', 'Unknown Pathway — Choose a card to remove a counter from');
+      return;
+    }
+
+    // E1: On play — look at top 3 deck cards, distribute
+    if (!fieldHasSymbol(state, player, 'terra')) {
+      addLog(state, player, 'effect', 'Unknown Pathway — Field has no Terra symbol. Effect fizzles.');
+      return;
+    }
+
+    const deck = state.players[player].deck;
+    const topCards = deck.slice(0, Math.min(3, deck.length));
+
+    if (topCards.length === 0) {
+      addLog(state, player, 'effect', 'Unknown Pathway — Deck is empty');
+      return;
+    }
+
+    if (topCards.length === 1) {
+      // Only 1 card — it goes to hand
+      moveCard(state, topCards[0], 'hand');
+      const def = getCardDefForInstance(state, topCards[0]);
+      addLog(state, player, 'effect', `Unknown Pathway — Only 1 card in deck, ${def.name} moved to hand`);
+      return;
+    }
+
+    if (topCards.length === 2) {
+      // 2 cards — pick 1 for hand, other goes to essence
+      state.pendingSearch = {
+        effectId: 'S0044-E1-hand',
+        owner: player,
+        criteria: 'Choose 1 card for your hand (the other goes to Essence)',
+        validCardIds: [...topCards],
+        displayCardIds: [...topCards],
+        sourceCardName: 'Unknown Pathway',
+      };
+      return;
+    }
+
+    // 3 cards — pick 1 for hand, then pick 1 for essence, last auto-discards
+    state.pendingSearch = {
+      effectId: 'S0044-E1-hand',
+      owner: player,
+      criteria: 'Choose 1 card for your hand',
+      validCardIds: [...topCards],
+      displayCardIds: [...topCards],
+      sourceCardName: 'Unknown Pathway',
+    };
+  },
+
+  // --------------------------------------------------------
+  // C0090 — Megalino
+  // ACTIVATE: If you control "Krakaan", put this card from hand in play
+  // --------------------------------------------------------
+  'C0090': (state, entry) => {
+    if (entry.effectId !== 'C0090-E1') return;
+
+    const player = entry.owner;
+    const card = state.cards[entry.sourceCardInstanceId];
+
+    // Validate: card must still be in hand
+    if (!card || card.zone !== 'hand') {
+      addLog(state, player, 'effect', 'Megalino — Card no longer in hand. Effect fizzles.');
+      return;
+    }
+
+    // Validate: player controls a character named "Krakaan"
+    const kingdom = state.players[player].kingdom;
+    const battlefield = state.players[player].battlefield;
+    const hasKrakaan = [...kingdom, ...battlefield].some((id) => {
+      try {
+        const def = getCardDefForInstance(state, id);
+        return cardMatchesName(def, 'Krakaan');
+      } catch { return false; }
+    });
+
+    if (!hasKrakaan) {
+      addLog(state, player, 'effect', 'Megalino — No "Krakaan" controlled. Effect fizzles.');
+      return;
+    }
+
+    // Move from hand to kingdom
+    moveCard(state, entry.sourceCardInstanceId, 'kingdom');
+    card.state = 'healthy';
+
+    // Create a solo team
+    const teamId = generateId('team');
+    state.teams[teamId] = {
+      id: teamId,
+      owner: player,
+      characterIds: [entry.sourceCardInstanceId],
+      hasLead: true,
+      isAttacking: false,
+      isBlocking: false,
+    };
+    card.teamId = teamId;
+
+    addLog(state, player, 'effect', 'Megalino — Put in play from hand');
+
+    // Check for "put-in-play-sea-monster" triggers on other characters (e.g., Krakaan)
+    // Megalino is a Sea Monster, so entering play triggers Krakaan's E2
+    const allInPlay = [
+      ...state.players[player].kingdom,
+      ...state.players[player].battlefield,
+    ];
+    for (const otherId of allInPlay) {
+      if (otherId === entry.sourceCardInstanceId) continue;
+      const otherCard = state.cards[otherId];
+      if (!otherCard || otherCard.isNegated) continue;
+      try {
+        const otherDef = getCardDefForInstance(state, otherId);
+        if (otherDef.cardType !== 'character') continue;
+        const otherCharDef = otherDef as CharacterCardDef;
+        for (const eff of otherCharDef.effects) {
+          if (eff.type !== 'trigger' || eff.triggerCondition !== 'put-in-play-sea-monster') continue;
+          if (otherCard.state === 'injured' && !eff.isValid) continue;
+          state.pendingTriggers.push({
+            id: `trigger_${otherId}_${eff.id}_${entry.sourceCardInstanceId}`,
+            type: 'trigger-effect',
+            sourceCardInstanceId: otherId,
+            effectId: eff.id,
+            resolved: false,
+            negated: false,
+            owner: player,
+          });
+        }
+      } catch { /* skip */ }
+    }
+  },
+
+  // --------------------------------------------------------
+  // A0035 — Aquabatics
+  // Discard 2 from opponent's Essence, then if your Essence > opponent's → win 1 BR
+  // --------------------------------------------------------
+  'A0035': (state, entry) => {
+    const player = entry.owner;
+    const opponent = getOpponent(player);
+
+    const opEssence = [...state.players[opponent].essence];
+    if (opEssence.length === 0) {
+      // No essence to discard — still check BR condition (unlikely to win)
+      if (state.players[player].essence.length > state.players[opponent].essence.length) {
+        // Award 1 BR
+        const loserDeck = state.players[opponent].deck;
+        if (loserDeck.length > 0) {
+          const brCardId = loserDeck.shift()!;
+          state.cards[brCardId].zone = 'battle-rewards';
+          state.players[opponent].battleRewards.push(brCardId);
+          addLog(state, player, 'effect', 'Aquabatics — You win 1 Battle Reward!');
+        }
+      } else {
+        addLog(state, player, 'effect', 'Aquabatics — Essence not greater, no Battle Reward');
+      }
+      return;
+    }
+
+    // Set up interactive pick for first discard
+    state.pendingTargetChoice = {
+      effectId: 'A0035-E1-pick1',
+      sourceCardId: entry.sourceCardInstanceId,
+      owner: player,
+      description: "Choose a card from your opponent's Essence to discard (1 of 2)",
+      validTargetIds: opEssence,
+    };
+  },
+
+  // --------------------------------------------------------
+  // A0039 — Torrential Sludge
+  // If target's Leader Value < user's Leader Value → move target to bottom of owner's deck
+  // Expert{Hydroon}: move to owner's Essence instead
+  // --------------------------------------------------------
+  'A0039': (state, entry) => {
+    const player = entry.owner;
+
+    if (!entry.userId || !entry.targetIds || entry.targetIds.length === 0) return;
+
+    const user = getCard(state, entry.userId);
+    const target = getCard(state, entry.targetIds[0]);
+
+    // Check user still on battlefield
+    if (user.zone !== 'battlefield' || user.owner !== player) {
+      addLog(state, player, 'effect', 'Torrential Sludge — User no longer on battlefield. Effect fizzles.');
+      return;
+    }
+
+    // Check target still on battlefield
+    if (target.zone !== 'battlefield') {
+      addLog(state, player, 'effect', 'Torrential Sludge — Target no longer on battlefield. Effect fizzles.');
+      return;
+    }
+
+    const userStats = getEffectiveStats(state, entry.userId);
+    const targetStats = getEffectiveStats(state, entry.targetIds[0]);
+
+    const userDef = getCardDefForInstance(state, entry.userId);
+    const targetDef = getCardDefForInstance(state, entry.targetIds[0]);
+
+    if (targetStats.lead >= userStats.lead) {
+      addLog(
+        state,
+        player,
+        'effect',
+        `Torrential Sludge — ${targetDef.name} (Lead ${targetStats.lead}) is not lower than ${userDef.name} (Lead ${userStats.lead}). Effect fizzles.`
+      );
+      return;
+    }
+
+    // Check Expert{Hydroon} — user must have name "Hydroon"
+    const isExpert = cardMatchesName(userDef, 'Hydroon');
+
+    if (isExpert) {
+      // Expert: move target to owner's Essence
+      moveCard(state, entry.targetIds[0], 'essence');
+      addLog(
+        state,
+        player,
+        'effect',
+        `Torrential Sludge (Expert: Hydroon) — Moved ${targetDef.name} to Essence`
+      );
+    } else {
+      // Base: move target to bottom of owner's deck
+      moveCardToBottomOfDeck(state, entry.targetIds[0]);
+      addLog(
+        state,
+        player,
+        'effect',
+        `Torrential Sludge — Moved ${targetDef.name} to bottom of deck`
+      );
+    }
+  },
+
+  // --------------------------------------------------------
+  // A0040 — Micromon Rage
+  // Double the user's current Stat Values this turn,
+  // then at end of turn deal 1 Damage to the user.
+  // --------------------------------------------------------
+  'A0040': (state, entry) => {
+    const player = entry.owner;
+
+    if (!entry.userId) return;
+
+    const user = getCard(state, entry.userId);
+
+    // Check user still on battlefield
+    if (user.zone !== 'battlefield' || user.owner !== player) {
+      addLog(state, player, 'effect', 'Micromon Rage — User no longer on battlefield. Effect fizzles.');
+      return;
+    }
+
+    // Get current effective stats and add modifier equal to them (doubling)
+    const currentStats = getEffectiveStats(state, entry.userId);
+    user.statModifiers.push({
+      lead: currentStats.lead,
+      support: currentStats.support,
+      source: 'A0040-MicromonRage',
+      duration: 'until-end-of-turn',
+    });
+
+    const userDef = getCardDefForInstance(state, entry.userId);
+    addLog(
+      state,
+      player,
+      'effect',
+      `Micromon Rage — ${userDef.name} stats doubled (now +${currentStats.lead}/+${currentStats.support})`
+    );
+
+    // Register lingering effect for end-of-turn damage
+    state.lingeringEffects.push({
+      id: `micromon_rage_${entry.id}`,
+      source: entry.sourceCardInstanceId,
+      effectDescription: 'At end of turn, deal 1 Damage to the user.',
+      duration: 'until-end-of-turn',
+      appliedTurn: state.turnNumber,
+      data: { targetId: entry.userId, owner: player },
+    });
   },
 };

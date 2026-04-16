@@ -20,6 +20,12 @@ export type CharacterState = 'healthy' | 'injured';
 // --- Effect Types ---
 export type EffectType = 'trigger' | 'activate' | 'ongoing';
 
+// --- Activate Scope (badge colors per rules 7.2.1) ---
+// 'instance' = green (once per turn per card instance, current default)
+// 'name-turn' = yellow (once per turn across all copies of same print number)
+// 'name-game' = pink (once per game across all copies — future-proof)
+export type ActivateScope = 'instance' | 'name-turn' | 'name-game';
+
 // --- Timing Windows ---
 export type Timing = 'main' | 'eoa' | 'both';
 
@@ -61,6 +67,7 @@ export interface BaseCardDef {
   id: string;             // e.g., 'C0077'
   printNumber: string;    // e.g., '0077'
   name: string;
+  names?: string[];       // additional names this card responds to (e.g., ['Krakaan'])
   cardType: CardType;
   symbols: Symbol[];
   imageFile?: string;
@@ -113,7 +120,7 @@ export interface EssenceCost {
 
 // --- Ability Requirements ---
 export interface AbilityRequirement {
-  type: 'attribute' | 'characteristic' | 'name' | 'symbol';
+  type: 'attribute' | 'characteristic' | 'name' | 'symbol' | 'turn-cost-min';
   value: string;
 }
 
@@ -129,6 +136,7 @@ export interface CardEffectDef {
   targetDescription?: string;
   effectDescription: string;
   oncePerTurn: boolean;
+  activateScope?: ActivateScope; // default (undefined) = 'instance' (green badge)
   // The actual effect logic will be implemented as functions keyed by card+effect ID
 }
 
@@ -227,6 +235,7 @@ export interface PlayerState {
   expel: string[];        // instanceIds
   battleRewards: string[];// instanceIds (on opponent's side physically)
   fieldCard?: string;     // instanceId
+  usedActivateNames: string[]; // tracks 'printNumber:effectId' for name-turn scope
 }
 
 // --- Game State ---
@@ -272,6 +281,7 @@ export interface GameState {
     validCardIds: string[];
     displayCardIds?: string[]; // all cards to show (some may not be selectable)
     sourceCardName?: string; // card name for overlay header (e.g., "Vanessa")
+    sourceCardInstanceId?: string; // instanceId of the card that created this search (for post-search actions)
     discardRest?: boolean; // discard non-selected display cards after selection
   };
 
@@ -295,6 +305,9 @@ export interface GameState {
     validTargetIds: string[];
     allowDecline?: boolean; // show SKIP button for "you may" effects
   };
+
+  // Pending Oceanic Abyss (S0042) discard-to-essence redirects
+  pendingEssenceRedirects?: string[]; // instanceIds of characters that can be redirected
 
   // Action log
   log: GameLogEntry[];
