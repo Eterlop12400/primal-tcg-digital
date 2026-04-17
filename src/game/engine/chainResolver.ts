@@ -46,6 +46,13 @@ export function resolveChain(state: GameState, collector?: EventCollector): void
     entry.resolved = true;
     state.chain.pop();
 
+    // If the effect set a pending target choice or search, pause chain resolution
+    // (entry already resolved — chain resumes after player makes their choice)
+    if (state.pendingTargetChoice || state.pendingSearch) {
+      state.isChainResolving = false;
+      return;
+    }
+
     // Check for Oceanic Abyss (S0042) discard-to-essence redirects
     if (state.pendingEssenceRedirects?.length) {
       if (setupNextEssenceRedirectPrompt(state)) {

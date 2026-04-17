@@ -19,6 +19,7 @@ import {
   particleBurst,
   showChainNotification,
   showEffectCallout,
+  showPassIndicator,
 } from '../effects/Animations';
 import { showCardCloseUp } from '../effects/CardCloseUp';
 import { shatterEffect } from '../effects/ShatterEffect';
@@ -34,11 +35,21 @@ export class AnimationRouter {
   private layout: BoardLayout;
   private humanPlayer: PlayerId | null = null;
   private cardPositions: CardPositionMap = new Map();
+  private _speed = 1;
 
   constructor(effectsLayer: Container, boardLayer: Container, layout: BoardLayout) {
     this.effectsLayer = effectsLayer;
     this.boardLayer = boardLayer;
     this.layout = layout;
+  }
+
+  setSpeed(speed: number): void {
+    this._speed = Math.max(0.1, speed);
+  }
+
+  /** Returns a delay scaled by the current speed multiplier. */
+  private scaledDelay(ms: number): Promise<void> {
+    return delay(ms / this._speed);
   }
 
   updateLayout(layout: BoardLayout): void {
@@ -93,6 +104,18 @@ export class AnimationRouter {
             L.width,
             L.height,
           );
+          // Strategy play flourish — expanding green circle
+          const stratCircle = new Graphics();
+          stratCircle.circle(0, 0, 20);
+          stratCircle.stroke({ color: 0x10b981, width: 2, alpha: 0.8 });
+          stratCircle.x = L.width / 2;
+          stratCircle.y = L.height / 2;
+          this.effectsLayer.addChild(stratCircle);
+          gsap.to(stratCircle.scale, { x: 5, y: 5, duration: 0.5, ease: 'power2.out' });
+          gsap.to(stratCircle, { alpha: 0, duration: 0.5, ease: 'power2.out', onComplete: () => {
+            this.effectsLayer.removeChild(stratCircle); stratCircle.destroy();
+          }});
+          particleBurst(this.effectsLayer, L.width / 2, L.height / 2, 0x10b981, 12);
         } else if (event.reason === 'charge') {
           // Card slides from hand to right side (essence zone)
           if (cardPos && cardPos.zone === 'hand') {
@@ -100,16 +123,27 @@ export class AnimationRouter {
             const isBottom = event.player === this.humanPlayer;
             const essenceY = isBottom ? L.playerY + L.playerH * 0.7 : L.opponentY + L.opponentH * 0.3;
             await this.flyCardOverlay(event.defId, cardPos.x, cardPos.y, cardPos.w, cardPos.h, essenceX, essenceY, 0.3);
-            particleBurst(this.effectsLayer, essenceX, essenceY, COLORS.accentCyan, 8);
+            // Expanding ring burst
+            const ring = new Graphics();
+            ring.circle(0, 0, 20);
+            ring.stroke({ color: COLORS.accentCyan, width: 2, alpha: 0.8 });
+            ring.x = essenceX;
+            ring.y = essenceY;
+            this.effectsLayer.addChild(ring);
+            gsap.to(ring.scale, { x: 4, y: 4, duration: 0.4, ease: 'power2.out' });
+            gsap.to(ring, { alpha: 0, duration: 0.4, ease: 'power2.out', onComplete: () => {
+              this.effectsLayer.removeChild(ring); ring.destroy();
+            }});
+            particleBurst(this.effectsLayer, essenceX, essenceY, COLORS.accentCyan, 12);
           }
-          await delay(100);
+          await this.scaledDelay(150);
         } else if (event.reason === 'destroy') {
           // Shatter at card's actual board position
           if (cardPos) {
             shatterEffect(this.effectsLayer, cardPos.x, cardPos.y, cardPos.w, cardPos.h, COLORS.injuredDot);
           }
           screenShake(this.boardLayer, 3, 0.2);
-          await delay(200);
+          await this.scaledDelay(200);
         } else if (event.reason === 'draw') {
           // Card slides from deck to hand area
           const isBottom = event.player === this.humanPlayer;
@@ -118,7 +152,18 @@ export class AnimationRouter {
           const handX = L.width / 2;
           const handY = isBottom ? L.height - 80 : 80;
           await this.flyCardOverlay(event.defId, deckX, deckY, 40, 56, handX, handY, 0.25);
-          await delay(50);
+          // Draw glow flash + particles at landing position
+          const drawGlow = new Graphics();
+          drawGlow.roundRect(-25, -32, 50, 64, 4);
+          drawGlow.fill({ color: COLORS.accentCyan, alpha: 0.4 });
+          drawGlow.x = handX;
+          drawGlow.y = handY;
+          this.effectsLayer.addChild(drawGlow);
+          gsap.to(drawGlow, { alpha: 0, duration: 0.3, ease: 'power2.out', onComplete: () => {
+            this.effectsLayer.removeChild(drawGlow); drawGlow.destroy();
+          }});
+          particleBurst(this.effectsLayer, handX, handY, COLORS.accentCyan, 8);
+          await this.scaledDelay(50);
         } else if (event.reason === 'discard') {
           // Card flies to discard pile
           if (cardPos) {
@@ -127,20 +172,25 @@ export class AnimationRouter {
             const discardY = isBottom ? L.playerY + L.playerH * 0.5 : L.opponentY + L.opponentH * 0.5;
             await this.flyCardOverlay(event.defId, cardPos.x, cardPos.y, cardPos.w, cardPos.h, discardX, discardY, 0.25);
           }
-          await delay(100);
+          await this.scaledDelay(100);
         }
         break;
       }
 
       case 'damage-applied': {
-        // Show floating damage number
-        const targetX = L.width / 2 + (Math.random() - 0.5) * 100;
-        const targetY = L.height / 2;
-        showDamageNumber(this.effectsLayer, event.amount, targetX, targetY);
+        // Use actual card position from cardPositions map
+        const dmgPos = this.cardPositions.get(event.targetCardId);
+        const targetX = dmgPos ? dmgPos.x + dmgPos.w / 2 : L.width / 2 + (Math.random() - 0.5) * 100;
+        const targetY = dmgPos ? dmgPos.y + dmgPos.h / 2 : L.height / 2;
+        const isHeavy = event.amount >= 3;
+        showDamageNumber(this.effectsLayer, event.amount, targetX, targetY, isHeavy);
+        if (isHeavy) {
+          screenShake(this.boardLayer, 3, 0.2);
+        }
         if (event.isLethal) {
           screenShake(this.boardLayer, 5, 0.3);
         }
-        await delay(300);
+        await this.scaledDelay(400);
         break;
       }
 
@@ -148,31 +198,59 @@ export class AnimationRouter {
         // Brief notification
         const changeText = `${event.cardName}: ${event.before.lead}/${event.before.support} → ${event.after.lead}/${event.after.support}`;
         showChainNotification(this.effectsLayer, changeText, L.width, L.height);
-        await delay(400);
+        await this.scaledDelay(400);
         break;
       }
 
       case 'counter-changed': {
-        showChainNotification(
-          this.effectsLayer,
-          `${event.cardName}: ${event.counterType} ${event.prevCount}→${event.newCount}`,
-          L.width,
-          L.height,
-        );
-        await delay(400);
+        // Pop badge at card position
+        const counterPos = this.cardPositions.get(event.cardId);
+        const isPositive = event.newCount > event.prevCount;
+        const counterColor = isPositive ? 0x10b981 : 0xef4444;
+        const counterLabel = isPositive ? '+1/+1' : '-1/-1';
+
+        if (counterPos) {
+          const cx = counterPos.x + counterPos.w / 2;
+          const cy = counterPos.y + counterPos.h / 2;
+          const badge = new Text({
+            text: counterLabel,
+            style: new TextStyle({ fontSize: 16, fill: counterColor, fontFamily: FONT, fontWeight: 'bold', stroke: { color: 0x000000, width: 3 } }),
+          });
+          badge.anchor.set(0.5, 0.5);
+          badge.x = cx;
+          badge.y = cy;
+          badge.scale.set(0);
+          this.effectsLayer.addChild(badge);
+          gsap.to(badge.scale, { x: 1.3, y: 1.3, duration: 0.2, ease: 'back.out(3)' });
+          gsap.to(badge, { y: cy - 30, alpha: 0, duration: 0.8, delay: 0.3, ease: 'power2.out', onComplete: () => {
+            this.effectsLayer.removeChild(badge); badge.destroy();
+          }});
+          particleBurst(this.effectsLayer, cx, cy, counterColor, 10);
+        } else {
+          showChainNotification(
+            this.effectsLayer,
+            `${event.cardName}: ${event.counterType} ${event.prevCount}→${event.newCount}`,
+            L.width,
+            L.height,
+          );
+        }
+        await this.scaledDelay(300);
         break;
       }
 
       case 'chain-entry-added': {
-        // Card close-up for chain entries — wait for player click
+        // Card close-up for chain entries — show effect description if available
+        const chainActionText = event.effectDescription
+          ? `CHAIN ${event.chainIndex + 1}\n${event.effectDescription}`
+          : `CHAIN ${event.chainIndex + 1}`;
         await showCardCloseUp(
           this.effectsLayer,
           event.defId,
           event.cardName,
-          `CHAIN ${event.chainIndex + 1}`,
+          chainActionText,
           L.width,
           L.height,
-          { waitForClick: true },
+          { waitForClick: this.humanPlayer !== null },
         );
         break;
       }
@@ -187,11 +265,28 @@ export class AnimationRouter {
           L.width,
           L.height,
         );
-        await delay(500);
+        await this.scaledDelay(300);
         break;
       }
 
       case 'effect-activated': {
+        // Glow emphasis at source card position before close-up
+        // Try to find card position from targets or by searching positions for matching defId
+        const effectPos = (event.targets.length > 0 ? this.cardPositions.get(event.targets[0]) : null)
+          ?? [...this.cardPositions.entries()].find(([, v]) => v.zone === 'kingdom' || v.zone === 'battlefield')?.[1]
+          ?? null;
+        if (effectPos) {
+          const glow = new Graphics();
+          glow.roundRect(effectPos.x - 4, effectPos.y - 4, effectPos.w + 8, effectPos.h + 8, 6);
+          glow.fill({ color: COLORS.accentGold, alpha: 0.2 });
+          glow.stroke({ color: COLORS.accentGold, width: 2, alpha: 0.7 });
+          this.effectsLayer.addChild(glow);
+          gsap.to(glow, { alpha: 0, duration: 0.6, ease: 'power2.out', onComplete: () => {
+            this.effectsLayer.removeChild(glow); glow.destroy();
+          }});
+          particleBurst(this.effectsLayer, effectPos.x + effectPos.w / 2, effectPos.y + effectPos.h / 2, COLORS.accentGold, 10);
+        }
+
         // Show close-up + effect description — wait for player click
         const effectActionText = event.effectDescription
           ? `EFFECT!\n${event.effectDescription}`
@@ -203,21 +298,24 @@ export class AnimationRouter {
           effectActionText,
           L.width,
           L.height,
-          { waitForClick: true },
+          { waitForClick: this.humanPlayer !== null },
         );
         break;
       }
 
       case 'battle-reward': {
         screenFlash(this.effectsLayer, L.width, L.height, COLORS.accentGold);
-        particleBurst(this.effectsLayer, L.width / 2, L.height / 2, COLORS.accentGold, 30);
+        particleBurst(this.effectsLayer, L.width / 2, L.height / 2, COLORS.accentGold, 50);
+        // Secondary gold particles
+        setTimeout(() => particleBurst(this.effectsLayer, L.width * 0.3, L.height / 2, 0xfbbf24, 15), 100);
+        setTimeout(() => particleBurst(this.effectsLayer, L.width * 0.7, L.height / 2, 0xfbbf24, 15), 200);
         showChainNotification(
           this.effectsLayer,
           `BATTLE REWARD! (${event.newTotal}/10)`,
           L.width,
           L.height,
         );
-        await delay(600);
+        await this.scaledDelay(400);
         break;
       }
 
@@ -226,14 +324,14 @@ export class AnimationRouter {
         if (event.toPhase !== 'start' && event.toPhase !== 'setup') {
           showPhaseBanner(this.effectsLayer, phaseText, L.width, L.height);
         }
-        await delay(200);
+        await this.scaledDelay(400);
         break;
       }
 
       case 'turn-change': {
         const label = `TURN ${event.turn}`;
         showTurnBanner(this.effectsLayer, label, L.width, L.height);
-        await delay(800);
+        await this.scaledDelay(600);
         break;
       }
 
@@ -244,7 +342,7 @@ export class AnimationRouter {
           L.width,
           L.height,
         );
-        await delay(300);
+        await this.scaledDelay(300);
         break;
       }
 
@@ -256,12 +354,14 @@ export class AnimationRouter {
           L.width,
           L.height,
         );
-        await delay(300);
+        await this.scaledDelay(300);
         break;
       }
 
       case 'card-destroyed': {
-        screenShake(this.boardLayer, 4, 0.25);
+        screenShake(this.boardLayer, 7, 0.35);
+        // Red screen flash on destruction
+        screenFlash(this.effectsLayer, L.width, L.height, 0xef4444);
         // Shatter at card's actual tracked position (or screen center fallback)
         const destroyPos = this.cardPositions.get(event.cardId);
         const shatterX = destroyPos ? destroyPos.x : L.width / 2 - 36;
@@ -282,7 +382,7 @@ export class AnimationRouter {
           L.width,
           L.height,
         );
-        await delay(200);
+        await this.scaledDelay(300);
         break;
       }
 
@@ -293,7 +393,7 @@ export class AnimationRouter {
           L.width,
           L.height,
         );
-        await delay(event.severity === 'dramatic' ? 600 : 300);
+        await this.scaledDelay(event.severity === 'dramatic' ? 600 : 300);
         break;
       }
 

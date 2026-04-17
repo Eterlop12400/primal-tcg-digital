@@ -65,7 +65,7 @@ export function showTurnBanner(
   });
 
   tl.fromTo(banner, { alpha: 0, x: -screenW }, { alpha: 1, x: 0, duration: 0.3, ease: 'power2.out' })
-    .to(banner, { duration: 1 }) // hold
+    .to(banner, { duration: 0.8 }) // hold
     .to(banner, { alpha: 0, x: screenW, duration: 0.3, ease: 'power2.in' });
 }
 
@@ -156,17 +156,33 @@ export function showPhaseBanner(
     },
   });
 
+  // Screen dim behind banner
+  const dim = new Graphics();
+  dim.rect(0, 0, screenW, screenH);
+  dim.fill({ color: 0x000000, alpha: 0.3 });
+  dim.alpha = 0;
+  parent.addChild(dim);
+  // Make sure banner is above dim
+  parent.removeChild(banner);
+  parent.addChild(banner);
+
   // Diagonal wipe entrance: slide in from left with fade
-  tl.fromTo(banner, { alpha: 0, x: -barW * 0.3 }, { alpha: 1, x: (screenW - barW) / 2, duration: 0.25, ease: 'power3.out' })
+  tl.to(dim, { alpha: 1, duration: 0.15 })
+    .fromTo(banner, { alpha: 0, x: -barW * 0.3 }, { alpha: 1, x: (screenW - barW) / 2, duration: 0.25, ease: 'power3.out' }, '<')
     .fromTo(txt.scale, { x: 1.2, y: 1.2 }, { x: 1, y: 1, duration: 0.2, ease: 'back.out(1.5)' }, '<0.05')
-    // Small particle accent on entrance
+    // Particle accents on entrance
     .call(() => {
-      particleBurst(parent, screenW / 2, banner.y + barH / 2, accentColor, 8);
+      particleBurst(parent, screenW / 2, banner.y + barH / 2, accentColor, 16);
     })
     // Hold
     .to(banner, { duration: 0.5 })
     // Diagonal wipe exit: slide out right
-    .to(banner, { alpha: 0, x: screenW * 0.3, duration: 0.2, ease: 'power2.in' });
+    .to(dim, { alpha: 0, duration: 0.2 })
+    .to(banner, { alpha: 0, x: screenW * 0.3, duration: 0.2, ease: 'power2.in' }, '<')
+    .call(() => {
+      parent.removeChild(dim);
+      dim.destroy();
+    });
 }
 
 // ============================================================
@@ -178,11 +194,17 @@ export function showDamageNumber(
   amount: number,
   x: number,
   y: number,
+  isHeavy = false,
 ): void {
+  const fontSize = isHeavy ? 36 : 28;
+  const popScale = isHeavy ? 2.2 : 1.6;
+  const particleCount = isHeavy ? 12 : 6;
+  const floatDist = 70;
+
   const txt = new Text({
     text: `-${amount}`,
     style: new TextStyle({
-      fontSize: 24,
+      fontSize,
       fill: COLORS.injuredDot,
       fontFamily: FONT,
       fontWeight: 'bold',
@@ -195,10 +217,10 @@ export function showDamageNumber(
   parent.addChild(txt);
 
   // Impact particles on damage
-  particleBurst(parent, x, y, COLORS.injuredDot, 6);
+  particleBurst(parent, x, y, COLORS.injuredDot, particleCount);
 
   gsap.to(txt, {
-    y: y - 60,
+    y: y - floatDist,
     alpha: 0,
     duration: 1,
     ease: 'power2.out',
@@ -208,7 +230,7 @@ export function showDamageNumber(
     },
   });
 
-  gsap.fromTo(txt.scale, { x: 1.5, y: 1.5 }, { x: 1, y: 1, duration: 0.2, ease: 'back.out' });
+  gsap.fromTo(txt.scale, { x: popScale, y: popScale }, { x: 1, y: 1, duration: 0.2, ease: 'back.out' });
 }
 
 // ============================================================
@@ -636,7 +658,7 @@ export function showEffectCallout(
 
       tl.to(c, { alpha: 1, duration: 0.2 })
         .to(c.scale, { x: 1, y: 1, duration: 0.2, ease: 'back.out(1.5)' }, '<')
-        .to(c, { duration: 1.5 }) // Hold longer for reading
+        .to(c, { duration: 0.7 }) // Hold for reading
         .to(c, { alpha: 0, y: c.y - 20, duration: 0.3, ease: 'power2.in' });
     }
   });
@@ -667,7 +689,7 @@ export function showTeamClash(
 
     const atkTxt = new Text({
       text: `${attackerPower}`,
-      style: new TextStyle({ fontSize: 20, fill: 0xffffff, fontFamily: FONT, fontWeight: 'bold' }),
+      style: new TextStyle({ fontSize: 28, fill: 0xffffff, fontFamily: FONT, fontWeight: 'bold' }),
     });
     atkTxt.anchor.set(0.5, 0.5);
     atkIndicator.addChild(atkTxt);
@@ -682,7 +704,7 @@ export function showTeamClash(
 
     const blkTxt = new Text({
       text: `${blockerPower}`,
-      style: new TextStyle({ fontSize: 20, fill: 0xffffff, fontFamily: FONT, fontWeight: 'bold' }),
+      style: new TextStyle({ fontSize: 28, fill: 0xffffff, fontFamily: FONT, fontWeight: 'bold' }),
     });
     blkTxt.anchor.set(0.5, 0.5);
     blkIndicator.addChild(blkTxt);
@@ -703,12 +725,34 @@ export function showTeamClash(
       // Impact
       .call(() => {
         screenShake(parent, 8, 0.35);
-        particleBurst(parent, centerX, centerY, 0xffffff, 24);
-        particleBurst(parent, centerX, centerY, COLORS.accentGold, 8);
+        particleBurst(parent, centerX, centerY, 0xffffff, 40);
+        particleBurst(parent, centerX, centerY, COLORS.accentGold, 12);
         screenFlash(parent, screenW, screenH, 0xffffff);
       })
+      // Result text
+      .call(() => {
+        const resultLabel = attackerPower > blockerPower ? 'ATTACKER WINS!'
+          : blockerPower > attackerPower ? 'DEFENDER WINS!'
+          : 'DRAW!';
+        const resultColor = attackerPower > blockerPower ? 0xef4444
+          : blockerPower > attackerPower ? 0x3b82f6
+          : 0xf59e0b;
+        const resultTxt = new Text({
+          text: resultLabel,
+          style: new TextStyle({ fontSize: 22, fill: resultColor, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 3, stroke: { color: 0x000000, width: 3 } }),
+        });
+        resultTxt.anchor.set(0.5, 0.5);
+        resultTxt.x = centerX;
+        resultTxt.y = centerY + 40;
+        resultTxt.alpha = 0;
+        parent.addChild(resultTxt);
+        gsap.to(resultTxt, { alpha: 1, duration: 0.15 });
+        gsap.to(resultTxt, { alpha: 0, duration: 0.3, delay: 0.5, onComplete: () => {
+          parent.removeChild(resultTxt); resultTxt.destroy();
+        }});
+      })
       // Hold
-      .to({}, { duration: 0.4 })
+      .to({}, { duration: 0.6 })
       // Fade out
       .to(atkIndicator, { alpha: 0, duration: 0.2 })
       .to(blkIndicator, { alpha: 0, duration: 0.2 }, '<');
@@ -726,10 +770,10 @@ export function showBattleRewardCelebration(
   rewardCount: number,
 ): void {
   // Multi-wave particle bursts (center + offset positions)
-  particleBurst(parent, screenW / 2, screenH / 2, COLORS.accentGold, 30);
-  // Delayed secondary bursts at offset positions
-  setTimeout(() => particleBurst(parent, screenW * 0.35, screenH / 2 - 20, COLORS.accentGold, 12), 100);
-  setTimeout(() => particleBurst(parent, screenW * 0.65, screenH / 2 + 20, COLORS.accentGold, 12), 200);
+  particleBurst(parent, screenW / 2, screenH / 2, COLORS.accentGold, 50);
+  // Delayed secondary gold bursts at offset positions
+  setTimeout(() => particleBurst(parent, screenW * 0.35, screenH / 2 - 20, 0xfbbf24, 18), 100);
+  setTimeout(() => particleBurst(parent, screenW * 0.65, screenH / 2 + 20, 0xfbbf24, 18), 200);
 
   // Screen flash
   screenFlash(parent, screenW, screenH, COLORS.accentGold);
@@ -787,6 +831,44 @@ export function showBattleRewardCelebration(
   tl.fromTo(banner, { alpha: 0, x: -screenW * 0.3 }, { alpha: 1, x: screenW * 0.2, duration: 0.3, ease: 'power2.out' })
     .to(banner, { duration: 0.8 }) // hold
     .to(banner, { alpha: 0, x: screenW, duration: 0.3, ease: 'power2.in' });
+}
+
+// ============================================================
+// Pass Priority Indicator
+// ============================================================
+
+export function showPassIndicator(
+  parent: Container,
+  screenW: number,
+  screenH: number,
+  isPlayer: boolean,
+): void {
+  const txt = new Text({
+    text: 'PASS',
+    style: new TextStyle({
+      fontSize: 18,
+      fill: 0x6b7280,
+      fontFamily: FONT,
+      fontWeight: 'bold',
+      letterSpacing: 4,
+    }),
+  });
+  txt.anchor.set(0.5, 0.5);
+  txt.x = screenW / 2;
+  txt.y = isPlayer ? screenH * 0.65 : screenH * 0.35;
+  txt.alpha = 0;
+  parent.addChild(txt);
+
+  const tl = gsap.timeline({
+    onComplete: () => {
+      parent.removeChild(txt);
+      txt.destroy();
+    },
+  });
+
+  tl.to(txt, { alpha: 0.8, duration: 0.15 })
+    .to(txt, { duration: 0.3 }) // hold
+    .to(txt, { alpha: 0, y: txt.y - 20, duration: 0.4, ease: 'power2.out' });
 }
 
 // ============================================================

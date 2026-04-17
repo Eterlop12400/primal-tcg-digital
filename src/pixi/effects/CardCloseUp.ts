@@ -187,9 +187,29 @@ export function showCardCloseUp(
           });
         });
     } else {
-      // Auto-dismiss with dramatic entrance
+      // Auto-dismiss with dramatic entrance + click-to-dismiss early
+      let dismissed = false;
+      const dismissEarly = () => {
+        if (dismissed) return;
+        dismissed = true;
+        gsap.killTweensOf(container);
+        gsap.to(container, {
+          alpha: 0,
+          y: -20,
+          duration: 0.2,
+          ease: 'power2.in',
+          onComplete: cleanup,
+        });
+      };
+
+      // Make backdrop clickable to dismiss early
+      backdrop.cursor = 'pointer';
+      backdrop.on('pointerdown', dismissEarly);
+
       const tl = gsap.timeline({
-        onComplete: cleanup,
+        onComplete: () => {
+          if (!dismissed) cleanup();
+        },
       });
 
       // Animate in
@@ -202,8 +222,8 @@ export function showCardCloseUp(
         // Staggered text reveal
         .to(nameTxt, { alpha: 1, duration: 0.15 }, '+=0.05')
         .to(actionTxt, { alpha: 1, duration: 0.15 }, '+=0.05')
-        // Hold
-        .to(container, { duration: 0.4 })
+        // Hold for readability
+        .to(container, { duration: 0.6 })
         // Fade out upward
         .to(container, { alpha: 0, y: -20, duration: 0.2, ease: 'power2.in' });
     }

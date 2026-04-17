@@ -51,7 +51,9 @@ export type SelectionMode =
   // Strategy target selection (e.g., Hard Decision — pick a character to sacrifice)
   | { type: 'strategy-target-select'; strategyCardId: string; handCostCardIds: string[]; validTargetIds: string[] }
   // Essence activation overlay (e.g., Unknown Pathway activate from essence)
-  | { type: 'essence-activate-select'; validCardIds: string[] };
+  | { type: 'essence-activate-select'; validCardIds: string[] }
+  // Character activate effect confirmation (preview before committing)
+  | { type: 'character-activate-confirm'; cardId: string; effectId: string };
 
 export interface UIState {
   gameState: GameState | null;

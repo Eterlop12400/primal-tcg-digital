@@ -321,6 +321,7 @@ export class TeamOrgOverlay extends Container {
           stats = getEffectiveStats(state, cid);
         } catch { /* skip */ }
 
+        const isInjured = inst.state === 'injured';
         const card = new CardSprite({
           defId: inst.defId,
           size: cardSize,
@@ -328,6 +329,7 @@ export class TeamOrgOverlay extends Container {
           instance: inst,
           effectiveStats: stats,
           interactive: true,
+          injured: isInjured,
         });
 
         // Pyramid positioning
@@ -347,8 +349,14 @@ export class TeamOrgOverlay extends Container {
           cardY = topCardY + cardSize.height * 0.65;
         }
 
-        card.x = cardX;
-        card.y = cardY;
+        if (isInjured) {
+          // Injured cards use pivot-based rotation, position at center
+          card.x = cardX + cardSize.width / 2;
+          card.y = cardY + cardSize.height / 2;
+        } else {
+          card.x = cardX;
+          card.y = cardY;
+        }
 
         // Role badge
         const roleIsLead = ci === 0;

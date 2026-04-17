@@ -67,6 +67,7 @@ export interface ChainEntryAddedEvent extends BaseAnimationEvent {
   cardName: string;
   defId: string;
   effectName: string;
+  effectDescription?: string;
   targets: string[];
 }
 

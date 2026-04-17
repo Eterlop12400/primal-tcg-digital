@@ -973,6 +973,8 @@ const effectHandlers: Record<string, EffectHandler> = {
           if (d.cardType === 'character' && (d as CharacterCardDef).attributes.includes('Sea Monster')) seaMonsterCount++;
         } catch { /* skip */ }
       }
+      // Oceanic Abyss E2 — virtual Sea Monster character (must match post-approval check)
+      seaMonsterCount += oceanicAbyssVirtualCharCount(state, player, { attribute: 'Sea Monster' });
       if (seaMonsterCount < 3) return; // silently skip
 
       // Check if opponent has valid targets (TC ≤ 3 characters)

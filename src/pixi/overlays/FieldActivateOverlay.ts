@@ -9,6 +9,7 @@ import { Container, Graphics, Text, TextStyle } from 'pixi.js';
 import { COLORS, BoardLayout } from '../layout';
 import { FONT } from '../SharedStyles';
 import type { UIAction } from '@/hooks/useGameEngine';
+import { fadeInOverlay } from './overlayTransitions';
 
 interface FieldEffect {
   index: number;
@@ -200,5 +201,7 @@ export class FieldActivateOverlay extends Container {
     cancelTxt.x = cancelX + cancelW / 2;
     cancelTxt.y = cancelY + cancelH / 2;
     this.addChild(cancelTxt);
+
+    fadeInOverlay(this);
   }
 }

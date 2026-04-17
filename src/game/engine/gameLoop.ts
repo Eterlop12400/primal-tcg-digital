@@ -29,6 +29,7 @@ import {
   setupNextEssenceRedirectPrompt,
 } from './utils';
 import { resolveChain, flushPendingTriggers } from './chainResolver';
+import type { EventCollector } from './EventCollector';
 
 // ============================================================
 // Phase Transitions
@@ -219,8 +220,18 @@ export function advanceToShowdown(state: GameState): void {
   }
 }
 
-export function advanceToEndPhase(state: GameState): void {
+export function advanceToEndPhase(state: GameState, collector?: EventCollector): void {
+  const prevPhase = state.phase;
   state.phase = 'end';
+  // Only emit phase-change on first entry (not re-entry after pause)
+  if (prevPhase !== 'end') {
+    collector?.emit({
+      type: 'phase-change',
+      player: state.currentTurn,
+      fromPhase: prevPhase,
+      toPhase: 'end',
+    });
+  }
   const player = state.currentTurn;
   const opponent = getOpponent(player);
 
@@ -360,10 +371,10 @@ export function advanceToEndPhase(state: GameState): void {
   }
 
   // Hand is fine — finish the end phase immediately
-  finishEndPhase(state);
+  finishEndPhase(state, collector);
 }
 
-export function finishEndPhase(state: GameState): void {
+export function finishEndPhase(state: GameState, collector?: EventCollector): void {
   const player = state.currentTurn;
   const opponent = getOpponent(player);
 
@@ -389,6 +400,20 @@ export function finishEndPhase(state: GameState): void {
   state.isFirstTurn = false;
 
   addLog(state, nextPlayer, 'new-turn', `Turn ${state.turnNumber} — ${nextPlayer}'s turn`);
+
+  // Emit turn-change and phase-change events
+  collector?.emit({
+    type: 'turn-change',
+    player: nextPlayer,
+    turn: state.turnNumber,
+    activePlayer: nextPlayer,
+  });
+  collector?.emit({
+    type: 'phase-change',
+    player: nextPlayer,
+    fromPhase: 'end',
+    toPhase: 'start',
+  });
 
   // Begin next player's Start Phase
   advanceToStartPhase(state);
@@ -526,7 +551,8 @@ export function organizeTeams(
 
 export function sendAttackers(
   state: GameState,
-  teamIds: string[]
+  teamIds: string[],
+  collector?: EventCollector,
 ): void {
   for (const teamId of teamIds) {
     const team = state.teams[teamId];
@@ -543,7 +569,7 @@ export function sendAttackers(
   if (teamIds.length === 0) {
     // No attackers = skip to End Phase
     addLog(state, state.currentTurn, 'no-attack', 'No teams sent to attack');
-    advanceToEndPhase(state);
+    advanceToEndPhase(state, collector);
     return;
   }
 
@@ -891,6 +917,14 @@ function awardBattleRewards(
     card.zone = 'battle-rewards';
     state.players[losingPlayer].battleRewards.push(cardId);
   }
+
+  // Check for game-over immediately after awarding BRs
+  if (state.players[losingPlayer].battleRewards.length >= 10) {
+    state.gameOver = true;
+    state.winner = winningPlayer;
+    state.winReason = 'battle-rewards';
+    addLog(state, winningPlayer, 'win', `${winningPlayer} wins — ${losingPlayer} has 10+ Battle Rewards!`);
+  }
 }
 
 // Return all battlefield characters to kingdom after showdown
@@ -929,7 +963,7 @@ export function returnFromBattlefield(state: GameState): void {
 // Priority / Pass Handling
 // ============================================================
 
-export function handlePassPriority(state: GameState, collector?: import('./EventCollector').EventCollector): void {
+export function handlePassPriority(state: GameState, collector?: EventCollector): void {
   state.consecutivePasses += 1;
 
   if (state.consecutivePasses >= 2) {
@@ -939,16 +973,30 @@ export function handlePassPriority(state: GameState, collector?: import('./Event
     if (state.chain.length > 0 && !state.isChainResolving) {
       resolveChain(state, collector);
     } else {
-      // No chain — advance to next phase
-      const prevPhase = state.phase;
-      advancePhase(state);
-      if (state.phase !== prevPhase) {
-        collector?.emit({
-          type: 'phase-change',
-          player: state.currentTurn,
-          fromPhase: prevPhase,
-          toPhase: state.phase,
-        });
+      // Promote any pending triggers to chain before advancing
+      if (state.pendingTriggers.length > 0) {
+        const turnPlayerTriggers = state.pendingTriggers.filter(t => t.owner === state.currentTurn);
+        const nonTurnPlayerTriggers = state.pendingTriggers.filter(t => t.owner !== state.currentTurn);
+        state.pendingTriggers = [];
+        for (const trigger of [...turnPlayerTriggers, ...nonTurnPlayerTriggers]) {
+          state.chain.push(trigger);
+        }
+        state.consecutivePasses = 0;
+        resolveChain(state, collector);
+      } else {
+        // No chain and no triggers — advance to next phase
+        const prevPhase = state.phase;
+        advancePhase(state, collector);
+        // Emit phase-change for simple transitions (main→org, eoa→showdown).
+        // The showdown→end→start path emits its own events inside advanceToEndPhase/finishEndPhase.
+        if (state.phase !== prevPhase && prevPhase !== 'battle-showdown') {
+          collector?.emit({
+            type: 'phase-change',
+            player: state.currentTurn,
+            fromPhase: prevPhase,
+            toPhase: state.phase,
+          });
+        }
       }
     }
   } else {
@@ -957,7 +1005,7 @@ export function handlePassPriority(state: GameState, collector?: import('./Event
   }
 }
 
-function advancePhase(state: GameState): void {
+function advancePhase(state: GameState, collector?: EventCollector): void {
   switch (state.phase) {
     case 'main':
       advanceToOrganizationPhase(state);
@@ -967,7 +1015,7 @@ function advancePhase(state: GameState): void {
       break;
     case 'battle-showdown':
       returnFromBattlefield(state);
-      advanceToEndPhase(state);
+      advanceToEndPhase(state, collector);
       break;
     default:
       break;

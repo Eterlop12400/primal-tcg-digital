@@ -44,17 +44,19 @@ export class BattleOverlay extends Container {
   private selectedBlockerTeamId: string | null = null;
   private showdownOrder: string[] = [];
 
+  private chainGrew: boolean;
+
   constructor(
     state: GameState,
     ui: UIState,
     layout: BoardLayout,
     dispatch: (action: UIAction) => void,
+    chainGrew = false,
   ) {
     super();
+    this.chainGrew = chainGrew;
 
     const phase = state.phase;
-    const isEOAPhase = phase === 'battle-eoa';
-
     // Phase accent color
     const phaseColor =
       phase === 'battle-attack' ? 0xef4444 :
@@ -62,13 +64,24 @@ export class BattleOverlay extends Container {
       phase === 'battle-showdown' ? 0xf59e0b :
       0x8b5cf6;
 
-    // Deep backdrop with radial glow (matches TeamOrg/Mulligan)
+    // Deep backdrop — visual fill covers full screen, event blocker is shorter
+    // during EOA so hand cards beneath remain clickable for playing abilities
+    const isEOAPhase = phase === 'battle-eoa';
+    const backdropH = layout.height;
     const backdrop = new Graphics();
-    const backdropH = isEOAPhase ? layout.playerY + 20 : layout.height;
     backdrop.rect(0, 0, layout.width, backdropH);
     backdrop.fill({ color: 0x050a14, alpha: 0.88 });
-    backdrop.eventMode = 'static';
+    backdrop.eventMode = 'none'; // Visual only — doesn't block clicks
     this.addChild(backdrop);
+
+    // Event blocker — captures clicks to prevent board interaction
+    // During EOA, only block the upper portion so hand area stays interactive
+    const eventBlocker = new Graphics();
+    const blockerH = isEOAPhase ? layout.playerY + 20 : layout.height;
+    eventBlocker.rect(0, 0, layout.width, blockerH);
+    eventBlocker.fill({ color: 0x000000, alpha: 0.001 });
+    eventBlocker.eventMode = 'static';
+    this.addChild(eventBlocker);
 
     // Radial glow using phaseColor
     const glow = new Graphics();
@@ -104,8 +117,8 @@ export class BattleOverlay extends Container {
       });
     }
 
-    // Static children: backdrop(1) + glow(1) + particles(8) = 10
-    const staticChildCount = 2 + particleCount;
+    // Static children: backdrop(1) + eventBlocker(1) + glow(1) + particles(8) = 11
+    const staticChildCount = 3 + particleCount;
 
     // Rebuild closure for local state changes
     const rebuild = () => {
@@ -134,7 +147,7 @@ export class BattleOverlay extends Container {
     const actingPlayer = getActingPlayer(state);
     const isMyTurn = actingPlayer === humanPlayer;
     const legalActions = getLegalActions(state, humanPlayer);
-    const cardSize = CARD_SIZES.lg;
+    const cardSize = CARD_SIZES.md;
 
     const allTeams = Object.values(state.teams);
     const attackingTeams = allTeams.filter((t) => t.isAttacking);
@@ -237,15 +250,42 @@ export class BattleOverlay extends Container {
       }
     }
 
+    // EOA priority hints
+    if (isEOA && !hintText) {
+      if (isMyTurn) {
+        hintText = 'YOUR PRIORITY — Play an ability or pass';
+      } else {
+        hintText = 'OPPONENT IS DECIDING';
+      }
+    }
+
     if (hintText) {
       const hint = new Text({
         text: hintText,
-        style: new TextStyle({ fontSize: 14, fill: COLORS.textMuted, fontFamily: FONT }),
+        style: new TextStyle({ fontSize: 14, fill: isEOA && isMyTurn ? 0x22d3ee : COLORS.textMuted, fontFamily: FONT, fontWeight: isEOA ? 'bold' : 'normal' }),
       });
       hint.anchor.set(0.5, 0);
       hint.x = layout.width / 2;
       hint.y = cy;
       content.addChild(hint);
+
+      // Pulsing dots when waiting for opponent during EOA
+      if (isEOA && !isMyTurn) {
+        for (let di = 0; di < 3; di++) {
+          const dot = new Graphics();
+          dot.circle(0, 0, 3);
+          dot.fill({ color: COLORS.textMuted });
+          dot.x = hint.x + hint.width / 2 + 12 + di * 10;
+          dot.y = cy + 8;
+          dot.alpha = 0.3;
+          content.addChild(dot);
+          gsap.to(dot, {
+            alpha: 1, duration: 0.5, repeat: -1, yoyo: true,
+            delay: di * 0.15, ease: 'sine.inOut',
+          });
+        }
+      }
+
       cy += 26;
     }
 
@@ -263,9 +303,10 @@ export class BattleOverlay extends Container {
     const matchupY = cy;
 
     // Calculate panel height based on actual content
-    // Top label(20) + top cards(cardSize.height) + VS bar(50) + bottom label(20) + bottom cards(cardSize.height) + padding(32)
-    const vsBarH = 46;
-    const panelH = 20 + cardSize.height + vsBarH + 20 + cardSize.height + 32 + (isShowdown ? 26 : 0);
+    // pyramidCardH accounts for stacked teams (leader + supports offset 65% below)
+    const pyramidCardH = Math.ceil(cardSize.height * 1.65);
+    const vsBarH = 36;
+    const panelH = 20 + pyramidCardH + vsBarH + 20 + pyramidCardH + 24 + (isShowdown ? 26 : 0);
 
     for (let mi = 0; mi < matchups.length; mi++) {
       const matchup = matchups[mi];
@@ -283,10 +324,20 @@ export class BattleOverlay extends Container {
       const orderIndex = this.showdownOrder.indexOf(matchup.attackingTeamId);
       const isOrdered = orderIndex !== -1;
 
-      // Panel outer glow
+      // Showdown winner prediction
+      const hasBlocker = !!matchup.blockingTeamId;
+      const atkWins = hasBlocker ? matchup.attackingPower > matchup.blockingPower : true;
+      const blkWins = hasBlocker ? matchup.blockingPower > matchup.attackingPower : false;
+      const winnerGlowColor = isShowdown ? (atkWins ? 0xef4444 : blkWins ? 0x3b82f6 : 0) : 0;
+
+      // Panel outer glow — enhanced during showdown for winner
       const panelGlow = new Graphics();
       panelGlow.roundRect(mx - 3, matchupY - 3, matchupW + 6, panelH + 6, 12);
-      panelGlow.stroke({ color: phaseColor, width: 1, alpha: 0.08 });
+      if (isShowdown && winnerGlowColor) {
+        panelGlow.stroke({ color: winnerGlowColor, width: 2, alpha: 0.3 });
+      } else {
+        panelGlow.stroke({ color: phaseColor, width: 1, alpha: 0.08 });
+      }
       content.addChild(panelGlow);
 
       // Panel background
@@ -295,6 +346,18 @@ export class BattleOverlay extends Container {
       const panelBorderColor = isOrdered ? 0xf59e0b : phaseColor;
       panel.fill({ color: 0x0f1729, alpha: 0.9 });
       panel.stroke({ color: panelBorderColor, width: isOrdered ? 2 : 1, alpha: isOrdered ? 0.6 : 0.15 });
+
+      // Colored side accent bars — red left (attack), blue right (block)
+      const accentW = 4;
+      const accentInset = 8;
+      const atkAccent = new Graphics();
+      atkAccent.roundRect(mx + accentInset, matchupY + accentInset, accentW, panelH - accentInset * 2, 2);
+      atkAccent.fill({ color: 0xef4444, alpha: 0.5 });
+      content.addChild(atkAccent);
+      const blkAccent = new Graphics();
+      blkAccent.roundRect(mx + matchupW - accentInset - accentW, matchupY + accentInset, accentW, panelH - accentInset * 2, 2);
+      blkAccent.fill({ color: 0x3b82f6, alpha: 0.5 });
+      content.addChild(blkAccent);
 
       // Click handlers
       if (needsOrdering && isPlayerAttacker) {
@@ -341,38 +404,72 @@ export class BattleOverlay extends Container {
       // --- Opponent side (top half of panel) ---
       const opponentTeamId = isPlayerAttacker ? assignedBlockerId : matchup.attackingTeamId;
       const opponentLabel = isPlayerAttacker
-        ? (assignedBlockerId ? 'OPPONENT BLOCK' : null)
-        : 'OPPONENT ATTACK';
+        ? (assignedBlockerId ? 'BLOCKING' : null)
+        : 'ATTACKING';
+      const opponentLabelColor = isPlayerAttacker ? 0x60a5fa : 0xef4444;
 
       if (opponentTeamId && state.teams[opponentTeamId]) {
         if (opponentLabel) {
+          // Role pill badge
+          const pillW = 90;
+          const pillH = 18;
+          const pillX = mx + matchupW / 2 - pillW / 2;
+          const roleIcon = isPlayerAttacker ? '\u{1F6E1}' : '\u2694';
+          const rolePill = new Graphics();
+          rolePill.roundRect(pillX, pcy, pillW, pillH, pillH / 2);
+          rolePill.fill({ color: opponentLabelColor, alpha: 0.15 });
+          rolePill.stroke({ color: opponentLabelColor, width: 1, alpha: 0.4 });
+          content.addChild(rolePill);
           const lbl = new Text({
-            text: opponentLabel,
-            style: new TextStyle({ fontSize: 12, fill: isPlayerAttacker ? 0x60a5fa : 0xf87171, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
+            text: `${roleIcon} ${opponentLabel}`,
+            style: new TextStyle({ fontSize: 10, fill: opponentLabelColor, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
           });
-          lbl.anchor.set(0.5, 0);
+          lbl.anchor.set(0.5, 0.5);
           lbl.x = mx + matchupW / 2;
-          lbl.y = pcy;
+          lbl.y = pcy + pillH / 2;
           content.addChild(lbl);
-          pcy += 20;
+          pcy += 22;
         }
         pcy = this.renderTeamCards(content, state, state.teams[opponentTeamId], contentX, pcy, contentW, cardSize);
       } else if (isPlayerAttacker) {
-        // Unblocked placeholder
+        // Unblocked placeholder with dashed outline
         const placeholderBg = new Graphics();
         placeholderBg.roundRect(contentX, pcy, contentW, cardSize.height, 6);
         placeholderBg.fill({ color: 0x111827, alpha: 0.5 });
         placeholderBg.stroke({ color: 0x1e293b, width: 1, alpha: 0.3 });
         content.addChild(placeholderBg);
 
+        // Dashed outline pill for "UNBLOCKED"
+        const ubPillW = 110;
+        const ubPillH = 22;
+        const ubPillX = mx + matchupW / 2 - ubPillW / 2;
+        const ubPillY = pcy + cardSize.height / 2 - ubPillH / 2 - 6;
+        const ubPill = new Graphics();
+        ubPill.roundRect(ubPillX, ubPillY, ubPillW, ubPillH, ubPillH / 2);
+        ubPill.stroke({ color: COLORS.textMuted, width: 1, alpha: 0.4 });
+        content.addChild(ubPill);
+
+        const unblockedLabel = isDefender ? 'TAP TO ASSIGN' : '\u2014 UNBLOCKED';
         const unblockedTxt = new Text({
-          text: isDefender ? 'TAP TO ASSIGN BLOCKER' : 'UNBLOCKED',
-          style: new TextStyle({ fontSize: 14, fill: COLORS.textMuted, fontFamily: FONT, fontStyle: 'italic' }),
+          text: unblockedLabel,
+          style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
         });
         unblockedTxt.anchor.set(0.5, 0.5);
         unblockedTxt.x = mx + matchupW / 2;
-        unblockedTxt.y = pcy + cardSize.height / 2;
+        unblockedTxt.y = ubPillY + ubPillH / 2;
         content.addChild(unblockedTxt);
+
+        if (isDefender) {
+          const tapHint = new Text({
+            text: 'Select a team below first',
+            style: new TextStyle({ fontSize: 10, fill: COLORS.textMuted, fontFamily: FONT, fontStyle: 'italic' }),
+          });
+          tapHint.anchor.set(0.5, 0.5);
+          tapHint.x = mx + matchupW / 2;
+          tapHint.y = ubPillY + ubPillH + 12;
+          content.addChild(tapHint);
+        }
+
         pcy += cardSize.height + 4;
       }
 
@@ -443,45 +540,54 @@ export class BattleOverlay extends Container {
 
       // --- Player side (bottom half of panel) ---
       const playerTeamId = isPlayerAttacker ? matchup.attackingTeamId : assignedBlockerId;
-      const playerLabel = isPlayerAttacker ? 'YOUR ATTACK' : (assignedBlockerId ? 'YOUR BLOCK' : null);
+      const playerLabel = isPlayerAttacker ? 'ATTACKING' : (assignedBlockerId ? 'BLOCKING' : null);
+      const playerLabelColor = isPlayerAttacker ? 0xef4444 : 0x60a5fa;
 
       if (playerTeamId && state.teams[playerTeamId]) {
         if (playerLabel) {
+          // Role pill badge
+          const pillW = 90;
+          const pillH = 18;
+          const pillX = mx + matchupW / 2 - pillW / 2;
+          const roleIcon = isPlayerAttacker ? '\u2694' : '\u{1F6E1}';
+          const rolePill = new Graphics();
+          rolePill.roundRect(pillX, pcy, pillW, pillH, pillH / 2);
+          rolePill.fill({ color: playerLabelColor, alpha: 0.15 });
+          rolePill.stroke({ color: playerLabelColor, width: 1, alpha: 0.4 });
+          content.addChild(rolePill);
           const lbl = new Text({
-            text: playerLabel,
-            style: new TextStyle({ fontSize: 12, fill: isPlayerAttacker ? 0xf87171 : 0x60a5fa, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
+            text: `${roleIcon} ${playerLabel}`,
+            style: new TextStyle({ fontSize: 10, fill: playerLabelColor, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
           });
-          lbl.anchor.set(0.5, 0);
+          lbl.anchor.set(0.5, 0.5);
           lbl.x = mx + matchupW / 2;
-          lbl.y = pcy;
+          lbl.y = pcy + pillH / 2;
           content.addChild(lbl);
-          pcy += 20;
+          pcy += 22;
         }
         this.renderTeamCards(content, state, state.teams[playerTeamId], contentX, pcy, contentW, cardSize);
       }
 
-      // Showdown result prediction
+      // Showdown result prediction (uses atkWins/blkWins computed above)
       if (isShowdown) {
-        const hasBlocker = !!matchup.blockingTeamId;
-        const atkWins = hasBlocker ? matchup.attackingPower > matchup.blockingPower : true;
-        const blkWins = hasBlocker ? matchup.blockingPower > matchup.attackingPower : false;
         const stalemate = hasBlocker ? matchup.attackingPower === matchup.blockingPower : false;
-        const resultLabel = atkWins ? 'Attacker Wins!' : blkWins ? 'Blocker Wins!' : stalemate ? 'Stalemate' : 'Unblocked';
-        const resultColor = atkWins ? 0xf87171 : blkWins ? 0x60a5fa : COLORS.textMuted;
+        const resultLabel = atkWins ? 'ATTACKER WINS' : blkWins ? 'BLOCKER WINS' : stalemate ? 'STALEMATE' : 'UNBLOCKED';
+        const resultColor = atkWins ? 0xef4444 : blkWins ? 0x3b82f6 : COLORS.textMuted;
 
         // Glow bg pill behind result text
-        const pillW = 140;
-        const pillH = 22;
+        const pillW = 150;
+        const pillH = 24;
         const pillX = mx + matchupW / 2 - pillW / 2;
         const pillY = matchupY + panelH - 10 - pillH;
         const resultPill = new Graphics();
-        resultPill.roundRect(pillX, pillY, pillW, pillH, 11);
-        resultPill.fill({ color: resultColor, alpha: 0.12 });
+        resultPill.roundRect(pillX, pillY, pillW, pillH, pillH / 2);
+        resultPill.fill({ color: resultColor, alpha: 0.15 });
+        resultPill.stroke({ color: resultColor, width: 1, alpha: 0.3 });
         content.addChild(resultPill);
 
         const resultTxt = new Text({
-          text: resultLabel.toUpperCase(),
-          style: new TextStyle({ fontSize: 14, fill: resultColor, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
+          text: resultLabel,
+          style: new TextStyle({ fontSize: 12, fill: resultColor, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 2 }),
         });
         resultTxt.anchor.set(0.5, 0.5);
         resultTxt.x = mx + matchupW / 2;
@@ -513,44 +619,103 @@ export class BattleOverlay extends Container {
       content.addChild(chainLabel);
       cy += 22;
 
-      // Feed entries (rendered in chain order — newest at bottom)
-      const feedW = Math.min(520, layout.width - 60);
+      // Feed entries — visual card-based layout
+      const feedW = Math.min(540, layout.width - 40);
       const feedX = (layout.width - feedW) / 2;
-      const rowH = 32;
+      const miniSize = CARD_SIZES.sm;
+      const rowH = miniSize.height + 20; // card height + padding
 
       for (let ci = 0; ci < state.chain.length; ci++) {
         const entry = state.chain[ci];
         const rowY = cy;
 
-        // Alternating row background
+        const isNewest = ci === state.chain.length - 1;
+        const isUnresolved = !entry.resolved && !entry.negated;
+        const isPlayerOwned = entry.owner === humanPlayer;
+
+        // Row container for slide animation
+        const rowContainer = new Container();
+        content.addChild(rowContainer);
+
+        // Row background
         const rowBg = new Graphics();
-        rowBg.roundRect(feedX, rowY, feedW, rowH, 4);
-        rowBg.fill({ color: 0xffffff, alpha: ci % 2 === 0 ? 0.04 : 0.08 });
-        content.addChild(rowBg);
+        rowBg.roundRect(feedX, rowY, feedW, rowH, 6);
+        rowBg.fill({ color: isUnresolved ? phaseColor : 0xffffff, alpha: isUnresolved ? 0.08 : 0.04 });
+        if (isUnresolved) {
+          rowBg.stroke({ color: phaseColor, width: 1, alpha: 0.15 });
+        }
+        rowContainer.addChild(rowBg);
 
+        // Slide newest entry in from left
+        if (isNewest && this.chainGrew) {
+          rowContainer.x = -120;
+          rowContainer.alpha = 0;
+          gsap.to(rowContainer, { x: 0, alpha: 1, duration: 0.3, ease: 'back.out(1.2)' });
+        }
+        if (isUnresolved) {
+          gsap.to(rowBg, { alpha: 0.03, duration: 0.8, repeat: -1, yoyo: true, ease: 'sine.inOut' });
+        }
+
+        const rowMidY = rowY + rowH / 2;
         let rx = feedX + 10;
-        const rowCenterY = rowY + rowH / 2;
 
-        // Owner color dot
-        const dotColor = entry.owner === humanPlayer ? COLORS.player1Color : COLORS.player2Color;
-        const dot = new Graphics();
-        dot.circle(rx + 4, rowCenterY, 4);
-        dot.fill({ color: dotColor });
-        content.addChild(dot);
-        rx += 16;
-
-        // Entry number
-        const numTxt = new Text({
-          text: `#${ci + 1}`,
-          style: new TextStyle({ fontSize: 11, fill: COLORS.textMuted, fontFamily: FONT }),
+        // Owner pill (YOU / OPP)
+        const ownerLabel = isPlayerOwned ? 'YOU' : 'OPP';
+        const ownerColor = isPlayerOwned ? COLORS.player1Color : COLORS.player2Color;
+        const ownerPillW = 36;
+        const ownerPillH = 16;
+        const ownerPill = new Graphics();
+        ownerPill.roundRect(rx, rowMidY - ownerPillH / 2, ownerPillW, ownerPillH, ownerPillH / 2);
+        ownerPill.fill({ color: ownerColor, alpha: 0.2 });
+        ownerPill.stroke({ color: ownerColor, width: 1, alpha: 0.4 });
+        rowContainer.addChild(ownerPill);
+        const ownerTxt = new Text({
+          text: ownerLabel,
+          style: new TextStyle({ fontSize: 9, fill: ownerColor, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
         });
-        numTxt.anchor.set(0, 0.5);
-        numTxt.x = rx;
-        numTxt.y = rowCenterY;
-        content.addChild(numTxt);
-        rx += numTxt.width + 8;
+        ownerTxt.anchor.set(0.5, 0.5);
+        ownerTxt.x = rx + ownerPillW / 2;
+        ownerTxt.y = rowMidY;
+        rowContainer.addChild(ownerTxt);
+        rx += ownerPillW + 8;
 
-        // Ability card name
+        // --- User character mini card ---
+        if (entry.userId) {
+          const userInst = state.cards[entry.userId];
+          if (userInst) {
+            let userDef: CardDef | undefined;
+            let userStats: { lead: number; support: number } | undefined;
+            try {
+              userDef = getCardDefForInstance(state, entry.userId);
+              userStats = getEffectiveStats(state, entry.userId);
+            } catch { /* skip */ }
+
+            const userCard = new CardSprite({
+              defId: userInst.defId,
+              size: miniSize,
+              cardDef: userDef,
+              instance: userInst,
+              effectiveStats: userStats,
+            });
+            userCard.eventMode = 'none';
+            userCard.x = rx;
+            userCard.y = rowY + 8;
+            rowContainer.addChild(userCard);
+
+            // "USER" label under card
+            const userLabel = new Text({
+              text: 'USER',
+              style: new TextStyle({ fontSize: 10, fill: 0x22d3ee, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
+            });
+            userLabel.anchor.set(0.5, 0);
+            userLabel.x = rx + miniSize.width / 2;
+            userLabel.y = rowY + 8 + miniSize.height + 1;
+            rowContainer.addChild(userLabel);
+          }
+          rx += miniSize.width + 8;
+        }
+
+        // --- Ability name (center, large) ---
         let abilityName = '???';
         try {
           const abilityDef = getCardDefForInstance(state, entry.sourceCardInstanceId);
@@ -559,89 +724,100 @@ export class BattleOverlay extends Container {
 
         const nameTxt = new Text({
           text: abilityName,
-          style: new TextStyle({ fontSize: 13, fill: phaseColor, fontFamily: FONT, fontWeight: 'bold' }),
+          style: new TextStyle({ fontSize: 14, fill: phaseColor, fontFamily: FONT, fontWeight: 'bold' }),
         });
         nameTxt.anchor.set(0, 0.5);
         nameTxt.x = rx;
-        nameTxt.y = rowCenterY;
-        content.addChild(nameTxt);
-        rx += nameTxt.width + 6;
+        nameTxt.y = rowMidY - 6;
+        rowContainer.addChild(nameTxt);
 
-        // User character
-        if (entry.userId) {
-          let userName = '???';
-          try { userName = getCardDefForInstance(state, entry.userId).name; } catch { /* skip */ }
+        // Entry number badge
+        const numBadge = new Graphics();
+        const numBadgeR = 8;
+        numBadge.circle(rx + nameTxt.width + 8 + numBadgeR, rowMidY - 6, numBadgeR);
+        numBadge.fill({ color: phaseColor, alpha: 0.15 });
+        rowContainer.addChild(numBadge);
+        const numTxt = new Text({
+          text: `${ci + 1}`,
+          style: new TextStyle({ fontSize: 9, fill: phaseColor, fontFamily: FONT, fontWeight: 'bold' }),
+        });
+        numTxt.anchor.set(0.5, 0.5);
+        numTxt.x = rx + nameTxt.width + 8 + numBadgeR;
+        numTxt.y = rowMidY - 6;
+        rowContainer.addChild(numTxt);
 
-          const byTxt = new Text({
-            text: 'by',
-            style: new TextStyle({ fontSize: 11, fill: COLORS.textMuted, fontFamily: FONT }),
+        // Status badge under ability name
+        if (entry.resolved || entry.negated) {
+          const statusLabel = entry.resolved ? 'RESOLVED' : 'NEGATED';
+          const statusColor = entry.resolved ? COLORS.textMuted : 0xef4444;
+          const statusTxt = new Text({
+            text: statusLabel,
+            style: new TextStyle({ fontSize: 9, fill: statusColor, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
           });
-          byTxt.anchor.set(0, 0.5);
-          byTxt.x = rx;
-          byTxt.y = rowCenterY;
-          content.addChild(byTxt);
-          rx += byTxt.width + 4;
-
-          const userTxt = new Text({
-            text: userName,
-            style: new TextStyle({ fontSize: 11, fill: COLORS.text, fontFamily: FONT }),
-          });
-          userTxt.anchor.set(0, 0.5);
-          userTxt.x = rx;
-          userTxt.y = rowCenterY;
-          content.addChild(userTxt);
-          rx += userTxt.width + 6;
+          statusTxt.anchor.set(0, 0);
+          statusTxt.x = rx;
+          statusTxt.y = rowMidY + 2;
+          rowContainer.addChild(statusTxt);
         }
 
-        // Target(s)
+        // --- Arrow + Target card(s) on right side ---
         const targetIds = entry.targetIds ?? [];
         if (targetIds.length > 0) {
+          // Position targets from right edge
+          let tx = feedX + feedW - 10;
+
+          // Render targets right-to-left
+          for (let ti = targetIds.length - 1; ti >= 0; ti--) {
+            const tid = targetIds[ti];
+            const targetInst = state.cards[tid];
+            if (!targetInst) continue;
+
+            let targetDef: CardDef | undefined;
+            let targetStats: { lead: number; support: number } | undefined;
+            try {
+              targetDef = getCardDefForInstance(state, tid);
+              targetStats = getEffectiveStats(state, tid);
+            } catch { /* skip */ }
+
+            tx -= miniSize.width;
+            const targetCard = new CardSprite({
+              defId: targetInst.defId,
+              size: miniSize,
+              cardDef: targetDef,
+              instance: targetInst,
+              effectiveStats: targetStats,
+            });
+            targetCard.eventMode = 'none';
+            targetCard.x = tx;
+            targetCard.y = rowY + 8;
+            rowContainer.addChild(targetCard);
+
+            if (ti > 0) tx -= 4;
+          }
+
+          // "TARGET" label under rightmost target
+          const targetLabel = new Text({
+            text: 'TARGET',
+            style: new TextStyle({ fontSize: 10, fill: 0xf87171, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
+          });
+          targetLabel.anchor.set(0.5, 0);
+          targetLabel.x = feedX + feedW - 10 - miniSize.width / 2;
+          targetLabel.y = rowY + 8 + miniSize.height + 1;
+          rowContainer.addChild(targetLabel);
+
+          // Arrow between ability name and targets
+          const arrowX = tx - 16;
           const arrowTxt = new Text({
             text: '\u2192',
-            style: new TextStyle({ fontSize: 11, fill: COLORS.textMuted, fontFamily: FONT }),
+            style: new TextStyle({ fontSize: 18, fill: phaseColor, fontFamily: FONT, fontWeight: 'bold' }),
           });
-          arrowTxt.anchor.set(0, 0.5);
-          arrowTxt.x = rx;
-          arrowTxt.y = rowCenterY;
-          content.addChild(arrowTxt);
-          rx += arrowTxt.width + 4;
-
-          const targetNames = targetIds.map(id => {
-            try { return getCardDefForInstance(state, id).name; } catch { return '???'; }
-          });
-          const targetTxt = new Text({
-            text: targetNames.join(', '),
-            style: new TextStyle({ fontSize: 11, fill: COLORS.text, fontFamily: FONT }),
-          });
-          targetTxt.anchor.set(0, 0.5);
-          targetTxt.x = rx;
-          targetTxt.y = rowCenterY;
-          content.addChild(targetTxt);
-          rx += targetTxt.width + 6;
+          arrowTxt.anchor.set(0.5, 0.5);
+          arrowTxt.x = arrowX;
+          arrowTxt.y = rowMidY;
+          rowContainer.addChild(arrowTxt);
         }
 
-        // Status badge
-        if (entry.resolved) {
-          const statusTxt = new Text({
-            text: 'RESOLVED',
-            style: new TextStyle({ fontSize: 9, fill: COLORS.textMuted, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
-          });
-          statusTxt.anchor.set(0, 0.5);
-          statusTxt.x = rx;
-          statusTxt.y = rowCenterY;
-          content.addChild(statusTxt);
-        } else if (entry.negated) {
-          const statusTxt = new Text({
-            text: 'NEGATED',
-            style: new TextStyle({ fontSize: 9, fill: 0xef4444, fontFamily: FONT, fontWeight: 'bold', letterSpacing: 1 }),
-          });
-          statusTxt.anchor.set(0, 0.5);
-          statusTxt.x = rx;
-          statusTxt.y = rowCenterY;
-          content.addChild(statusTxt);
-        }
-
-        cy += rowH;
+        cy += rowH + 4;
       }
 
       cy += 10;
@@ -845,14 +1021,16 @@ export class BattleOverlay extends Container {
       cy += btnH;
     }
 
-    // --- Center content vertically ---
+    // --- Center content vertically within the backdrop area ---
     const totalHeight = cy;
-    const topOffset = Math.max(20, (layout.height - totalHeight) / 2);
+    const backdropHeight = layout.height;
+    const topOffset = Math.max(10, (backdropHeight - totalHeight) / 2);
     content.y = topOffset;
     this.addChild(content);
   }
 
-  // ---- Render team characters in a row ----
+  // ---- Render team characters in pyramid layout (leader on top, supports fanned below) ----
+  // Matches TeamOrgOverlay's pyramid style. Injured cards rotated 90° with pivot at center.
   private renderTeamCards(
     parent: Container,
     state: GameState,
@@ -863,33 +1041,97 @@ export class BattleOverlay extends Container {
     cardSize: CardSize,
   ): number {
     const chars = team.characterIds;
-    const gap = 6;
-    const totalW = chars.length * cardSize.width + (chars.length - 1) * gap;
-    const startX = x + (w - totalW) / 2;
+    if (chars.length === 0) return y;
 
-    for (let i = 0; i < chars.length; i++) {
-      const cid = chars[i];
+    const centerX = x + w / 2;
+
+    // Helper: position a card accounting for injured rotation
+    const placeCard = (card: CardSprite, cx: number, cy: number, isInj: boolean) => {
+      if (isInj) {
+        card.x = cx + cardSize.width / 2;
+        card.y = cy + cardSize.height / 2;
+      } else {
+        card.x = cx;
+        card.y = cy;
+      }
+    };
+
+    const makeCard = (cid: string) => {
       const inst = state.cards[cid];
-      if (!inst) continue;
-
+      if (!inst) return null;
+      const isInj = inst.state === 'injured';
       let def: CardDef | undefined;
       let stats: { lead: number; support: number } | undefined;
       try { def = getCardDefForInstance(state, cid); stats = getEffectiveStats(state, cid); } catch { /* skip */ }
-
       const card = new CardSprite({
-        defId: inst.defId,
-        size: cardSize,
-        cardDef: def,
-        instance: inst,
-        effectiveStats: stats,
+        defId: inst.defId, size: cardSize, cardDef: def, instance: inst,
+        effectiveStats: stats, injured: isInj,
       });
       card.eventMode = 'none';
-      card.x = startX + i * (cardSize.width + gap);
-      card.y = y;
+      return { card, isInj };
+    };
+
+    // Solo card — render centered
+    if (chars.length === 1) {
+      const result = makeCard(chars[0]);
+      if (result) {
+        const { card, isInj } = result;
+        if (isInj) {
+          const visualW = cardSize.height;
+          placeCard(card, centerX - visualW / 2, y + (cardSize.height - cardSize.width) / 2, true);
+        } else {
+          placeCard(card, centerX - cardSize.width / 2, y, false);
+        }
+        parent.addChild(card);
+      }
+      return y + cardSize.height + 4;
+    }
+
+    // Multi-card team — pyramid: leader centered at top, supports fanned below
+    const leaderId = chars[0];
+    const supportIds = chars.slice(1);
+    const supportOffsetY = Math.floor(cardSize.height * 0.65);
+    const pyramidH = cardSize.height + supportOffsetY;
+
+    // Render supports first (behind), then leader last (on top)
+    for (let i = 0; i < supportIds.length; i++) {
+      const result = makeCard(supportIds[i]);
+      if (!result) continue;
+      const { card, isInj } = result;
+
+      let cardX: number;
+      if (supportIds.length === 1) {
+        // Single support — centered below
+        cardX = centerX - cardSize.width / 2;
+      } else {
+        // Two supports — spread below
+        const offset = i === 0 ? -cardSize.width * 0.6 : cardSize.width * 0.6;
+        cardX = centerX + offset - cardSize.width / 2;
+      }
+      const cardY = y + supportOffsetY;
+
+      if (isInj) {
+        placeCard(card, cardX + (cardSize.width - cardSize.height) / 2, cardY + (cardSize.height - cardSize.width) / 2, true);
+      } else {
+        placeCard(card, cardX, cardY, false);
+      }
       parent.addChild(card);
     }
 
-    return y + cardSize.height + 4;
+    // Leader — centered at top, drawn last (on top)
+    const leaderResult = makeCard(leaderId);
+    if (leaderResult) {
+      const { card, isInj } = leaderResult;
+      if (isInj) {
+        const visualW = cardSize.height;
+        placeCard(card, centerX - visualW / 2, y + (cardSize.height - cardSize.width) / 2, true);
+      } else {
+        placeCard(card, centerX - cardSize.width / 2, y, false);
+      }
+      parent.addChild(card);
+    }
+
+    return y + pyramidH + 4;
   }
 
   // ---- Blocker selection handlers ----

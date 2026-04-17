@@ -13,6 +13,7 @@ import gsap from 'gsap';
 import { getCardTexture, getCardBackTexture } from './AssetLoader';
 import { COLORS, CardSize, CARD_SIZES } from './layout';
 import { FONT } from './SharedStyles';
+import { TIMING } from './timing';
 import type { CardInstance, CardDef, CharacterCardDef, StrategyCardDef } from '@/game/types';
 
 export interface CardSpriteOptions {
@@ -28,6 +29,14 @@ export interface CardSpriteOptions {
   injured?: boolean;
   interactive?: boolean;
   showName?: boolean;
+  /** When true, base alpha is reduced to indicate the card is not a valid target for the current selection mode. */
+  dimmed?: boolean;
+  /** When true, draw a pulsing outer glow ring indicating the card is playable. */
+  playable?: boolean;
+  /** Type color used for playable glow (defaults to card type color). */
+  playableColor?: number;
+  /** When true, draw a pulsing gold border indicating the card has an activatable effect. */
+  activatable?: boolean;
 }
 
 export class CardSprite extends Container {
@@ -39,6 +48,8 @@ export class CardSprite extends Container {
   private borderGfx: Graphics;
   private glowGfx: Graphics;
   private _pulseTween: gsap.core.Tween | null = null;
+  private _playableGlowTween: gsap.core.Tween | null = null;
+  private _activatableGlowTween: gsap.core.Tween | null = null;
   private _hoverTween: gsap.core.Tween | null = null;
   private _isHovered = false;
   public instanceId?: string;
@@ -195,6 +206,7 @@ export class CardSprite extends Container {
         const inst = options.instance;
         const plusOnes = inst.counters.filter((c) => c.type === 'plus-one').length;
         const minusOnes = inst.counters.filter((c) => c.type === 'minus-one').length;
+        const permanents = inst.counters.filter((c) => c.type === 'permanent').length;
         let badgeY = isChar && options.effectiveStats ? 22 : 2;
         const fontSize = size.width >= 72 ? 12 : 9;
 
@@ -204,6 +216,10 @@ export class CardSprite extends Container {
         }
         if (minusOnes > 0) {
           this.addChild(this.makeBadge(`-${minusOnes}/-${minusOnes}`, 0xef4444, fontSize, 2, badgeY));
+          badgeY += fontSize + 5;
+        }
+        if (permanents > 0) {
+          this.addChild(this.makePermanentBadge(permanents, fontSize, size.width, badgeY));
         }
       }
 
@@ -251,6 +267,56 @@ export class CardSprite extends Container {
       // Caller is responsible for positioning
     }
 
+    // Dimmed state for cards that aren't valid selection targets
+    if (options.dimmed) {
+      this.alpha = 0.45;
+    }
+
+    // Playable glow — pulsing outer glow indicating card can be played
+    if (options.playable && !options.dimmed) {
+      const glowColor = options.playableColor ?? typeColor;
+
+      // Outer soft glow (wider, diffuse)
+      const outerGlow = new Graphics();
+      outerGlow.roundRect(-10, -10, size.width + 20, size.height + 20, 12);
+      outerGlow.fill({ color: glowColor, alpha: 0.12 });
+      this.addChildAt(outerGlow, 0);
+
+      // Inner crisp border
+      const playableGlow = new Graphics();
+      playableGlow.roundRect(-4, -4, size.width + 8, size.height + 8, 6);
+      playableGlow.fill({ color: glowColor, alpha: 0.06 });
+      playableGlow.stroke({ color: glowColor, width: 2.5, alpha: 0.7 });
+      this.addChildAt(playableGlow, 1);
+
+      // Subtle upward lift for playable cards
+      this.y -= 3;
+
+      this._playableGlowTween = gsap.to(outerGlow, {
+        alpha: 0.35,
+        duration: TIMING.playableGlowPulse / 2,
+        repeat: -1,
+        yoyo: true,
+        ease: 'sine.inOut',
+      });
+    }
+
+    // Activatable glow — pulsing gold border indicating an activate effect is available
+    if (options.activatable && !options.dimmed && !options.playable) {
+      const activatableGlow = new Graphics();
+      activatableGlow.roundRect(-6, -6, size.width + 12, size.height + 12, 8);
+      activatableGlow.fill({ color: 0xd4a843, alpha: 0.06 });
+      activatableGlow.stroke({ color: 0xd4a843, width: 2, alpha: 0.5 });
+      this.addChildAt(activatableGlow, 0);
+      this._activatableGlowTween = gsap.to(activatableGlow, {
+        alpha: 0.4,
+        duration: TIMING.playableGlowPulse / 2,
+        repeat: -1,
+        yoyo: true,
+        ease: 'sine.inOut',
+      });
+    }
+
     if (options.interactive) {
       this.eventMode = 'static';
       this.cursor = 'pointer';
@@ -258,7 +324,34 @@ export class CardSprite extends Container {
       // Hover effects
       this.on('pointerover', this.onHoverIn, this);
       this.on('pointerout', this.onHoverOut, this);
+
+      // Press feedback — quick scale-down on pointer down, springy return on pointer up
+      this.on('pointerdown', this.onPressDown, this);
+      this.on('pointerup', this.onPressUp, this);
+      this.on('pointerupoutside', this.onPressUp, this);
     }
+  }
+
+  private onPressDown(): void {
+    if (this.eventMode === 'none') return;
+    gsap.to(this.scale, {
+      x: this._isHovered ? 1.05 : 0.95,
+      y: this._isHovered ? 1.05 : 0.95,
+      duration: TIMING.pressDown,
+      ease: 'power2.out',
+    });
+  }
+
+  private onPressUp(): void {
+    if (this.eventMode === 'none') return;
+    const restX = this._isHovered ? 1.12 : 1;
+    const restY = this._isHovered ? 1.12 : 1;
+    gsap.to(this.scale, {
+      x: restX,
+      y: restY,
+      duration: TIMING.pressUp,
+      ease: 'back.out(2)',
+    });
   }
 
   private onHoverIn(): void {
@@ -299,6 +392,26 @@ export class CardSprite extends Container {
       this._hoverTween.kill();
     }
     this._hoverTween = gsap.to(this.glowGfx, { alpha: 0, duration: 0.15 });
+  }
+
+  private makePermanentBadge(count: number, fontSize: number, cardWidth: number, y: number): Container {
+    const c = new Container();
+    const txt = new Text({
+      text: `\u23F3${count}`,
+      style: new TextStyle({ fontSize, fill: COLORS.textGold ?? 0xfbbf24, fontFamily: FONT, fontWeight: 'bold' }),
+    });
+    const padX = 4;
+    const padY = 2;
+    const bg = new Graphics();
+    bg.roundRect(-padX, -padY, txt.width + padX * 2, txt.height + padY * 2, 3);
+    bg.fill({ color: 0x2a1f00, alpha: 0.9 });
+    bg.stroke({ color: COLORS.textGold ?? 0xfbbf24, width: 1, alpha: 0.8 });
+    c.addChild(bg);
+    c.addChild(txt);
+    // Position at top-right of card
+    c.x = cardWidth - txt.width - padX - 2;
+    c.y = y;
+    return c;
   }
 
   private makeBadge(text: string, color: number, fontSize: number, x: number, y: number): Container {
@@ -373,6 +486,16 @@ export class CardSprite extends Container {
 
   get cardHeight(): number {
     return this._size.height;
+  }
+
+  override destroy(options?: boolean | { children?: boolean; texture?: boolean; baseTexture?: boolean }): void {
+    if (this._pulseTween) { this._pulseTween.kill(); this._pulseTween = null; }
+    if (this._playableGlowTween) { this._playableGlowTween.kill(); this._playableGlowTween = null; }
+    if (this._activatableGlowTween) { this._activatableGlowTween.kill(); this._activatableGlowTween = null; }
+    if (this._hoverTween) { this._hoverTween.kill(); this._hoverTween = null; }
+    gsap.killTweensOf(this);
+    gsap.killTweensOf(this.scale);
+    super.destroy(options);
   }
 
   /**

@@ -33,6 +33,7 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
   const initRef = useRef(false);
   const consumedEventsRef = useRef<Set<number>>(new Set());
   const [rendererReady, setRendererReady] = useState(false);
+  const [isAnimationBusy, setIsAnimationBusy] = useState(false);
 
   // ============================================================
   // Initialize game on mount
@@ -100,6 +101,18 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
   }, [gameState, uiState, rendererReady]);
 
   // ============================================================
+  // Poll animation busy state (100ms interval)
+  // ============================================================
+  useEffect(() => {
+    if (!rendererReady) return;
+    const interval = setInterval(() => {
+      const busy = rendererRef.current?.isAnimationBusy ?? false;
+      setIsAnimationBusy(busy);
+    }, 100);
+    return () => clearInterval(interval);
+  }, [rendererReady]);
+
+  // ============================================================
   // AI Loop callbacks
   // ============================================================
   const handleAIAction = useCallback(
@@ -143,6 +156,7 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
     isAIThinking: uiState.isAIThinking,
     gameStarted: uiState.gameStarted,
     mulliganDone: uiState.mulliganDone,
+    isAnimationBusy,
     onAIAction: handleAIAction,
     onAIThinkingChange: handleAIThinkingChange,
     onAIMulligan: handleAIMulligan,
@@ -161,6 +175,9 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
 
     if (!gameState || !isMyTurn || uiState.mode !== 'pvai' || gameState.gameOver) return;
     if (!uiState.gameStarted) return;
+
+    // Don't auto-pass while animations are playing
+    if (isAnimationBusy) return;
 
     // Don't auto-pass when there's a pending interactive choice
     if (gameState.pendingSearch || gameState.pendingTargetChoice || gameState.pendingOptionalEffect) return;
@@ -207,7 +224,29 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
       return card && card.owner === humanPlayer;
     });
 
-    const hasEOAOptions = hasBattlefieldChars && (hasAbilityCards || hasActivateEffects);
+    // Check if player has a field card with activate effects
+    const hasFieldActivate = (() => {
+      const fieldId = gameState.players[humanPlayer].fieldCard;
+      if (!fieldId) return false;
+      try {
+        const def = getCardDefForInstance(gameState, fieldId);
+        return def.cardType === 'field' && (def as { effects?: { type: string }[] }).effects?.some((e: { type: string }) => e.type === 'activate');
+      } catch { return false; }
+    })();
+
+    // Check if player has essence cards with activate-from-essence effects
+    const hasEssenceActivate = gameState.players[humanPlayer].essence.some((id) => {
+      try {
+        const def = getCardDefForInstance(gameState, id);
+        if (def.cardType !== 'strategy') return false;
+        return (def as { effects?: { type: string; costDescription?: string }[] }).effects?.some((e: { type: string; costDescription?: string }) =>
+          e.type === 'activate' && e.costDescription?.toLowerCase().includes('expel this card from your essence')
+        );
+      } catch { return false; }
+    });
+
+    const hasEOAOptions = (hasBattlefieldChars && (hasAbilityCards || hasActivateEffects))
+      || hasFieldActivate || hasEssenceActivate;
 
     if (!isTurnPlayer) {
       if (phase === 'main') {
@@ -240,7 +279,7 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
       if (phase === 'start') shouldAutoPass = true;
       // End phase with hand <= 7 is handled immediately by finishEndPhase —
       // no need to auto-pass since the phase won't linger at 'end'
-      if (phase === 'battle-eoa' && !hasEOAOptions) shouldAutoPass = true;
+      // Turn player during EOA must always manually click PASS — never auto-pass
 
       if (phase === 'battle-showdown' && legalActions.includes('choose-showdown-order')) {
         const myAttackingTeams = Object.values(gameState.teams).filter(
@@ -276,7 +315,7 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
           action: { type: 'pass-priority' },
         });
         autoPassRef.current = null;
-      }, 100);
+      }, autoPassDelay);
     }
 
     return () => {
@@ -285,7 +324,7 @@ export function PixiGameCanvas({ mode, p1Deck, p2Deck }: PixiGameCanvasProps) {
         autoPassRef.current = null;
       }
     };
-  }, [gameState, isMyTurn, legalActions, uiState.mode, uiState.humanPlayer, uiState.gameStarted, uiState.speedPreset, dispatch]);
+  }, [gameState, isMyTurn, legalActions, uiState.mode, uiState.humanPlayer, uiState.gameStarted, uiState.speedPreset, isAnimationBusy, dispatch]);
 
   // ============================================================
   // Render

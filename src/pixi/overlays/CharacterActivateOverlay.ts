@@ -1,34 +1,32 @@
 // ============================================================
-// Primal TCG — Essence Activate Overlay
+// Primal TCG — Character Activate Effect Confirmation Overlay
 // ============================================================
-// Displays activatable strategy cards in the player's essence zone.
-// Player clicks a card to activate its effect from essence.
+// Shows the character's activate effect description with cost info
+// and scope badge before the player commits. ACTIVATE confirms and
+// enters cost-selection flow; CANCEL returns to normal mode.
 
 import { Container, Graphics, Text, TextStyle } from 'pixi.js';
 import { COLORS, BoardLayout } from '../layout';
 import { FONT } from '../SharedStyles';
-import { CardSprite } from '../CardSprite';
 import type { UIAction } from '@/hooks/useGameEngine';
-import type { GameState } from '@/game/types';
-import { getCardDefForInstance } from '@/game/engine/utils';
-import type { StrategyCardDef, CardEffectDef } from '@/game/types';
 import { fadeInOverlay } from './overlayTransitions';
 
-interface ActivatableCard {
-  instanceId: string;
-  defId: string;
-  name: string;
+interface ActivateEffectInfo {
   effectId: string;
   effectDescription: string;
+  costDescription?: string;
+  scope?: 'instance' | 'name-turn' | 'name-game';
 }
 
-export class EssenceActivateOverlay extends Container {
+export class CharacterActivateOverlay extends Container {
   constructor(
     layout: BoardLayout,
-    state: GameState,
-    cards: ActivatableCard[],
+    characterName: string,
+    cardId: string,
+    effects: ActivateEffectInfo[],
     dispatch: (action: UIAction) => void,
     humanPlayer: string,
+    onActivate: (effectId: string) => void,
   ) {
     super();
 
@@ -38,7 +36,7 @@ export class EssenceActivateOverlay extends Container {
     // Backdrop
     const backdrop = new Graphics();
     backdrop.rect(0, 0, W, H);
-    backdrop.fill({ color: 0x000000, alpha: 0.75 });
+    backdrop.fill({ color: 0x000000, alpha: 0.7 });
     backdrop.eventMode = 'static';
     backdrop.cursor = 'default';
     backdrop.on('pointerdown', () => {
@@ -47,9 +45,9 @@ export class EssenceActivateOverlay extends Container {
     this.addChild(backdrop);
 
     // Panel dimensions
-    const panelW = Math.min(520, W - 40);
-    const rowH = 72;
-    const panelH = 60 + cards.length * (rowH + 8) + 60;
+    const panelW = Math.min(460, W - 40);
+    const rowH = 70;
+    const panelH = 60 + effects.length * (rowH + 8) + 50;
     const panelX = (W - panelW) / 2;
     const panelY = (H - panelH) / 2;
 
@@ -58,14 +56,14 @@ export class EssenceActivateOverlay extends Container {
     panel.roundRect(panelX, panelY, panelW, panelH, 12);
     panel.fill({ color: 0x0f1729, alpha: 0.95 });
     panel.stroke({ color: 0xd4a843, width: 2, alpha: 0.8 });
-    panel.eventMode = 'static'; // prevent click-through
+    panel.eventMode = 'static'; // prevent backdrop click-through
     this.addChild(panel);
 
-    // Title
+    // Title — character name
     const title = new Text({
-      text: 'ACTIVATE FROM ESSENCE',
+      text: characterName.toUpperCase(),
       style: new TextStyle({
-        fontSize: 18,
+        fontSize: 20,
         fill: 0xd4a843,
         fontFamily: FONT,
         fontWeight: 'bold',
@@ -79,22 +77,22 @@ export class EssenceActivateOverlay extends Container {
 
     // Subtitle
     const subtitle = new Text({
-      text: 'Choose a card to activate',
+      text: 'ACTIVATE EFFECT',
       style: new TextStyle({
-        fontSize: 13,
+        fontSize: 12,
         fill: COLORS.textMuted,
         fontFamily: FONT,
-        letterSpacing: 1,
+        letterSpacing: 2,
       }),
     });
     subtitle.anchor.set(0.5, 0);
     subtitle.x = W / 2;
-    subtitle.y = panelY + 38;
+    subtitle.y = panelY + 40;
     this.addChild(subtitle);
 
-    // Card rows
+    // Effect rows
     let curY = panelY + 60;
-    for (const card of cards) {
+    for (const eff of effects) {
       const rowBg = new Graphics();
       rowBg.roundRect(panelX + 12, curY, panelW - 24, rowH, 8);
       rowBg.fill({ color: 0x1a2744, alpha: 0.9 });
@@ -102,79 +100,77 @@ export class EssenceActivateOverlay extends Container {
       rowBg.eventMode = 'static';
       rowBg.cursor = 'pointer';
 
+      // Hover effect
       rowBg.on('pointerover', () => { rowBg.tint = 0xbbddff; });
       rowBg.on('pointerout', () => { rowBg.tint = 0xffffff; });
 
-      const cardInstanceId = card.instanceId;
-      const effectId = card.effectId;
+      // Click — activate this effect
+      const effectId = eff.effectId;
       rowBg.on('pointerdown', () => {
-        dispatch({ type: 'CLEAR_SELECTION' });
-        dispatch({
-          type: 'PERFORM_ACTION',
-          player: humanPlayer as any,
-          action: {
-            type: 'activate-effect',
-            cardInstanceId,
-            effectId,
-          },
-        });
+        onActivate(effectId);
       });
 
       this.addChild(rowBg);
 
-      // Card name
-      const nameTxt = new Text({
-        text: card.name,
-        style: new TextStyle({
-          fontSize: 15,
-          fill: 0xe2e8f0,
-          fontFamily: FONT,
-          fontWeight: 'bold',
-        }),
-      });
-      nameTxt.x = panelX + 24;
-      nameTxt.y = curY + 8;
-      this.addChild(nameTxt);
+      // Scope badge (if not default instance)
+      const scopeColors: Record<string, { bg: number; text: string }> = {
+        'instance': { bg: 0x22c55e, text: 'PER CARD' },
+        'name-turn': { bg: 0xeab308, text: 'ONCE/TURN' },
+        'name-game': { bg: 0xec4899, text: 'ONCE/GAME' },
+      };
+      const scope = eff.scope ?? 'instance';
+      if (scope !== 'instance') {
+        const scopeInfo = scopeColors[scope];
+        const scopeBadgeW = 72;
+        const scopeBadgeH = 18;
+        const scopeX = panelX + panelW - 12 - scopeBadgeW - 8;
+        const scopeY = curY + 4;
+        const scopeBadge = new Graphics();
+        scopeBadge.roundRect(scopeX, scopeY, scopeBadgeW, scopeBadgeH, 3);
+        scopeBadge.fill({ color: scopeInfo.bg, alpha: 0.25 });
+        this.addChild(scopeBadge);
+
+        const scopeTxt = new Text({
+          text: scopeInfo.text,
+          style: new TextStyle({ fontSize: 9, fill: scopeInfo.bg, fontFamily: FONT, fontWeight: 'bold' }),
+        });
+        scopeTxt.anchor.set(0.5, 0.5);
+        scopeTxt.x = scopeX + scopeBadgeW / 2;
+        scopeTxt.y = scopeY + scopeBadgeH / 2;
+        this.addChild(scopeTxt);
+      }
 
       // Effect description
       const descTxt = new Text({
-        text: card.effectDescription,
+        text: eff.effectDescription,
         style: new TextStyle({
-          fontSize: 11,
-          fill: COLORS.textMuted,
+          fontSize: 13,
+          fill: 0xe2e8f0,
           fontFamily: FONT,
           wordWrap: true,
-          wordWrapWidth: panelW - 52,
+          wordWrapWidth: panelW - 48,
+          lineHeight: 18,
         }),
       });
       descTxt.x = panelX + 24;
-      descTxt.y = curY + 28;
+      descTxt.y = curY + 8;
       this.addChild(descTxt);
 
-      // "ACTIVATE" badge
-      const badgeW = 72;
-      const badgeH = 22;
-      const badgeX = panelX + panelW - 24 - badgeW;
-      const badgeY = curY + 8;
-      const badge = new Graphics();
-      badge.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
-      badge.fill({ color: 0xd4a843, alpha: 0.3 });
-      this.addChild(badge);
-
-      const badgeTxt = new Text({
-        text: 'ACTIVATE',
-        style: new TextStyle({
-          fontSize: 11,
-          fill: 0xd4a843,
-          fontFamily: FONT,
-          fontWeight: 'bold',
-          letterSpacing: 1,
-        }),
-      });
-      badgeTxt.anchor.set(0.5, 0.5);
-      badgeTxt.x = badgeX + badgeW / 2;
-      badgeTxt.y = badgeY + badgeH / 2;
-      this.addChild(badgeTxt);
+      // Cost description (if any)
+      if (eff.costDescription) {
+        const costTxt = new Text({
+          text: `Cost: ${eff.costDescription}`,
+          style: new TextStyle({
+            fontSize: 11,
+            fill: 0xfbbf24,
+            fontFamily: FONT,
+            fontStyle: 'italic',
+          }),
+        });
+        costTxt.x = panelX + 24;
+        costTxt.y = curY + rowH - 22;
+        this.addChild(costTxt);
+      }
 
       curY += rowH + 8;
     }

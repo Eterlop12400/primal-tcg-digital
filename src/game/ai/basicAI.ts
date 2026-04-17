@@ -35,19 +35,228 @@ import {
 } from '../engine/utils';
 
 import { getLegalActions } from '../engine/gameLoop';
+import {
+  enumerateMainPhaseActions,
+  scoreAction,
+  simulateAction,
+  isWinningState,
+  planMainPhase,
+} from './simulation';
 
 // ============================================================
 // Helper Functions — Board Evaluation & Utilities
 // ============================================================
 
-function getGamePhase(state: GameState): 'early' | 'mid' | 'late' {
+export function getGamePhase(state: GameState): 'early' | 'mid' | 'late' {
   const maxTM = Math.max(state.players.player1.turnMarker, state.players.player2.turnMarker);
   if (maxTM <= 2) return 'early';
   if (maxTM <= 5) return 'mid';
   return 'late';
 }
 
-function cardValue(state: GameState, cardId: string): number {
+export type AIStance = 'aggro' | 'balanced' | 'defensive' | 'desperate';
+
+export interface GameContext {
+  phase: 'early' | 'mid' | 'late';
+  stance: AIStance;
+  myBRTaken: number;      // BRs opponent earned against us
+  oppBRTaken: number;     // BRs we earned against opponent
+  myBoardPower: number;   // sum of lead stats (non-injured) in kingdom
+  oppBoardPower: number;
+  deckOutRisk: boolean;
+}
+
+/**
+ * Compute game context for the AI player. Used to adjust aggressiveness
+ * across multiple decision points (attackers, blockers, strategies, summons).
+ */
+export function getGameContext(state: GameState, player: PlayerId): GameContext {
+  const ps = state.players[player];
+  const ops = state.players[getOpponent(player)];
+
+  const sumBoardPower = (chars: string[]): number => {
+    let total = 0;
+    for (const id of chars) {
+      const card = state.cards[id];
+      if (!card || card.state === undefined) continue;
+      if (card.state === 'injured') continue;
+      try {
+        const stats = getEffectiveStats(state, id);
+        total += stats.lead + stats.support * 0.5;
+      } catch { /* ignore */ }
+    }
+    return total;
+  };
+
+  const myBoardPower = sumBoardPower(ps.kingdom);
+  const oppBoardPower = sumBoardPower(ops.kingdom);
+  const myBRTaken = ps.battleRewards.length;
+  const oppBRTaken = ops.battleRewards.length;
+  const deckOutRisk = ps.deck.length <= 5;
+
+  // Stance logic
+  let stance: AIStance = 'balanced';
+  if (myBRTaken >= 6 || (myBRTaken >= 5 && oppBoardPower > myBoardPower * 1.3)) {
+    stance = 'desperate';
+  } else if (myBRTaken >= 4 || oppBoardPower > myBoardPower * 1.5 || deckOutRisk) {
+    stance = 'defensive';
+  } else if (oppBRTaken >= 4 || myBoardPower > oppBoardPower * 1.4) {
+    stance = 'aggro';
+  }
+
+  return {
+    phase: getGamePhase(state),
+    stance,
+    myBRTaken,
+    oppBRTaken,
+    myBoardPower,
+    oppBoardPower,
+    deckOutRisk,
+  };
+}
+
+// ============================================================
+// Opponent Model — threat projection from visible info only
+// ============================================================
+// "Visible info" means: opponent's essence, discard, expel, battleRewards,
+// kingdom, battlefield, and field card. We do NOT peek at opponent's hand
+// or the face-down order of their deck. We DO use their deck list (which
+// cards remain un-revealed) since decklists are public in competitive TCG.
+
+export interface OpponentModel {
+  /** Projected max lead stat of a single character they could summon next turn. */
+  maxNextTurnLead: number;
+  /** Max essence cost of any ability they could currently afford. */
+  maxAffordableAbilityCost: number;
+  /** Best strategy turnCost they could play right now. */
+  maxAffordableStrategyCost: number;
+  /** True if they have enough essence + hand to plausibly hold a counter. */
+  likelyHasCounter: boolean;
+  /** Projected incoming damage next turn (from un-injured kingdom leaders). */
+  projectedIncomingDamage: number;
+  /** Deck+hand pool size (what they haven't revealed yet). */
+  unknownPoolSize: number;
+  /** True if opponent has shown they're running strategy counters (based on play history). */
+  runsCounterStrategies: boolean;
+}
+
+export function buildOpponentModel(
+  state: GameState,
+  player: PlayerId,
+): OpponentModel {
+  const opp = getOpponent(player);
+  const ops = state.players[opp];
+
+  // Collect all currently visible opponent card IDs
+  const visibleIds = new Set<string>([
+    ...ops.discard,
+    ...ops.expel,
+    ...ops.essence,
+    ...ops.kingdom,
+    ...ops.battlefield,
+    ...ops.battleRewards,
+  ]);
+  if (ops.fieldCard) visibleIds.add(ops.fieldCard);
+
+  // Unknown pool = deck + hand (cards opponent has that we haven't seen)
+  const unknownPoolSize = ops.deck.length + ops.hand.length;
+
+  // Essence symbols the opponent owns
+  const oppEssenceSymbols = new Set<string>();
+  for (const eid of ops.essence) {
+    try {
+      const d = getCardDefForInstance(state, eid);
+      for (const s of d.symbols) oppEssenceSymbols.add(s);
+    } catch { /* ignore */ }
+  }
+  const oppEssenceCount = ops.essence.length;
+
+  // Scan the unknown pool (their deck + hand) for the strongest
+  // character they could summon next turn (assuming they have matching essence/symbols).
+  // This is an upper-bound threat projection — not a prediction.
+  let maxNextTurnLead = 0;
+  let maxAffordableAbilityCost = 0;
+
+  const unknownIds = [...ops.deck, ...ops.hand];
+  for (const id of unknownIds) {
+    let def;
+    try { def = getCardDefForInstance(state, id); } catch { continue; }
+
+    if (def.cardType === 'character') {
+      const cd = def as CharacterCardDef;
+      // They could summon this next turn if they'll have enough turnMarker.
+      // Next turn turnMarker ≈ ops.turnMarker + 1.
+      if (cd.turnCost <= ops.turnMarker + 1) {
+        if (cd.healthyStats.lead > maxNextTurnLead) {
+          maxNextTurnLead = cd.healthyStats.lead;
+        }
+      }
+    } else if (def.cardType === 'ability') {
+      const ad = def as AbilityCardDef;
+      const costTotal = (ad.essenceCost?.neutral ?? 0) +
+        (ad.essenceCost?.specific.reduce((sum, sc) => sum + sc.count, 0) ?? 0);
+      // Check if affordable with current opponent essence
+      if (costTotal <= oppEssenceCount) {
+        // Symbol feasibility: at least one specific requirement has matching essence
+        const symbolsOk = !ad.essenceCost || ad.essenceCost.specific.length === 0 ||
+          ad.essenceCost.specific.some((sc) => oppEssenceSymbols.has(sc.symbol));
+        if (symbolsOk && costTotal > maxAffordableAbilityCost) {
+          maxAffordableAbilityCost = costTotal;
+        }
+      }
+    }
+  }
+
+  // Max affordable strategy cost from unknown pool
+  let maxAffordableStrategyCost = 0;
+  for (const id of unknownIds) {
+    let def;
+    try { def = getCardDefForInstance(state, id); } catch { continue; }
+    if (def.cardType !== 'strategy') continue;
+    const sd = def as StrategyCardDef;
+    if (sd.turnCost <= ops.turnMarker + 1 && sd.turnCost > maxAffordableStrategyCost) {
+      maxAffordableStrategyCost = sd.turnCost;
+    }
+  }
+
+  // "Likely has counter": opponent has ≥ 3 hand cards AND ≥ 2 essence
+  // AND their deck/discard shows evidence of counter strategies
+  let runsCounterStrategies = false;
+  for (const id of [...ops.discard, ...ops.deck, ...ops.hand]) {
+    try {
+      const d = getCardDefForInstance(state, id);
+      if (d.cardType === 'strategy' && (d as StrategyCardDef).keywords.includes('counter')) {
+        runsCounterStrategies = true;
+        break;
+      }
+    } catch { /* ignore */ }
+  }
+  const likelyHasCounter = runsCounterStrategies && ops.hand.length >= 3 && oppEssenceCount >= 2;
+
+  // Projected incoming damage: sum of un-injured kingdom leaders' lead stats
+  let projectedIncomingDamage = 0;
+  for (const id of ops.kingdom) {
+    const card = state.cards[id];
+    if (!card || card.state === undefined) continue;
+    if (card.state === 'injured') continue;
+    try {
+      const stats = getEffectiveStats(state, id);
+      projectedIncomingDamage += stats.lead;
+    } catch { /* ignore */ }
+  }
+
+  return {
+    maxNextTurnLead,
+    maxAffordableAbilityCost,
+    maxAffordableStrategyCost,
+    likelyHasCounter,
+    projectedIncomingDamage,
+    unknownPoolSize,
+    runsCounterStrategies,
+  };
+}
+
+export function cardValue(state: GameState, cardId: string): number {
   const def = getCardDefForInstance(state, cardId);
   if (def.cardType === 'character') {
     const cd = def as CharacterCardDef;
@@ -62,43 +271,179 @@ function cardValue(state: GameState, cardId: string): number {
   return 3;
 }
 
-function evaluateBoard(state: GameState, player: PlayerId): number {
+export function evaluateBoard(state: GameState, player: PlayerId): number {
   const ps = state.players[player];
   const opponent = getOpponent(player);
   const ops = state.players[opponent];
   let score = 0;
 
-  // Character stats on board (kingdom + battlefield)
+  // ----- Board character stats (tempo-aware) -----
+  // A non-injured character in kingdom is "ready to act" this turn; injured = 0.6x.
+  // Leader stats matter more than support because they're the team face-off number.
   const myChars = [...ps.kingdom, ...ps.battlefield];
+  let myBoardPower = 0;
+  let myReadyCharCount = 0;
   for (const id of myChars) {
     const card = state.cards[id];
     if (!card || card.state === undefined) continue; // not a character
     const stats = getEffectiveStats(state, id);
     const statScore = stats.lead * 2 + stats.support;
-    score += card.state === 'injured' ? statScore * 0.6 : statScore;
+    const injured = card.state === 'injured';
+    score += injured ? statScore * 0.6 : statScore;
+    myBoardPower += injured ? 0 : Math.max(stats.lead, stats.support);
+    if (!injured) myReadyCharCount++;
   }
 
-  // Essence count
-  score += ps.essence.length * 0.8;
+  // ----- Tempo value -----
+  // Characters we can ACT with this turn (non-injured) are worth extra because they
+  // translate directly to pressure. Diminishing returns after 3 (team limit).
+  score += Math.min(myReadyCharCount, 3) * 1.2;
 
-  // Hand size (diminishing returns above 5)
-  score += Math.min(ps.hand.length, 5) * 0.5 + Math.max(0, ps.hand.length - 5) * 0.2;
+  // ----- Threat assessment -----
+  // Opponent's board power hints at defensive pressure on us. If opponent's top
+  // team power meaningfully exceeds our best ready character's stats, we're behind.
+  let oppMaxLead = 0;
+  for (const id of ops.kingdom) {
+    const card = state.cards[id];
+    if (!card || card.state === undefined) continue;
+    if (card.state === 'injured') continue;
+    const stats = getEffectiveStats(state, id);
+    if (stats.lead > oppMaxLead) oppMaxLead = stats.lead;
+  }
+  let myMaxLead = 0;
+  for (const id of ps.kingdom) {
+    const card = state.cards[id];
+    if (!card || card.state === undefined || card.state === 'injured') continue;
+    const stats = getEffectiveStats(state, id);
+    if (stats.lead > myMaxLead) myMaxLead = stats.lead;
+  }
+  const threatGap = oppMaxLead - myMaxLead;
+  if (threatGap > 0) score -= threatGap * 0.8;
 
-  // Battle Reward differential (opponent BRs is good for us — we're winning)
-  score += ops.battleRewards.length * 3.0;
-  score -= ps.battleRewards.length * 3.0;
+  // ----- Essence (ability-aware) -----
+  let abilityPoolSize = 0;
+  let maxAbilityCost = 0;
+  const seenAbilityIds = new Set<string>();
+  const essenceCostTotal = (ec: { specific?: { count: number }[]; neutral?: number } | undefined): number => {
+    if (!ec) return 0;
+    const specific = (ec.specific ?? []).reduce((sum, s) => sum + (s.count || 0), 0);
+    return specific + (ec.neutral ?? 0);
+  };
+  const checkAbilityPool = (id: string) => {
+    try {
+      const def = getCardDefForInstance(state, id);
+      if (seenAbilityIds.has(def.id)) return;
+      if (def.cardType === 'ability') {
+        abilityPoolSize++;
+        seenAbilityIds.add(def.id);
+        const cost = essenceCostTotal((def as AbilityCardDef).essenceCost);
+        if (cost > maxAbilityCost) maxAbilityCost = cost;
+        return;
+      }
+      const effects = (def as { effects?: { type?: string; essenceCost?: { specific?: { count: number }[]; neutral?: number } }[] }).effects ?? [];
+      for (const eff of effects) {
+        if (eff.type === 'activate' && eff.essenceCost) {
+          abilityPoolSize++;
+          seenAbilityIds.add(def.id);
+          const cost = essenceCostTotal(eff.essenceCost);
+          if (cost > maxAbilityCost) maxAbilityCost = cost;
+          break;
+        }
+      }
+    } catch { /* ignore */ }
+  };
+  for (const id of ps.hand) checkAbilityPool(id);
+  for (const id of ps.deck) checkAbilityPool(id);
+  for (const id of ps.kingdom) checkAbilityPool(id);
+  for (const id of ps.battlefield) checkAbilityPool(id);
 
-  // Turn marker advantage
+  // Essence: valuable up to what abilities actually cost, then saturates sharply.
+  const usefulEssenceCap = abilityPoolSize > 0 ? Math.max(maxAbilityCost, 3) : 1;
+  const usefulEssence = Math.min(ps.essence.length, usefulEssenceCap);
+  const excessEssence = Math.max(0, ps.essence.length - usefulEssenceCap);
+  score += usefulEssence * (abilityPoolSize > 0 ? 0.5 : 0.1);
+  score += excessEssence * 0.05;
+
+  // ----- Hand value (playability-weighted) -----
+  // Affordable cards (turnCost ≤ turnMarker) are worth more than clunkers.
+  // Unique dupes of already-in-play cards are near-zero.
+  let handValue = 0;
+  const inPlayPrintNums = new Set<string>();
+  for (const id of [...ps.kingdom, ...ps.battlefield]) {
+    try {
+      const d = getCardDefForInstance(state, id);
+      inPlayPrintNums.add(d.printNumber);
+    } catch { /* ignore */ }
+  }
+  for (const id of ps.hand) {
+    try {
+      const def = getCardDefForInstance(state, id);
+      let v = 0.5; // baseline per-card
+      if (def.cardType === 'character') {
+        const cd = def as CharacterCardDef;
+        const affordable = cd.turnCost <= ps.turnMarker;
+        v = affordable ? 0.7 : 0.3;
+        if (cd.characteristics.includes('unique') && inPlayPrintNums.has(cd.printNumber)) v = 0.05;
+      } else if (def.cardType === 'strategy') {
+        const sd = def as StrategyCardDef;
+        v = sd.turnCost <= ps.turnMarker ? 0.7 : 0.35;
+      } else if (def.cardType === 'ability') {
+        v = abilityPoolSize > 0 && ps.essence.length >= 1 ? 0.6 : 0.3;
+      }
+      handValue += v;
+    } catch { handValue += 0.4; }
+  }
+  // Diminishing returns past 5 cards
+  score += Math.min(handValue, 5 * 0.7) + Math.max(0, handValue - 5 * 0.7) * 0.3;
+
+  // ----- BR differential with urgency scaling -----
+  // Late in the game (either player at 5+ BR taken against them), each BR is worth more.
+  // ops.battleRewards = BRs earned BY us against opponent → opponent is losing.
+  // ps.battleRewards = BRs opponent earned against us → we are losing.
+  const myBRDanger = ps.battleRewards.length;
+  const oppBRDanger = ops.battleRewards.length;
+  const danger = Math.max(myBRDanger, oppBRDanger);
+  const brWeight = danger >= 5 ? 5.0 : danger >= 3 ? 3.75 : 3.0;
+  score += oppBRDanger * brWeight;
+  score -= myBRDanger * brWeight;
+
+  // ----- Turn marker advantage -----
   score += (ps.turnMarker - ops.turnMarker) * 0.5;
 
-  // Deck-out danger
+  // ----- Deck-out danger -----
   if (ps.deck.length <= 5) score -= (6 - ps.deck.length) * 1.5;
 
-  // Permanent strategies in play
+  // ----- Permanent strategies in play -----
   for (const id of ps.kingdom) {
-    const def = getCardDefForInstance(state, id);
-    if (def.cardType === 'strategy') score += 2;
+    try {
+      const def = getCardDefForInstance(state, id);
+      if (def.cardType === 'strategy') score += 2;
+    } catch { /* ignore */ }
   }
+
+  // ----- Opponent threat modeling -----
+  // Discount our position if opponent has unseen powerhouses they could drop next turn.
+  // This makes AI more cautious when opponent has a big unplayed curve.
+  try {
+    const opModel = buildOpponentModel(state, player);
+    // Big threats coming = mild discount (opponent upside, not our loss)
+    if (opModel.maxNextTurnLead >= 5) score -= 1.2;
+    else if (opModel.maxNextTurnLead >= 4) score -= 0.6;
+
+    // Projected incoming damage vs our BR-taken position
+    // Each BR toward 7 ends the game; damage is per-attack so weight more in late game
+    const brWeight = ps.battleRewards.length >= 5 ? 0.8 : 0.4;
+    score -= opModel.projectedIncomingDamage * brWeight * 0.25;
+
+    // Affordable ability threat — they can pop off on our big team
+    if (opModel.maxAffordableAbilityCost >= 4) score -= 0.8;
+
+    // Counter strategies known to be in their deck + they have resources
+    if (opModel.likelyHasCounter) score -= 0.6;
+  } catch { /* best effort */ }
+
+  // Silence unused variable
+  void myBoardPower;
 
   return score;
 }
@@ -144,6 +489,17 @@ export function getAIAction(state: GameState, player: PlayerId): PlayerAction {
 function decideMulligan(state: GameState, player: PlayerId): PlayerAction {
   const hand = state.players[player].hand;
 
+  // Count duplicate print numbers for de-duping
+  const printCounts: Record<string, number> = {};
+  const printNumsByCard: Record<string, string> = {};
+  for (const id of hand) {
+    try {
+      const def = getCardDefForInstance(state, id);
+      printCounts[def.printNumber] = (printCounts[def.printNumber] || 0) + 1;
+      printNumsByCard[id] = def.printNumber;
+    } catch { /* ignore */ }
+  }
+
   // Score each card for opening hand quality
   const scored = hand.map((cardId) => {
     const def = getCardDefForInstance(state, cardId);
@@ -157,12 +513,23 @@ function decideMulligan(state: GameState, player: PlayerId): PlayerAction {
       else score = 1;
       // Bonus for put-in-play triggers
       if (cd.effects.some((e) => e.type === 'trigger' && e.triggerCondition?.includes('put-in-play'))) score += 1;
+      // Unique duplicates are worthless (can't summon two)
+      if (cd.characteristics.includes('unique') && (printCounts[cd.printNumber] || 1) > 1) {
+        score = Math.min(score, 2);
+      }
     } else if (def.cardType === 'strategy') {
       const sd = def as StrategyCardDef;
       score = sd.turnCost <= 2 ? 4 : 2;
+      if (sd.keywords.includes('unique') && (printCounts[sd.printNumber] || 1) > 1) {
+        score = Math.min(score, 2);
+      }
     } else if (def.cardType === 'ability') {
       score = 2;
     }
+
+    // Penalize triplicates harder (≥3 copies of same card)
+    if ((printCounts[def.printNumber] || 1) >= 3) score -= 1;
+
     return { id: cardId, score };
   });
 
@@ -172,21 +539,35 @@ function decideMulligan(state: GameState, player: PlayerId): PlayerAction {
     return def.cardType === 'character' && (def as CharacterCardDef).turnCost === 0;
   });
 
+  // Check turn-cost curve: want at least one 1-2 cost card too
+  const hasEarlyCurve = scored.some((s) => {
+    const def = getCardDefForInstance(state, s.id);
+    if (def.cardType !== 'character') return false;
+    const cd = def as CharacterCardDef;
+    return cd.turnCost >= 1 && cd.turnCost <= 2;
+  });
+
   scored.sort((a, b) => a.score - b.score);
 
   const cardsToReturn: string[] = [];
 
-  if (!hasZeroCost) {
-    // No early plays — return up to 3 lowest scored cards
+  if (!hasZeroCost && !hasEarlyCurve) {
+    // Very bad opener — return up to 3 lowest scored cards aggressively
+    for (const s of scored) {
+      if (cardsToReturn.length >= 3) break;
+      if (s.score <= 4) cardsToReturn.push(s.id);
+    }
+  } else if (!hasZeroCost) {
+    // Decent curve but no turn-1 play — return 2-3 lowest
     for (const s of scored) {
       if (cardsToReturn.length >= 3) break;
       if (s.score <= 3) cardsToReturn.push(s.id);
     }
   } else {
-    // Have early plays — return high-cost clunkers (score ≤ 2, up to 2)
-    const highCost = scored.filter((s) => s.score <= 2);
-    if (highCost.length >= 3) {
-      cardsToReturn.push(highCost[0].id, highCost[1].id);
+    // Have 0-cost — only dump true clunkers (score ≤ 2)
+    for (const s of scored) {
+      if (cardsToReturn.length >= 2) break;
+      if (s.score <= 2) cardsToReturn.push(s.id);
     }
   }
 
@@ -210,39 +591,106 @@ function decideMainPhase(
     return { type: 'pass-priority' };
   }
 
-  // Priority 1: Summon a character if we can
-  if (
-    legalActions.includes('summon') &&
-    !playerState.hasSummonedThisTurn &&
-    state.chain.length === 0
-  ) {
-    const summonAction = chooseSummon(state, player);
-    if (summonAction) return summonAction;
-  }
-
-  // Priority 2: Use activate effects (Solomon's buff, Lucian's draw)
+  // Activate effects are handled by a specialized picker (Solomon, Lucian, Spike, etc.) —
+  // these have card-specific validation that's complex to enumerate, so we keep the
+  // dedicated path and try it first.
   if (legalActions.includes('activate-effect')) {
     const activateAction = chooseActivateEffect(state, player);
     if (activateAction) return activateAction;
   }
 
-  // Priority 3: Play a strategy card
-  if (
-    legalActions.includes('play-strategy') &&
-    !playerState.hasPlayedStrategyThisTurn
-  ) {
-    const stratAction = chooseStrategy(state, player);
-    if (stratAction) return stratAction;
+  // Pre-compute Tier 1 heuristic actions — used as bonus signal layered on simulation
+  const heuristicSummon = chooseSummon(state, player);
+  const heuristicStrategy = chooseStrategy(state, player);
+  const heuristicCharge = chooseCharge(state, player);
+  const bonusCtx = { heuristicSummon, heuristicStrategy, heuristicCharge };
+
+  // Tier 2 — depth-2 lookahead planner. Uses heuristicBonus at depth-1 ranking
+  // to preserve Tier 1 card-specific intelligence.
+  try {
+    const planned = planMainPhase(state, player, {
+      topK: 5,
+      maxSims: 250,
+      fullTurn: true,
+      maxRolloutDepth: 5,
+      heuristicBonusFn: (s, p, a) => heuristicBonus(s, p, a, bonusCtx),
+    });
+    if (planned) return planned;
+  } catch {
+    // Fall through to depth-1 scoring safety net
   }
 
-  // Priority 4: Charge essence (move cards we don't need to essence)
-  if (legalActions.includes('charge-essence') && state.chain.length === 0) {
-    const chargeAction = chooseCharge(state, player);
-    if (chargeAction) return chargeAction;
+  // Fallback — depth-1 scoring (original Tier 1+simulation logic, safety net)
+  const candidates = enumerateMainPhaseActions(state, player);
+  if (candidates.length === 0) return { type: 'pass-priority' };
+
+  const scored = candidates.map((action) => {
+    const simulated = simulateAction(state, player, action);
+    if (simulated && isWinningState(simulated, player)) {
+      return { action, score: Number.POSITIVE_INFINITY };
+    }
+    const simScore = scoreAction(state, player, action);
+    const bonus = heuristicBonus(state, player, action, bonusCtx);
+    return { action, score: simScore + bonus };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  if (!best || best.score === Number.NEGATIVE_INFINITY) {
+    return { type: 'pass-priority' };
   }
 
-  // Default: pass
-  return { type: 'pass-priority' };
+  if (best.action.type === 'pass-priority' && scored.length > 1 && scored[1].score > 0.5) {
+    return scored[1].action;
+  }
+
+  return best.action;
+}
+
+/**
+ * Heuristic bonus layered on top of simulation's scoreAction.
+ * Preserves Tier 1 card-specific intelligence that `evaluateBoard` can't see
+ * (e.g., "this summon enables Spike's activate next turn"). If the Tier 1
+ * picker would have chosen this exact action, we add a bonus; otherwise 0.
+ */
+function heuristicBonus(
+  _state: GameState,
+  _player: PlayerId,
+  action: PlayerAction,
+  ctx: {
+    heuristicSummon: PlayerAction | null;
+    heuristicStrategy: PlayerAction | null;
+    heuristicCharge: PlayerAction | null;
+  },
+): number {
+  if (action.type === 'summon') {
+    if (ctx.heuristicSummon?.type === 'summon') {
+      if (action.cardInstanceId === ctx.heuristicSummon.cardInstanceId) return 2.5;
+      return -0.5; // Tier 1 preferred a different summon
+    }
+    // Tier 1 said "don't summon" — light penalty, but simulation can override for strong plays
+    return -1.0;
+  }
+  if (action.type === 'play-strategy') {
+    if (ctx.heuristicStrategy?.type === 'play-strategy') {
+      if (action.cardInstanceId === ctx.heuristicStrategy.cardInstanceId) return 2.0;
+      return -0.5;
+    }
+    return -1.0;
+  }
+  if (action.type === 'charge-essence') {
+    if (ctx.heuristicCharge?.type === 'charge-essence') {
+      const a = action.cardInstanceIds[0];
+      const b = ctx.heuristicCharge.cardInstanceIds[0];
+      if (a && a === b) return 1.5;
+      return -1.0; // different charge target than Tier 1 picked
+    }
+    // Tier 1 vetoed charging entirely (hand too small or essence full) — strong penalty
+    return -3.0;
+  }
+  // Slight negative bias on pass so we prefer action when scores are close
+  if (action.type === 'pass-priority') return -0.25;
+  return 0;
 }
 
 function chooseSummon(
@@ -797,8 +1245,52 @@ function chooseCharge(
   const ps = state.players[player];
   const hand = ps.hand;
 
+  // Hard guards
   if (hand.length <= 3) return null;
   if (ps.essence.length >= 6) return null;
+
+  // Essence in this game only pays ability essence-costs. Before recommending
+  // a charge, check if the player actually benefits from more essence.
+  //
+  // Count ability cards in hand/deck and highest essence cost seen.
+  const essenceCostTotal = (ec: { specific?: { count: number }[]; neutral?: number } | undefined): number => {
+    if (!ec) return 0;
+    const specific = (ec.specific ?? []).reduce((sum, s) => sum + (s.count || 0), 0);
+    return specific + (ec.neutral ?? 0);
+  };
+
+  let abilityCount = 0;
+  let maxAbilityEssenceCost = 0;
+  const checkAbility = (id: string) => {
+    try {
+      const def = getCardDefForInstance(state, id);
+      if (def.cardType === 'ability') {
+        abilityCount++;
+        const total = essenceCostTotal((def as AbilityCardDef).essenceCost);
+        if (total > maxAbilityEssenceCost) maxAbilityEssenceCost = total;
+      }
+      // Characters/fields/strategies may have activate effects with essence costs
+      if (def.cardType === 'character' || def.cardType === 'field' || def.cardType === 'strategy') {
+        const effects = (def as { effects?: { essenceCost?: { specific?: { count: number }[]; neutral?: number } }[] }).effects ?? [];
+        for (const eff of effects) {
+          const total = essenceCostTotal(eff.essenceCost);
+          if (total > 0 && total > maxAbilityEssenceCost) maxAbilityEssenceCost = total;
+        }
+      }
+    } catch { /* ignore */ }
+  };
+  for (const id of hand) checkAbility(id);
+  for (const id of ps.deck) checkAbility(id);
+  for (const id of ps.kingdom) checkAbility(id);
+  for (const id of ps.battlefield) checkAbility(id);
+
+  // Essence is wasted if no abilities exist and we're not overflowing the hand limit.
+  const overflowing = hand.length >= 7;
+  const needsMoreEssence = ps.essence.length < maxAbilityEssenceCost;
+
+  if (!overflowing && (abilityCount === 0 || !needsMoreEssence)) {
+    return null;
+  }
 
   // Count copies of each card in hand for duplicate scoring
   const cardCounts: Record<string, number> = {};
@@ -839,9 +1331,9 @@ function chooseCharge(
 
   scored.sort((a, b) => a.value - b.value);
 
-  // Charge the lowest-value card if it's low enough or hand is big
+  // Charge if we need essence for abilities OR we're over hand limit
   const lowest = scored[0];
-  if (lowest.value < 4 || hand.length > 5) {
+  if (overflowing || (abilityCount > 0 && needsMoreEssence && lowest.value < 5)) {
     return { type: 'charge-essence', cardInstanceIds: [lowest.id] };
   }
 
@@ -858,8 +1350,13 @@ function decideOrganization(state: GameState, player: PlayerId): PlayerAction {
     (t) => t.owner === player
   );
 
-  if (existingTeams.length > 0) {
-    // Teams already organized — choose battle or end
+  // If all teams are solo (1 character each) and we have 2+ characters,
+  // this is likely the initial auto-created solo teams — fall through to
+  // reorganization logic so the AI can combine characters into multi-member teams.
+  const allSolo = existingTeams.length >= 2 && existingTeams.every((t) => t.characterIds.length === 1);
+
+  if (existingTeams.length > 0 && !allSolo) {
+    // Teams already organized (multi-member) — choose battle or end
     if (state.turnNumber === 0) {
       return { type: 'choose-battle-or-end', choice: 'end' };
     }
@@ -917,16 +1414,132 @@ function decideOrganization(state: GameState, player: PlayerId): PlayerAction {
     return { type: 'choose-battle-or-end', choice: 'end' };
   }
 
-  // Build teams based on synergy
-  const teams = buildTeams(state, player, kingdom);
+  // Build team candidates and simulate each — pick the one with best resulting state
+  const candidates = generateTeamCandidates(state, player, kingdom);
+
+  const baseEval = evaluateBoard(state, player);
+  let bestTeams = candidates[0];
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const candidate of candidates) {
+    const action: PlayerAction = {
+      type: 'organize-teams',
+      teams: candidate.map((t) => ({
+        leadId: t[0],
+        supportIds: t.slice(1),
+      })),
+    };
+
+    const simulated = simulateAction(state, player, action);
+    if (!simulated) continue;
+
+    // Score = evaluateBoard delta + team power distribution bonus
+    let score = evaluateBoard(simulated, player) - baseEval;
+
+    // Bonus: favor having at least one strong team (>= 5 power for 5+ BR threshold)
+    let hasStrongTeam = false;
+    const simTeams = Object.values(simulated.teams).filter((t) => t.owner === player);
+    for (const t of simTeams) {
+      const p = estimateTeamPower(simulated, t);
+      if (p >= 5) hasStrongTeam = true;
+    }
+    if (hasStrongTeam) score += 0.8;
+
+    // Penalize too many solo teams if we have 4+ chars (usually inefficient)
+    if (kingdom.length >= 4 && simTeams.length === kingdom.length) score -= 1;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestTeams = candidate;
+    }
+  }
 
   return {
     type: 'organize-teams',
-    teams: teams.map((t) => ({
+    teams: bestTeams.map((t) => ({
       leadId: t[0],
       supportIds: t.slice(1),
     })),
   };
+}
+
+/**
+ * Generate candidate team arrangements for simulation comparison.
+ * Returns up to 5 distinct arrangements covering common strategies.
+ */
+function generateTeamCandidates(
+  state: GameState,
+  player: PlayerId,
+  characters: CardInstance[],
+): string[][][] {
+  const candidates: string[][][] = [];
+
+  // Candidate 1: synergy-based (current heuristic)
+  candidates.push(buildTeams(state, player, characters));
+
+  // Candidate 2: all chars in one team (if ≤ 3)
+  if (characters.length <= 3) {
+    const sorted = [...characters].sort((a, b) => {
+      const aStats = getEffectiveStats(state, a.instanceId);
+      const bStats = getEffectiveStats(state, b.instanceId);
+      return bStats.lead - aStats.lead;
+    });
+    candidates.push([sorted.map((c) => c.instanceId)]);
+  }
+
+  // Candidate 3: stacked — best leader gets 2 best supports
+  if (characters.length >= 3) {
+    const sorted = [...characters].sort((a, b) => {
+      const aStats = getEffectiveStats(state, a.instanceId);
+      const bStats = getEffectiveStats(state, b.instanceId);
+      return bStats.lead - aStats.lead;
+    });
+    const stacked: string[][] = [sorted.slice(0, 3).map((c) => c.instanceId)];
+    // Remaining chars each get their own solo team
+    for (let i = 3; i < sorted.length; i++) {
+      stacked.push([sorted[i].instanceId]);
+    }
+    candidates.push(stacked);
+  }
+
+  // Candidate 4: all solo teams (useful when few chars with unique effects)
+  if (characters.length >= 2 && characters.length <= 5) {
+    candidates.push(characters.map((c) => [c.instanceId]));
+  }
+
+  // Candidate 5: 3-team split for 4-6 characters (wider coverage)
+  if (characters.length >= 4 && characters.length <= 6) {
+    const sorted = [...characters].sort((a, b) => {
+      const aStats = getEffectiveStats(state, a.instanceId);
+      const bStats = getEffectiveStats(state, b.instanceId);
+      return bStats.lead - aStats.lead;
+    });
+    // Top-3 as leads, rest distributed by lead stat (reverse-sorted → strong supports to weaker leads)
+    const numLeads = Math.min(3, sorted.length);
+    const teams: string[][] = sorted.slice(0, numLeads).map((c) => [c.instanceId]);
+    const supports = sorted.slice(numLeads);
+    // Distribute supports evenly (round-robin starting from strongest support → weakest leader)
+    for (let i = 0; i < supports.length; i++) {
+      const teamIdx = (numLeads - 1) - (i % numLeads);
+      if (teams[teamIdx].length < 3) teams[teamIdx].push(supports[i].instanceId);
+    }
+    candidates.push(teams);
+  }
+
+  // Deduplicate by serialized team layout
+  const seen = new Set<string>();
+  const unique: string[][][] = [];
+  for (const c of candidates) {
+    // Normalize: sort within teams and sort teams by first member
+    const normalized = c.map((t) => [...t].sort()).sort((a, b) => a[0].localeCompare(b[0]));
+    const key = normalized.map((t) => t.join(',')).join('|');
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(c);
+    }
+  }
+
+  return unique;
 }
 
 function buildTeams(
@@ -1029,6 +1642,8 @@ function decideAttackers(state: GameState, player: PlayerId): PlayerAction {
   const opponent = getOpponent(player);
   const opTeams = Object.values(state.teams).filter((t) => t.owner === opponent);
   const phase = getGamePhase(state);
+  const ctx = getGameContext(state, player);
+  const opModel = buildOpponentModel(state, player);
 
   // Score each team for attacking
   const teamScores = playerTeams.map((t) => {
@@ -1056,14 +1671,29 @@ function decideAttackers(state: GameState, player: PlayerId): PlayerAction {
 
   teamScores.sort((a, b) => b.attackValue - a.attackValue);
 
+  // Stance-adjusted risk tolerance
+  let winThreshold =
+    ctx.stance === 'aggro' ? 0.55 :
+    ctx.stance === 'defensive' ? 0.9 :
+    ctx.stance === 'desperate' ? 1.2 :
+    0.7;
+  let maxAttackers =
+    ctx.stance === 'defensive' ? Math.min(teamScores.length, 1) :
+    Math.min(teamScores.length, 3);
+
+  // Opponent model: if counter strategies likely, pull back from overcommitting
+  if (opModel.likelyHasCounter) {
+    winThreshold *= 1.1;        // require more margin to commit
+    maxAttackers = Math.max(1, maxAttackers - 1); // send fewer teams — don't lose multiple to one counter
+  }
+  // Opponent has big affordable abilities → they'll pump a blocker; send stronger teams only
+  if (opModel.maxAffordableAbilityCost >= 4) {
+    winThreshold *= 1.05;
+  }
+
   // Overflow strategy: if we have more teams than opponent can block, send extras for free BRs
   const opBlockerCount = opTeams.length;
-  let maxToSend = Math.min(teamScores.length, 3);
-
-  // If we can overflow, send at least opBlockerCount + 1
-  if (teamScores.length > opBlockerCount) {
-    maxToSend = Math.min(teamScores.length, 3);
-  }
+  const maxToSend = Math.min(maxAttackers, teamScores.length);
 
   // Evaluate: compare our weakest potential attacker vs opponent's strongest blocker
   const opBestPower = opTeams.length > 0
@@ -1077,18 +1707,64 @@ function decideAttackers(state: GameState, player: PlayerId): PlayerAction {
     // Skip weak teams that would lose unless we're overflowing
     if (ts.power < opBestPower && selected.length >= opBlockerCount) {
       // This would be an overflow team — free BR if unblocked, okay to send
-      selected.push(ts.team.id);
-    } else if (ts.power >= opBestPower * 0.7 || selected.length < opBlockerCount) {
+      if (ctx.stance !== 'defensive') selected.push(ts.team.id);
+    } else if (ts.power >= opBestPower * winThreshold || selected.length < opBlockerCount) {
       selected.push(ts.team.id);
     }
   }
 
-  // Late game: always send at least one team
-  if (selected.length === 0 && phase === 'late' && teamScores.length > 0) {
+  // Desperate: attack with everything — we need to stop the opponent's snowball
+  if (ctx.stance === 'desperate' && selected.length === 0) {
+    for (const ts of teamScores.slice(0, 3)) selected.push(ts.team.id);
+  }
+
+  // Late game: always send at least one team (unless defensive)
+  if (selected.length === 0 && phase === 'late' && teamScores.length > 0 && ctx.stance !== 'defensive') {
     selected.push(teamScores[0].team.id);
   }
 
-  return { type: 'select-attackers', teamIds: selected };
+  // Simulation re-scoring (MCTS-lite): consider alternative attack compositions
+  // and let the game engine's real simulation adjudicate between them.
+  const alternatives: string[][] = [];
+  alternatives.push([...selected]); // current heuristic pick
+  // Go-wide: send all positive-power teams
+  alternatives.push(teamScores.map((ts) => ts.team.id));
+  // Go-narrow: send only the strongest team
+  if (teamScores.length > 0) alternatives.push([teamScores[0].team.id]);
+  // Conservative: no attackers
+  alternatives.push([]);
+
+  // Deduplicate by serialized ID list
+  const dedup = new Map<string, string[]>();
+  for (const alt of alternatives) {
+    const key = [...alt].sort().join('|');
+    if (!dedup.has(key)) dedup.set(key, alt);
+  }
+
+  const baseEval = evaluateBoard(state, player);
+  let bestTeams = selected;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const [, altTeams] of dedup) {
+    const action: PlayerAction = { type: 'select-attackers', teamIds: altTeams };
+    const simulated = simulateAction(state, player, action);
+    if (!simulated) continue;
+
+    let altScore = evaluateBoard(simulated, player) - baseEval;
+
+    // Stance-adjusted preference: defensive penalizes attacking, aggro rewards it
+    if (ctx.stance === 'defensive' && altTeams.length > 0) altScore -= 0.5;
+    if (ctx.stance === 'aggro' && altTeams.length > 0) altScore += 0.3;
+    // Desperate: must attack (empty selection heavily penalized)
+    if (ctx.stance === 'desperate' && altTeams.length === 0) altScore -= 3;
+
+    if (altScore > bestScore) {
+      bestScore = altScore;
+      bestTeams = altTeams;
+    }
+  }
+
+  return { type: 'select-attackers', teamIds: bestTeams };
 }
 
 function decideBlockers(state: GameState, player: PlayerId): PlayerAction {
@@ -1106,11 +1782,32 @@ function decideBlockers(state: GameState, player: PlayerId): PlayerAction {
     return { type: 'select-blockers', assignments: [] };
   }
 
+  const ctx = getGameContext(state, player);
+  const opModel = buildOpponentModel(state, player);
+  // When defensive/desperate, unblocked damage costs more (we can't afford BRs).
+  // When aggro, let weak chip damage through — we're winning the race.
+  let unblockedMult =
+    ctx.stance === 'desperate' ? 2.0 :
+    ctx.stance === 'defensive' ? 1.5 :
+    ctx.stance === 'aggro' ? 0.8 :
+    1.0;
+  // When defensive, a losing trade is still better than unblocked damage.
+  let losingTradeMult =
+    ctx.stance === 'desperate' ? 0.6 :
+    ctx.stance === 'defensive' ? 0.75 :
+    1.0;
+
+  // Opponent model adjustments:
+  // If opponent has big affordable abilities, they can pump attackers in EOA —
+  // blocking becomes more urgent (unblocked = extra damage from ability boost).
+  if (opModel.maxAffordableAbilityCost >= 4) unblockedMult *= 1.15;
+  // If likely counter, losing a trade is worse (lose the trade + eat a counter)
+  if (opModel.likelyHasCounter) losingTradeMult *= 1.1;
+
   // Score the damage of an unblocked attacker
   function unblockedDamage(attacker: Team): number {
     const power = calculateTeamPower(state, attacker);
-    // Outstanding BR if power >= 5 → counts as extra bad
-    return power >= 5 ? 6 : 3;
+    return (power >= 5 ? 6 : 3) * unblockedMult;
   }
 
   // Score for a blocker-vs-attacker matchup (lower = better for us)
@@ -1120,7 +1817,8 @@ function decideBlockers(state: GameState, player: PlayerId): PlayerAction {
     if (bPower > aPower) return 0;       // we win
     if (bPower === aPower) return 1;     // stalemate
     // we lose — how bad?
-    return aPower >= 5 ? 4 : 2;
+    const base = aPower >= 5 ? 4 : 2;
+    return base * losingTradeMult;
   }
 
   // Brute-force: for each attacker, try each blocker or "unblocked"
@@ -1139,8 +1837,12 @@ function decideBlockers(state: GameState, player: PlayerId): PlayerAction {
     return greedyBlock(state, attackingTeams, ourTeams);
   }
 
-  let bestAssignment: number[] = new Array(attackerCount).fill(-1);
-  let bestDamage = Infinity;
+  // Pass 1: heuristic scoring — collect all valid assignments with their damage
+  interface ScoredAssignment {
+    assignment: number[];
+    heuristicDamage: number;
+  }
+  const scored: ScoredAssignment[] = [];
 
   for (let combo = 0; combo < totalCombos; combo++) {
     const assignment: number[] = [];
@@ -1174,23 +1876,66 @@ function decideBlockers(state: GameState, player: PlayerId): PlayerAction {
       }
     }
 
-    if (totalDamage < bestDamage) {
-      bestDamage = totalDamage;
-      bestAssignment = assignment;
+    scored.push({ assignment, heuristicDamage: totalDamage });
+  }
+
+  if (scored.length === 0) {
+    return { type: 'select-blockers', assignments: [] };
+  }
+
+  // Pass 2: Simulation re-scoring (MCTS-lite).
+  // Take top-K candidates by heuristic, simulate each blocker assignment,
+  // score the resulting state with evaluateBoard. Pick best by combined score.
+  scored.sort((a, b) => a.heuristicDamage - b.heuristicDamage);
+  const topK = Math.min(5, scored.length);
+  const candidates = scored.slice(0, topK);
+
+  const makeAssignmentPayload = (assignment: number[]) => {
+    const payload: { blockingTeamId: string; attackingTeamId: string }[] = [];
+    for (let a = 0; a < attackerCount; a++) {
+      if (assignment[a] >= 0) {
+        payload.push({
+          blockingTeamId: ourTeams[assignment[a]].id,
+          attackingTeamId: attackingTeams[a].id,
+        });
+      }
+    }
+    return payload;
+  };
+
+  const baseEval = evaluateBoard(state, player);
+  let bestAssignment = candidates[0].assignment;
+  let bestCombinedScore = Number.NEGATIVE_INFINITY;
+
+  for (const cand of candidates) {
+    const payload = makeAssignmentPayload(cand.assignment);
+    const action: PlayerAction = { type: 'select-blockers', assignments: payload };
+
+    // Simulate just the select-blockers action — evaluates immediate state
+    // after triggers (sent-to-battle etc.) resolve. More accurate than heuristic
+    // because it reflects real game engine effects.
+    const simulated = simulateAction(state, player, action);
+    let simEval: number;
+    if (simulated) {
+      simEval = evaluateBoard(simulated, player);
+    } else {
+      // Simulation failed — fall back to heuristic-only
+      simEval = baseEval - cand.heuristicDamage * 0.3;
+    }
+
+    // Combined: simulation delta is primary, heuristic as tiebreaker
+    const combined = (simEval - baseEval) - cand.heuristicDamage * 0.15;
+
+    if (combined > bestCombinedScore) {
+      bestCombinedScore = combined;
+      bestAssignment = cand.assignment;
     }
   }
 
-  const assignments: { blockingTeamId: string; attackingTeamId: string }[] = [];
-  for (let a = 0; a < attackerCount; a++) {
-    if (bestAssignment[a] >= 0) {
-      assignments.push({
-        blockingTeamId: ourTeams[bestAssignment[a]].id,
-        attackingTeamId: attackingTeams[a].id,
-      });
-    }
-  }
-
-  return { type: 'select-blockers', assignments };
+  return {
+    type: 'select-blockers',
+    assignments: makeAssignmentPayload(bestAssignment),
+  };
 }
 
 function greedyBlock(
@@ -1412,6 +2157,21 @@ function chooseAbility(
         ? Math.max(0, canPayEssence.cardIds.length - abilityDef.essenceCost.specific.reduce((s, c) => s + c.count, 0) - abilityDef.essenceCost.neutral - (abilityDef.essenceCost.cardSymbol ?? 0))
         : undefined;
 
+      // Simulation term — add board-eval delta as a secondary signal
+      try {
+        const simScore = scoreAction(state, player, {
+          type: 'play-ability',
+          cardInstanceId: cardId,
+          userId: validUser.instanceId,
+          targetIds,
+          essenceCostCardIds: canPayEssence.cardIds,
+          xValue,
+        });
+        if (Number.isFinite(simScore)) {
+          score += simScore * 0.3;
+        }
+      } catch { /* ignore sim failures */ }
+
       candidates.push({
         cardId,
         userId: validUser.instanceId,
@@ -1425,8 +2185,142 @@ function chooseAbility(
 
   if (candidates.length === 0) return null;
 
-  // Pick the highest-scored ability
+  // Sort by current single-ability score
   candidates.sort((a, b) => b.score - a.score);
+
+  // Phase 8: combo-aware lookahead.
+  // For the top candidates, simulate the play and check whether a follow-up
+  // ability play is also possible afterward (e.g., buff → damage, Spike activate
+  // → another ability, Swift Strike on injured target → second ability combo).
+  // Add the follow-up's board-delta as a combo bonus.
+  const topK = Math.min(3, candidates.length);
+  const comboScores = new Map<number, number>(); // candidate index → combo bonus
+
+  for (let i = 0; i < topK; i++) {
+    const cand = candidates[i];
+    const action: PlayerAction = {
+      type: 'play-ability',
+      cardInstanceId: cand.cardId,
+      userId: cand.userId,
+      targetIds: cand.targetIds,
+      essenceCostCardIds: cand.essenceCardIds,
+      xValue: cand.xValue,
+    };
+
+    const afterFirst = simulateAction(state, player, action);
+    if (!afterFirst) continue;
+
+    // In simulation, the chain has the ability + opponent gets priority.
+    // Skip if chain is still unresolved or pending interactive prompts.
+    if (
+      afterFirst.pendingOptionalEffect ||
+      afterFirst.pendingTargetChoice ||
+      afterFirst.pendingSearch
+    ) continue;
+
+    // Recursively check if ANOTHER ability can be played after chain resolves.
+    // Simulate opponent passing, chain resolving, then back to us.
+    let advanced: GameState | null = afterFirst;
+    // Try to advance priority a couple times (opponent may need to pass first)
+    for (let step = 0; step < 3; step++) {
+      if (!advanced) break;
+      if (advanced.chain.length === 0) break;
+      const priorityP = advanced.priorityPlayer ?? advanced.currentTurn;
+      const next: GameState | null = simulateAction(advanced, priorityP, { type: 'pass-priority' });
+      if (!next) break;
+      advanced = next;
+    }
+
+    if (!advanced) continue;
+
+    // Find best follow-up ability play from the advanced state.
+    // Recursion-lite: we don't call chooseAbility recursively (would infinite-loop),
+    // just search hand for another playable ability with matching user + essence.
+    const baseEval = evaluateBoard(afterFirst, player);
+    let bestComboBonus = 0;
+
+    const followHand = advanced.players[player].hand;
+    for (const fid of followHand) {
+      let fdef;
+      try { fdef = getCardDefForInstance(advanced, fid); } catch { continue; }
+      if (fdef.cardType !== 'ability') continue;
+      const fAbility = fdef as AbilityCardDef;
+
+      // Quick playability check
+      const followUsers = getCardsInZone(advanced, player, 'battlefield').filter((c) => {
+        if (c.state === 'injured') return false;
+        const cDef = getCardDefForInstance(advanced, c.instanceId) as CharacterCardDef;
+        return fAbility.requirements.every((req) => {
+          if (req.type === 'attribute') return cDef.attributes.includes(req.value);
+          if (req.type === 'turn-cost-min') return cDef.turnCost >= parseInt(req.value, 10);
+          return true;
+        });
+      });
+      if (followUsers.length === 0) continue;
+
+      const followPay = checkEssenceCost(advanced, player, fAbility);
+      if (!followPay.canPay) continue;
+
+      // Pick first valid user + simple target (opposing char if needed)
+      const followUser = followUsers[0];
+      let followTargetIds: string[] | undefined;
+      if (fAbility.targetDescription?.includes('opposing')) {
+        const uTeam = Object.values(advanced.teams).find((t) =>
+          t.characterIds.includes(followUser.instanceId),
+        );
+        if (!uTeam) continue;
+        let opposing: typeof uTeam | undefined;
+        if (uTeam.isAttacking && uTeam.blockedByTeamId) {
+          opposing = advanced.teams[uTeam.blockedByTeamId];
+        } else if (uTeam.isBlocking && uTeam.blockingTeamId) {
+          opposing = advanced.teams[uTeam.blockingTeamId];
+        }
+        if (!opposing) continue;
+        const chars = opposing.characterIds.filter(
+          (id) => advanced.cards[id]?.zone === 'battlefield',
+        );
+        if (chars.length === 0) continue;
+        followTargetIds = [chars[0]];
+      }
+
+      const followXValue = fAbility.essenceCost.x
+        ? Math.max(0, followPay.cardIds.length -
+            fAbility.essenceCost.specific.reduce((s, c) => s + c.count, 0) -
+            fAbility.essenceCost.neutral -
+            (fAbility.essenceCost.cardSymbol ?? 0))
+        : undefined;
+
+      const followAction: PlayerAction = {
+        type: 'play-ability',
+        cardInstanceId: fid,
+        userId: followUser.instanceId,
+        targetIds: followTargetIds,
+        essenceCostCardIds: followPay.cardIds,
+        xValue: followXValue,
+      };
+
+      const afterSecond = simulateAction(advanced, player, followAction);
+      if (!afterSecond) continue;
+
+      const comboDelta = evaluateBoard(afterSecond, player) - baseEval;
+      if (comboDelta > bestComboBonus) {
+        bestComboBonus = comboDelta;
+      }
+    }
+
+    if (bestComboBonus > 0) {
+      // Combo discount: follow-up needs opponent not to counter — not guaranteed
+      comboScores.set(i, bestComboBonus * 0.7);
+    }
+  }
+
+  // Apply combo bonuses and re-rank
+  for (let i = 0; i < candidates.length; i++) {
+    const bonus = comboScores.get(i) ?? 0;
+    candidates[i].score += bonus;
+  }
+  candidates.sort((a, b) => b.score - a.score);
+
   const best = candidates[0];
 
   return {
@@ -1513,39 +2407,136 @@ function decideEndPhase(state: GameState, player: PlayerId): PlayerAction {
   const ps = state.players[player];
   const hand = ps.hand;
   const phase = getGamePhase(state);
+  const ctx = getGameContext(state, player);
 
   if (hand.length > 7) {
+    // Pre-compute print-number counts in hand (for duplicate detection)
+    const handPrintCounts = new Map<string, number>();
+    for (const id of hand) {
+      const d = getCardDefForInstance(state, id);
+      handPrintCounts.set(d.printNumber, (handPrintCounts.get(d.printNumber) ?? 0) + 1);
+    }
+
+    // Identify what's already in play (for unique checks)
+    const inPlayPrints = new Set<string>();
+    for (const id of [...ps.kingdom, ...ps.battlefield]) {
+      const d = getCardDefForInstance(state, id);
+      inPlayPrints.add(d.printNumber);
+    }
+
+    // Turn-cost curve: how many affordable playable characters/strategies do we have?
+    const affordablePlayables = hand.filter((id) => {
+      const d = getCardDefForInstance(state, id);
+      if (d.cardType === 'character') {
+        return (d as CharacterCardDef).turnCost <= ps.turnMarker;
+      }
+      if (d.cardType === 'strategy') {
+        return (d as StrategyCardDef).turnCost <= ps.turnMarker;
+      }
+      return false;
+    }).length;
+    const curveShortage = affordablePlayables <= 1; // scarce → protect cheap cards
+
+    // Which essence symbols do we currently own?
+    const ownedEssenceSymbols = new Set<string>();
+    for (const eid of ps.essence) {
+      const d = getCardDefForInstance(state, eid);
+      for (const s of d.symbols) ownedEssenceSymbols.add(s);
+    }
+
     const scored = hand.map((id) => {
       let value = cardValue(state, id);
       const def = getCardDefForInstance(state, id);
+      const dupCount = handPrintCounts.get(def.printNumber) ?? 1;
+
+      // Duplicate handling in hand
+      if (dupCount >= 3) value -= 2;
+      else if (dupCount === 2) value -= 0.5;
 
       // Playability penalty: turn cost too far out
       if (def.cardType === 'character') {
         const cd = def as CharacterCardDef;
-        if (cd.turnCost > ps.turnMarker + 2) value *= 0.5;
-        // Unique already in play → discard it
-        if (cd.characteristics.includes('unique')) {
-          const inPlay = [...ps.kingdom, ...ps.battlefield].some((kid) => {
-            const kd = getCardDefForInstance(state, kid);
-            return kd.printNumber === cd.printNumber;
+        const turnsAway = cd.turnCost - ps.turnMarker;
+        if (turnsAway >= 3) value *= 0.3;      // won't play soon
+        else if (turnsAway === 2) value *= 0.6; // a couple turns out
+        else if (turnsAway <= 0) value *= 1.2;  // affordable now: protect it
+
+        // Unique already in play → nearly worthless
+        if (cd.characteristics.includes('unique') && inPlayPrints.has(cd.printNumber)) {
+          value = 0.1;
+        }
+        // Unique with duplicate in hand → extra copy is wasted
+        if (cd.characteristics.includes('unique') && dupCount >= 2) {
+          value -= 1.5;
+        }
+
+        // No matching symbols anywhere (essence + hand) → can't cast solo
+        if (cd.handCost > 0) {
+          const anyMatchInHand = hand.some((oid) => {
+            if (oid === id) return false;
+            const od = getCardDefForInstance(state, oid);
+            return cd.symbols.some((s) => od.symbols.includes(s));
           });
-          if (inPlay) value = 0;
+          if (!anyMatchInHand) value *= 0.8;
         }
       }
 
-      // Abilities without essence to pay
-      if (def.cardType === 'ability' && ps.essence.length < 2) value *= 0.5;
-
-      // Strategy too expensive
+      // Strategy: weight by affordability and counter-relevance
       if (def.cardType === 'strategy') {
         const sd = def as StrategyCardDef;
-        if (sd.turnCost > ps.turnMarker + 1) value *= 0.6;
+        const turnsAway = sd.turnCost - ps.turnMarker;
+        if (turnsAway >= 2) value *= 0.5;
+        else if (turnsAway === 1) value *= 0.75;
+
+        // Counter strategies are only worth keeping if opponent is threatening
+        if (sd.keywords.includes('counter') && ctx.oppBoardPower < 3) {
+          value *= 0.5;
+        }
+        // Can't pay symbols? devalue
+        const canPaySymbols = sd.symbols.length === 0 ||
+          sd.symbols.some((s) => ownedEssenceSymbols.has(s));
+        if (!canPaySymbols && ps.essence.length > 0) value *= 0.7;
       }
 
-      // Late game: high-impact cards are more valuable
+      // Abilities: without user characters, useless
+      if (def.cardType === 'ability') {
+        if (ps.kingdom.length === 0 && ps.battlefield.length === 0) value *= 0.3;
+        if (ps.essence.length < 2) value *= 0.7;
+
+        // Can't pay symbols → less useful
+        const ad = def as AbilityCardDef;
+        if (ad.essenceCost && ad.essenceCost.specific.length > 0) {
+          const canPay = ad.essenceCost.specific.some((sc) =>
+            ownedEssenceSymbols.has(sc.symbol),
+          );
+          if (!canPay && ps.essence.length > 0) value *= 0.6;
+        }
+      }
+
+      // Curve protection: if we're starved for plays, boost cheap cards
+      if (curveShortage && (def.cardType === 'character' || def.cardType === 'strategy')) {
+        const tc = def.cardType === 'character'
+          ? (def as CharacterCardDef).turnCost
+          : (def as StrategyCardDef).turnCost;
+        if (tc <= ps.turnMarker) value += 1.5;
+      }
+
+      // Phase weighting: late game prefers big swings, early prefers curve
       if (phase === 'late' && def.cardType === 'character') {
         const cd = def as CharacterCardDef;
-        if (cd.healthyStats.lead >= 4) value += 2;
+        if (cd.healthyStats.lead >= 4) value += 1.5;
+      }
+      if (phase === 'early' && def.cardType === 'character') {
+        const cd = def as CharacterCardDef;
+        if (cd.turnCost <= 1) value += 1;
+      }
+
+      // Desperate stance: value immediate impact more
+      if (ctx.stance === 'desperate') {
+        if (def.cardType === 'character') {
+          const cd = def as CharacterCardDef;
+          if (cd.turnCost > ps.turnMarker) value *= 0.4; // can't play it in time
+        }
       }
 
       return { id, value };

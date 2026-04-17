@@ -6,9 +6,11 @@
 // not centered like other overlays.
 
 import { Container, Graphics, Text, TextStyle } from 'pixi.js';
+import gsap from 'gsap';
 import { COLORS, BoardLayout } from '../layout';
 import { FONT } from '../SharedStyles';
 import type { UIAction } from '@/hooks/useGameEngine';
+import { TIMING } from '../timing';
 
 export interface CardAction {
   label: string;
@@ -129,5 +131,9 @@ export class CardActionMenuOverlay extends Container {
 
       curY += rowH + 4;
     }
+
+    // Fade-in animation for smooth appearance
+    this.alpha = 0;
+    gsap.to(this, { alpha: 1, duration: TIMING.overlayFadeIn, ease: 'power2.out' });
   }
 }

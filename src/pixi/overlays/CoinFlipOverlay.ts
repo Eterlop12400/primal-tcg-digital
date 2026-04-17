@@ -105,9 +105,9 @@ export class CoinFlipOverlay extends Container {
       },
     });
 
-    tl.to(card, { alpha: 1, duration: 0.3, ease: 'power2.out' })
-      .to(card.scale, { x: 1, y: 1, duration: 0.3, ease: 'back.out' }, '<')
-      .to(card, { duration: 2 }) // hold
-      .to(card, { alpha: 0, y: card.y - 30, duration: 0.5, ease: 'power2.in' });
+    tl.to(card, { alpha: 1, duration: 0.25, ease: 'power2.out' })
+      .to(card.scale, { x: 1, y: 1, duration: 0.25, ease: 'back.out' }, '<')
+      .to(card, { duration: 0.8 }) // hold
+      .to(card, { alpha: 0, y: card.y - 30, duration: 0.35, ease: 'power2.in' });
   }
 }

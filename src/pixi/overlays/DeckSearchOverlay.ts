@@ -9,8 +9,11 @@ import { COLORS, CARD_SIZES, BoardLayout, CardSize } from '../layout';
 import { FONT } from '../SharedStyles';
 import type { GameState, PlayerId, CardDef } from '@/game/types';
 import { getCardDefForInstance, getEffectiveStats } from '@/game/engine';
+import { fadeInOverlay } from './overlayTransitions';
 
 export class DeckSearchOverlay extends Container {
+  private _selectionMade = false;
+
   constructor(
     state: GameState,
     player: PlayerId,
@@ -20,6 +23,7 @@ export class DeckSearchOverlay extends Container {
     onSelect: (cardId: string | null) => void,
     displayCardIds?: string[],
     sourceCardName?: string,
+    onRightClick?: (defId: string, instance?: import('@/game/types').CardInstance, stats?: { lead: number; support: number }) => void,
   ) {
     super();
 
@@ -110,7 +114,7 @@ export class DeckSearchOverlay extends Container {
         cardDef: def,
         instance: inst,
         effectiveStats: stats,
-        interactive: isValid,
+        interactive: true,
         highlighted: isValid,
       });
       card.x = cx;
@@ -134,11 +138,17 @@ export class DeckSearchOverlay extends Container {
         this.addChild(nameTxt);
       }
 
-      if (isValid) {
-        card.on('pointerdown', () => {
-          onSelect(cid);
-        });
-      }
+      card.on('pointerdown', (e: import('pixi.js').FederatedPointerEvent) => {
+        if (e.button === 2) {
+          e.preventDefault?.();
+          onRightClick?.(inst.defId, inst, stats);
+          return;
+        }
+        if (!isValid) return;
+        if (this._selectionMade) return;
+        this._selectionMade = true;
+        onSelect(cid);
+      });
 
       this.addChild(card);
     }
@@ -151,9 +161,13 @@ export class DeckSearchOverlay extends Container {
     cancelBtn.x = layout.width / 2 - btnW / 2;
     cancelBtn.y = layout.height - 60;
     cancelBtn.on('pointerdown', () => {
+      if (this._selectionMade) return;
+      this._selectionMade = true;
       onSelect(null);
     });
     this.addChild(cancelBtn);
+
+    fadeInOverlay(this);
   }
 
   private makeButton(label: string, w: number, h: number, color: number): Container {

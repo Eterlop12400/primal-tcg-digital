@@ -10,12 +10,13 @@ export interface SpeedConfig {
   aiMoveDelay: number;
   autoPassDelay: number;
   animationSpeed: number;
+  postAnimationBuffer: number;
 }
 
 export const SPEED_PRESETS: Record<SpeedPreset, SpeedConfig> = {
-  slow: { aiMoveDelay: 3000, autoPassDelay: 1500, animationSpeed: 0.5 },
-  normal: { aiMoveDelay: 1200, autoPassDelay: 600, animationSpeed: 1.0 },
-  fast: { aiMoveDelay: 400, autoPassDelay: 200, animationSpeed: 2.0 },
+  slow: { aiMoveDelay: 2000, autoPassDelay: 1000, animationSpeed: 0.5, postAnimationBuffer: 400 },
+  normal: { aiMoveDelay: 800, autoPassDelay: 400, animationSpeed: 1.0, postAnimationBuffer: 200 },
+  fast: { aiMoveDelay: 300, autoPassDelay: 150, animationSpeed: 2.0, postAnimationBuffer: 100 },
 };
 
 export const PHASE_LABELS: Record<string, string> = {

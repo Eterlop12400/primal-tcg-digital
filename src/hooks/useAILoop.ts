@@ -22,6 +22,7 @@ interface UseAILoopOptions {
   isAIThinking: boolean;
   gameStarted: boolean;
   mulliganDone: Record<PlayerId, boolean>;
+  isAnimationBusy?: boolean;
   onAIAction: (player: PlayerId, action: PlayerAction) => void;
   onAIThinkingChange: (value: boolean) => void;
   onAIMulligan: (player: PlayerId) => void;
@@ -42,12 +43,14 @@ export function useAILoop(options: UseAILoopOptions): void {
     isAIThinking,
     gameStarted,
     mulliganDone,
+    isAnimationBusy = false,
     onAIAction,
     onAIThinkingChange,
     onAIMulligan,
   } = options;
 
-  const aiDelay = SPEED_PRESETS[speedPreset].aiMoveDelay;
+  const speedConfig = SPEED_PRESETS[speedPreset];
+  const aiDelay = speedConfig.aiMoveDelay;
 
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -71,6 +74,9 @@ export function useAILoop(options: UseAILoopOptions): void {
     if (!gameState) return;
     if (gameState.gameOver) return;
     if (isPaused) return;
+
+    // Wait for animations to finish before AI acts
+    if (isAnimationBusy) return;
 
     // --- Handle mulligan phase ---
     if (!gameStarted) {
@@ -211,5 +217,5 @@ export function useAILoop(options: UseAILoopOptions): void {
         timeoutRef.current = null;
       }
     };
-  }, [gameState, mode, humanPlayer, isPaused, aiSpeed, speedPreset, gameStarted, mulliganDone]);
+  }, [gameState, mode, humanPlayer, isPaused, aiSpeed, speedPreset, gameStarted, mulliganDone, isAnimationBusy]);
 }

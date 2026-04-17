@@ -209,7 +209,7 @@ export class EssencePickerOverlay extends Container {
         // Determine display color
         let symColor: number;
         if (isCardSymbolCost && cardSymbols) {
-          // Use first symbol's color
+          // Use first symbol's color for pill (dots below show all colors)
           symColor = COLORS.symbols[cardSymbols[0]] ?? COLORS.textMuted;
         } else if (cost.symbol !== 'neutral') {
           symColor = COLORS.symbols[cost.symbol] ?? COLORS.textMuted;
@@ -242,9 +242,24 @@ export class EssencePickerOverlay extends Container {
         const pillW = isCardSymbolCost ? 90 : 68;
         const pillH = 28;
         const pill = new Graphics();
-        pill.roundRect(reqX, reqY, pillW, pillH, 6);
-        pill.fill({ color: isMet ? symColor : 0x1a2535, alpha: isMet ? 0.3 : 0.8 });
-        pill.stroke({ color: symColor, width: 1.5, alpha: isMet ? 1 : 0.4 });
+        if (isCardSymbolCost && cardSymbols && cardSymbols.length > 1 && isMet) {
+          // Split-color pill background for multi-symbol costs
+          const c1 = COLORS.symbols[cardSymbols[0]] ?? COLORS.textMuted;
+          const c2 = COLORS.symbols[cardSymbols[1]] ?? COLORS.textMuted;
+          // Left half
+          pill.roundRect(reqX, reqY, pillW / 2, pillH, 0);
+          pill.fill({ color: c1, alpha: 0.25 });
+          // Right half
+          pill.roundRect(reqX + pillW / 2, reqY, pillW / 2, pillH, 0);
+          pill.fill({ color: c2, alpha: 0.25 });
+          // Full border with first color
+          pill.roundRect(reqX, reqY, pillW, pillH, 6);
+          pill.stroke({ color: c1, width: 1.5, alpha: 1 });
+        } else {
+          pill.roundRect(reqX, reqY, pillW, pillH, 6);
+          pill.fill({ color: isMet ? symColor : 0x1a2535, alpha: isMet ? 0.3 : 0.8 });
+          pill.stroke({ color: symColor, width: 1.5, alpha: isMet ? 1 : 0.4 });
+        }
         this.addChild(pill);
 
         // Symbol dot(s) — for cardSymbol, show multi-colored dot
@@ -327,9 +342,12 @@ export class EssencePickerOverlay extends Container {
 
       const isSelected = ui.selectedCardIds.includes(eid);
 
-      // Determine if this card's symbol is needed
-      const cardSymbol = eDef?.symbols?.[0] ?? 'neutral';
-      const isNeededSymbol = specificCosts.some(c => c.symbol === cardSymbol) || true; // All essence is potentially useful
+      // Determine if this card's symbol(s) match any required cost.
+      // Multi-symbol cards count as ANY of their symbols for cost payment.
+      const cardSymbolsForCard: string[] = (eDef?.symbols ?? []) as string[];
+      const isNeededSymbol =
+        specificCosts.some(c => cardSymbolsForCard.includes(c.symbol)) ||
+        (cardSymbols ? cardSymbolsForCard.some(s => cardSymbols.includes(s)) : false);
 
       // Selection highlight behind card
       if (isSelected) {
@@ -340,11 +358,17 @@ export class EssencePickerOverlay extends Container {
         this.addChild(highlight);
       }
 
-      // Symbol color border
-      const symColor = eDef?.symbols?.[0] ? (COLORS.symbols[eDef.symbols[0]] ?? COLORS.textMuted) : COLORS.textMuted;
+      // Symbol color border — for multi-symbol cards, prefer the symbol that matches a required cost.
+      let borderSymbol: string | undefined = cardSymbolsForCard[0];
+      const matchingSymbol = cardSymbolsForCard.find(s =>
+        specificCosts.some(c => c.symbol === s) ||
+        (cardSymbols ? cardSymbols.includes(s) : false)
+      );
+      if (matchingSymbol) borderSymbol = matchingSymbol;
+      const symColor = borderSymbol ? (COLORS.symbols[borderSymbol] ?? COLORS.textMuted) : COLORS.textMuted;
       const symBorder = new Graphics();
       symBorder.roundRect(cx - 2, cy - 2, cardSize.width + 4, cardSize.height + 4, 6);
-      symBorder.stroke({ color: symColor, width: isSelected ? 0 : 2, alpha: 0.6 });
+      symBorder.stroke({ color: symColor, width: isSelected ? 0 : 2, alpha: isNeededSymbol ? 0.8 : 0.4 });
       this.addChild(symBorder);
 
       const card = new CardSprite({
@@ -416,10 +440,12 @@ export class EssencePickerOverlay extends Container {
 
       this.addChild(card);
 
-      // Symbol label under card
-      const symName = eDef?.symbols?.[0] ?? 'neutral';
+      // Symbol label under card — show all symbols joined so multi-symbol cards are clear
+      const symLabelText = cardSymbolsForCard.length > 0
+        ? cardSymbolsForCard.map((s) => s.toUpperCase()).join('/')
+        : 'NEUTRAL';
       const symLbl = new Text({
-        text: symName.toUpperCase(),
+        text: symLabelText,
         style: new TextStyle({
           fontSize: 10,
           fill: symColor,
@@ -546,5 +572,7 @@ export class EssencePickerOverlay extends Container {
       errorMsg.y = errorY;
       this.addChild(errorMsg);
     }
+    // No fadeInOverlay here — this overlay rebuilds on every card selection,
+    // which would cause a flicker on each click. See overlayTransitions.ts.
   }
 }

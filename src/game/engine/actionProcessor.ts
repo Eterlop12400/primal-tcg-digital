@@ -100,10 +100,10 @@ export function processAction(
       return handleDiscardToHandLimit(state, player, action, collector);
 
     case 'search-select':
-      return handleSearchSelect(state, player, action);
+      return handleSearchSelect(state, player, action, collector);
 
     case 'resolve-target-choice':
-      return handleResolveTargetChoice(state, player, action);
+      return handleResolveTargetChoice(state, player, action, collector);
 
     case 'choose-optional-trigger':
       return handleChooseOptionalTrigger(state, player, action, collector);
@@ -469,6 +469,19 @@ function handlePlayAbility(
 
   addLog(state, player, 'play-ability', `Playing ${def.name}`, action.cardInstanceId);
 
+  // Emit chain-entry-added animation event
+  const abilityEffectDesc = def.effects[0]?.effectDescription ?? '';
+  collector?.emit({
+    type: 'chain-entry-added',
+    player,
+    chainIndex: state.chain.length - 1,
+    cardName: def.name,
+    defId: def.id,
+    effectName: def.name,
+    effectDescription: abilityEffectDesc,
+    targets: action.targetIds ?? [],
+  });
+
   return { success: true };
 }
 
@@ -600,6 +613,33 @@ function handleActivateEffect(
 
   addLog(state, player, 'activate', `Activated ${def.name}'s effect`, action.cardInstanceId);
 
+  // Emit chain-entry-added animation event so both players see what was activated
+  let effectDesc = effect.effectDescription;
+  if (def.cardType === 'field' && action.effectSubChoice !== undefined) {
+    const fieldSubDescs: Record<string, string[]> = {
+      'F0006': [
+        'Select 1 Character — it gets +1/+1 this turn',
+        'Draw 1 card',
+        "Discard 1 from opponent's Essence, move 1 from your DP to Essence",
+        'Ability cards cannot be played during this turn',
+      ],
+    };
+    const descs = fieldSubDescs[def.id];
+    if (descs && descs[action.effectSubChoice]) {
+      effectDesc = descs[action.effectSubChoice];
+    }
+  }
+  collector?.emit({
+    type: 'chain-entry-added',
+    player,
+    chainIndex: state.chain.length - 1,
+    cardName: def.name,
+    defId: def.id,
+    effectName: effect.effectDescription,
+    effectDescription: effectDesc,
+    targets: action.targetIds ?? [],
+  });
+
   return { success: true };
 }
 
@@ -708,7 +748,7 @@ function handleBattleOrEnd(
   if (action.choice === 'battle') {
     advanceToBattlePhase(state);
   } else {
-    advanceToEndPhase(state);
+    advanceToEndPhase(state, collector);
   }
 
   return { success: true };
@@ -738,7 +778,7 @@ function handleSelectAttackers(
     }
   }
 
-  sendAttackers(state, action.teamIds);
+  sendAttackers(state, action.teamIds, collector);
 
   // Check triggers
   checkSentToAttackTriggers(state, allAttackerIds, player);
@@ -817,6 +857,19 @@ function handleShowdownOrder(
   // Resolve each showdown in the order chosen by turn player
   for (const teamId of action.teamIds) {
     resolveShowdown(state, teamId);
+    if (state.gameOver) break;
+  }
+
+  // If game is over (10+ BRs reached mid-showdown), skip cleanup and end immediately
+  if (state.gameOver) {
+    returnFromBattlefield(state);
+    return { success: true };
+  }
+
+  // If a trigger set pendingOptionalEffect (e.g., Slayer Guild draw),
+  // pause before cleanup — the player must respond first
+  if (state.pendingOptionalEffect) {
+    return { success: true };
   }
 
   // Check for Oceanic Abyss (S0042) discard-to-essence redirects before cleanup
@@ -830,7 +883,7 @@ function handleShowdownOrder(
   returnFromBattlefield(state);
 
   // Advance to End Phase
-  advanceToEndPhase(state);
+  advanceToEndPhase(state, collector);
 
   return { success: true };
 }
@@ -859,7 +912,7 @@ function handleDiscardToHandLimit(
   addLog(state, player, 'discard-hand-limit', `Discarded ${excess} card(s) to hand limit`);
 
   // After discarding, finish the end phase (increment turn marker, switch turns)
-  finishEndPhase(state);
+  finishEndPhase(state, collector);
 
   return { success: true };
 }
@@ -867,7 +920,8 @@ function handleDiscardToHandLimit(
 function handleSearchSelect(
   state: GameState,
   player: PlayerId,
-  action: Extract<PlayerAction, { type: 'search-select' }>
+  action: Extract<PlayerAction, { type: 'search-select' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (!state.pendingSearch) {
     return { success: false, error: 'No pending search' };
@@ -894,6 +948,10 @@ function handleSearchSelect(
       addLog(state, player, 'search', 'Declined to search');
     }
     state.pendingSearch = undefined;
+    // Resume chain resolution if there are remaining entries
+    if (state.chain.length > 0) {
+      resolveChain(state, collector);
+    }
     return { success: true };
   }
 
@@ -979,14 +1037,16 @@ function handleSearchSelect(
     const def = getCardDefForInstance(state, chosen);
     addLog(state, player, 'effect', `Unknown Pathway — ${def.name} moved to hand`);
 
-    // Remaining displayed cards
+    // Remaining displayed cards — remove them from deck now (they've been revealed)
     const remaining = (displayCardIds ?? []).filter((id) => id !== chosen);
+    for (const rid of remaining) {
+      state.players[player].deck = state.players[player].deck.filter((id) => id !== rid);
+    }
 
     if (remaining.length === 0) {
       // No more cards to distribute
     } else if (remaining.length === 1) {
       // Only 1 remaining — auto-send to essence
-      state.players[player].deck = state.players[player].deck.filter((id) => id !== remaining[0]);
       moveCard(state, remaining[0], 'essence');
       const remDef = getCardDefForInstance(state, remaining[0]);
       addLog(state, player, 'effect', `Unknown Pathway — ${remDef.name} moved to Essence`);
@@ -1002,17 +1062,15 @@ function handleSearchSelect(
       };
     }
   } else if (effectId === 'S0044-E1-essence') {
-    // Unknown Pathway — chosen card goes to essence
-    state.players[player].deck = state.players[player].deck.filter((id) => id !== chosen);
+    // Unknown Pathway — chosen card goes to essence (already removed from deck in hand step)
     moveCard(state, chosen, 'essence');
 
     const def = getCardDefForInstance(state, chosen);
     addLog(state, player, 'effect', `Unknown Pathway �� ${def.name} moved to Essence`);
 
-    // Last remaining card auto-discards
+    // Last remaining card auto-discards (already removed from deck in hand step)
     const remaining = (displayCardIds ?? []).filter((id) => id !== chosen);
     for (const id of remaining) {
-      state.players[player].deck = state.players[player].deck.filter((did) => did !== id);
       moveCard(state, id, 'discard');
       const remDef = getCardDefForInstance(state, id);
       addLog(state, player, 'effect', `Unknown Pathway — ${remDef.name} moved to Discard`);
@@ -1042,6 +1100,12 @@ function handleSearchSelect(
   }
 
   state.pendingSearch = undefined;
+
+  // Resume chain resolution if there are remaining entries
+  if (state.chain.length > 0) {
+    resolveChain(state, collector);
+  }
+
   return { success: true };
 }
 
@@ -1102,6 +1166,7 @@ function handleResolveTargetChoice(
   state: GameState,
   player: PlayerId,
   action: Extract<PlayerAction, { type: 'resolve-target-choice' }>,
+  collector?: EventCollector,
 ): { success: boolean; error?: string } {
   if (!state.pendingTargetChoice) {
     return { success: false, error: 'No pending target choice' };
@@ -1119,6 +1184,10 @@ function handleResolveTargetChoice(
     }
     addLog(state, player, 'effect-declined', 'Declined target choice');
     state.pendingTargetChoice = undefined;
+    // Resume chain resolution if there are remaining entries
+    if (state.chain.length > 0) {
+      resolveChain(state, collector);
+    }
     return { success: true };
   }
 
@@ -1408,6 +1477,12 @@ function handleResolveTargetChoice(
   }
 
   state.pendingTargetChoice = undefined;
+
+  // Resume chain resolution if there are remaining entries
+  if (state.chain.length > 0) {
+    resolveChain(state, collector);
+  }
+
   return { success: true };
 }
 
@@ -1454,6 +1529,18 @@ function handleChooseOptionalTrigger(
           : state.currentTurn;
         state.consecutivePasses = 0;
       }
+    }
+
+    // If we were paused during showdown for this optional effect,
+    // finish showdown cleanup now that the player has responded
+    if (state.phase === 'battle-showdown' && !state.pendingOptionalEffect && state.chain.length === 0) {
+      if (state.pendingEssenceRedirects?.length) {
+        if (setupNextEssenceRedirectPrompt(state)) {
+          return { success: true };
+        }
+      }
+      returnFromBattlefield(state);
+      advanceToEndPhase(state, collector);
     }
   } else if (lingeringEffectId) {
     // Category B: lingering effect (Solomon end-of-turn, Swift Strike draw)
@@ -1525,7 +1612,7 @@ function handleChooseOptionalTrigger(
 
     // Re-call the phase function to continue
     if (lingeringEffectId.startsWith('solomon_')) {
-      advanceToEndPhase(state);
+      advanceToEndPhase(state, collector);
     } else if (lingeringEffectId.startsWith('stakegun_expert_')) {
       // Complete the paused ability chain entry that was waiting for the expert prompt
       if (state.chain.length > 0) {
@@ -1569,10 +1656,10 @@ function handleChooseOptionalTrigger(
         if (state.phase === 'battle-showdown') {
           // Was paused during handleShowdownOrder — finish showdown cleanup
           returnFromBattlefield(state);
-          advanceToEndPhase(state);
+          advanceToEndPhase(state, collector);
         } else if (state.phase === 'end') {
           // Was paused during advanceToEndPhase (e.g., Dangerous Waters) — re-run
-          advanceToEndPhase(state);
+          advanceToEndPhase(state, collector);
         } else if (state.chain.length > 0) {
           // Was paused during chain resolution — continue resolving
           resolveChain(state, collector);
